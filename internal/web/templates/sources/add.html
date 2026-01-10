@@ -1,0 +1,131 @@
+{{define "content"}}
+<div class="px-4 py-6 sm:px-0">
+    <div class="mb-6">
+        <h1 class="text-2xl font-bold text-gray-900">Add Calendar Source</h1>
+        <p class="mt-1 text-sm text-gray-600">Configure a new calendar synchronization source.</p>
+    </div>
+
+    <div class="bg-white shadow sm:rounded-lg">
+        <form action="/sources/add" method="POST" class="space-y-6 p-6">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+            {{if .Error}}
+            <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+                {{.Error}}
+            </div>
+            {{end}}
+
+            <!-- General Settings -->
+            <div class="border-b border-gray-200 pb-6">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">General Settings</h3>
+                <div class="mt-4 grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                    <div class="sm:col-span-4">
+                        <label for="name" class="block text-sm font-medium text-gray-700">Name</label>
+                        <input type="text" name="name" id="name" value="{{.Form.Name}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                        <p class="mt-1 text-sm text-gray-500">A friendly name for this sync source.</p>
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="source_type" class="block text-sm font-medium text-gray-700">Source Type</label>
+                        <select name="source_type" id="source_type" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            <option value="caldav" {{if eq .Form.SourceType "caldav"}}selected{{end}}>CalDAV</option>
+                            <option value="google" {{if eq .Form.SourceType "google"}}selected{{end}}>Google Calendar</option>
+                            <option value="outlook" {{if eq .Form.SourceType "outlook"}}selected{{end}}>Outlook</option>
+                        </select>
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="sync_interval" class="block text-sm font-medium text-gray-700">Sync Interval</label>
+                        <select name="sync_interval" id="sync_interval" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            <option value="300" {{if eq .Form.SyncInterval 300}}selected{{end}}>5 minutes</option>
+                            <option value="900" {{if eq .Form.SyncInterval 900}}selected{{end}}>15 minutes</option>
+                            <option value="1800" {{if eq .Form.SyncInterval 1800}}selected{{end}}>30 minutes</option>
+                            <option value="3600" {{if or (eq .Form.SyncInterval 0) (eq .Form.SyncInterval 3600)}}selected{{end}}>1 hour</option>
+                            <option value="7200" {{if eq .Form.SyncInterval 7200}}selected{{end}}>2 hours</option>
+                            <option value="21600" {{if eq .Form.SyncInterval 21600}}selected{{end}}>6 hours</option>
+                            <option value="86400" {{if eq .Form.SyncInterval 86400}}selected{{end}}>24 hours</option>
+                        </select>
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="conflict_strategy" class="block text-sm font-medium text-gray-700">Conflict Strategy</label>
+                        <select name="conflict_strategy" id="conflict_strategy" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            <option value="source_wins" {{if eq .Form.ConflictStrategy "source_wins"}}selected{{end}}>Source Wins</option>
+                            <option value="dest_wins" {{if eq .Form.ConflictStrategy "dest_wins"}}selected{{end}}>Destination Wins</option>
+                            <option value="newest_wins" {{if eq .Form.ConflictStrategy "newest_wins"}}selected{{end}}>Newest Wins</option>
+                        </select>
+                        <p class="mt-1 text-sm text-gray-500">How to handle conflicts when events differ.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Source Server -->
+            <div class="border-b border-gray-200 pb-6">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">Source Server</h3>
+                <p class="mt-1 text-sm text-gray-500">The CalDAV server to sync events from.</p>
+                <div class="mt-4 grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                    <div class="sm:col-span-6">
+                        <label for="source_url" class="block text-sm font-medium text-gray-700">CalDAV URL</label>
+                        <input type="url" name="source_url" id="source_url" value="{{.Form.SourceURL}}" required
+                            placeholder="https://caldav.example.com/calendars/user/"
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="source_username" class="block text-sm font-medium text-gray-700">Username</label>
+                        <input type="text" name="source_username" id="source_username" value="{{.Form.SourceUsername}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="source_password" class="block text-sm font-medium text-gray-700">Password</label>
+                        <input type="password" name="source_password" id="source_password" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                        <p class="mt-1 text-sm text-gray-500">Stored encrypted with AES-256-GCM.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Destination Server -->
+            <div class="pb-6">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">Destination Server</h3>
+                <p class="mt-1 text-sm text-gray-500">The CalDAV server to sync events to.</p>
+                <div class="mt-4 grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                    <div class="sm:col-span-6">
+                        <label for="dest_url" class="block text-sm font-medium text-gray-700">CalDAV URL</label>
+                        <input type="url" name="dest_url" id="dest_url" value="{{.Form.DestURL}}" required
+                            placeholder="https://caldav.example.com/calendars/user/"
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="dest_username" class="block text-sm font-medium text-gray-700">Username</label>
+                        <input type="text" name="dest_username" id="dest_username" value="{{.Form.DestUsername}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="dest_password" class="block text-sm font-medium text-gray-700">Password</label>
+                        <input type="password" name="dest_password" id="dest_password" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                        <p class="mt-1 text-sm text-gray-500">Stored encrypted with AES-256-GCM.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex justify-end space-x-3">
+                <a href="/sources" class="bg-white py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                    Cancel
+                </a>
+                <button type="submit" class="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                    Add Source
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{{end}}

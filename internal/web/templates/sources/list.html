@@ -1,0 +1,107 @@
+{{define "content"}}
+<div class="px-4 py-6 sm:px-0">
+    <div class="flex justify-between items-center mb-6">
+        <h1 class="text-2xl font-bold text-gray-900">Calendar Sources</h1>
+        <a href="/sources/add" class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700">
+            Add Source
+        </a>
+    </div>
+
+    <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+        {{if .Sources}}
+        <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Source</th>
+                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Destination</th>
+                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Interval</th>
+                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200">
+                {{range .Sources}}
+                <tr id="source-{{.ID}}">
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        <div class="flex items-center">
+                            <div>
+                                <div class="text-sm font-medium text-gray-900">{{.Name}}</div>
+                                <div class="text-sm text-gray-500">{{.SourceType}}</div>
+                            </div>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4">
+                        <div class="text-sm text-gray-900 truncate max-w-xs" title="{{.SourceURL}}">{{.SourceURL}}</div>
+                        <div class="text-sm text-gray-500">{{.SourceUsername}}</div>
+                    </td>
+                    <td class="px-6 py-4">
+                        <div class="text-sm text-gray-900 truncate max-w-xs" title="{{.DestURL}}">{{.DestURL}}</div>
+                        <div class="text-sm text-gray-500">{{.DestUsername}}</div>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        {{if ge .SyncInterval 3600}}
+                            {{divide .SyncInterval 3600}}h
+                        {{else if ge .SyncInterval 60}}
+                            {{divide .SyncInterval 60}}m
+                        {{else}}
+                            {{.SyncInterval}}s
+                        {{end}}
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        <div class="flex items-center">
+                            <form action="/sources/{{.ID}}/toggle" method="POST" hx-post="/sources/{{.ID}}/toggle" hx-swap="outerHTML" hx-target="#source-{{.ID}}">
+                                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                                <button type="submit" class="relative inline-flex flex-shrink-0 h-6 w-11 border-2 border-transparent rounded-full cursor-pointer transition-colors ease-in-out duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 {{if .Enabled}}bg-indigo-600{{else}}bg-gray-200{{end}}">
+                                    <span class="sr-only">Toggle enabled</span>
+                                    <span aria-hidden="true" class="pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow transform ring-0 transition ease-in-out duration-200 {{if .Enabled}}translate-x-5{{else}}translate-x-0{{end}}"></span>
+                                </button>
+                            </form>
+                            {{if .Enabled}}
+                            <span class="ml-3 text-sm {{if eq .SyncStatus "success"}}text-green-600{{else if eq .SyncStatus "error"}}text-red-600{{else if eq .SyncStatus "running"}}text-blue-600{{else}}text-gray-500{{end}}">
+                                {{if eq .SyncStatus "success"}}Synced
+                                {{else if eq .SyncStatus "error"}}Error
+                                {{else if eq .SyncStatus "running"}}Running
+                                {{else}}Pending{{end}}
+                            </span>
+                            {{end}}
+                        </div>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        <div class="flex space-x-2">
+                            <form action="/sources/{{.ID}}/sync" method="POST" class="inline" hx-post="/sources/{{.ID}}/sync" hx-swap="none">
+                                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                                <button type="submit" class="text-indigo-600 hover:text-indigo-900" {{if not .Enabled}}disabled{{end}}>
+                                    Sync
+                                </button>
+                            </form>
+                            <a href="/sources/{{.ID}}/edit" class="text-indigo-600 hover:text-indigo-900">Edit</a>
+                            <a href="/sources/{{.ID}}/logs" class="text-gray-600 hover:text-gray-900">Logs</a>
+                            <form action="/sources/{{.ID}}" method="POST" class="inline" hx-delete="/sources/{{.ID}}" hx-confirm="Are you sure you want to delete this source?" hx-swap="outerHTML" hx-target="#source-{{.ID}}">
+                                <input type="hidden" name="_method" value="DELETE">
+                                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                                <button type="submit" class="text-red-600 hover:text-red-900">Delete</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {{end}}
+            </tbody>
+        </table>
+        {{else}}
+        <div class="text-center py-12">
+            <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            <h3 class="mt-2 text-sm font-medium text-gray-900">No calendar sources</h3>
+            <p class="mt-1 text-sm text-gray-500">Get started by adding a new calendar source.</p>
+            <div class="mt-6">
+                <a href="/sources/add" class="inline-flex items-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">
+                    Add Source
+                </a>
+            </div>
+        </div>
+        {{end}}
+    </div>
+</div>
+{{end}}

@@ -1,0 +1,168 @@
+{{define "content"}}
+<div class="px-4 py-6 sm:px-0">
+    <div class="mb-6">
+        <h1 class="text-2xl font-bold text-gray-900">Edit Calendar Source</h1>
+        <p class="mt-1 text-sm text-gray-600">Update the configuration for "{{.Source.Name}}".</p>
+    </div>
+
+    <div class="bg-white shadow sm:rounded-lg">
+        <form action="/sources/{{.Source.ID}}" method="POST" class="space-y-6 p-6">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+
+            {{if .Error}}
+            <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+                {{.Error}}
+            </div>
+            {{end}}
+
+            <!-- General Settings -->
+            <div class="border-b border-gray-200 pb-6">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">General Settings</h3>
+                <div class="mt-4 grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                    <div class="sm:col-span-4">
+                        <label for="name" class="block text-sm font-medium text-gray-700">Name</label>
+                        <input type="text" name="name" id="name" value="{{.Source.Name}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="source_type" class="block text-sm font-medium text-gray-700">Source Type</label>
+                        <select name="source_type" id="source_type" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            <option value="caldav" {{if eq .Source.SourceType "caldav"}}selected{{end}}>CalDAV</option>
+                            <option value="google" {{if eq .Source.SourceType "google"}}selected{{end}}>Google Calendar</option>
+                            <option value="outlook" {{if eq .Source.SourceType "outlook"}}selected{{end}}>Outlook</option>
+                        </select>
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="sync_interval" class="block text-sm font-medium text-gray-700">Sync Interval</label>
+                        <select name="sync_interval" id="sync_interval" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            <option value="300" {{if eq .Source.SyncInterval 300}}selected{{end}}>5 minutes</option>
+                            <option value="900" {{if eq .Source.SyncInterval 900}}selected{{end}}>15 minutes</option>
+                            <option value="1800" {{if eq .Source.SyncInterval 1800}}selected{{end}}>30 minutes</option>
+                            <option value="3600" {{if eq .Source.SyncInterval 3600}}selected{{end}}>1 hour</option>
+                            <option value="7200" {{if eq .Source.SyncInterval 7200}}selected{{end}}>2 hours</option>
+                            <option value="21600" {{if eq .Source.SyncInterval 21600}}selected{{end}}>6 hours</option>
+                            <option value="86400" {{if eq .Source.SyncInterval 86400}}selected{{end}}>24 hours</option>
+                        </select>
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="conflict_strategy" class="block text-sm font-medium text-gray-700">Conflict Strategy</label>
+                        <select name="conflict_strategy" id="conflict_strategy" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            <option value="source_wins" {{if eq .Source.ConflictStrategy "source_wins"}}selected{{end}}>Source Wins</option>
+                            <option value="dest_wins" {{if eq .Source.ConflictStrategy "dest_wins"}}selected{{end}}>Destination Wins</option>
+                            <option value="newest_wins" {{if eq .Source.ConflictStrategy "newest_wins"}}selected{{end}}>Newest Wins</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Source Server -->
+            <div class="border-b border-gray-200 pb-6">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">Source Server</h3>
+                <div class="mt-4 grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                    <div class="sm:col-span-6">
+                        <label for="source_url" class="block text-sm font-medium text-gray-700">CalDAV URL</label>
+                        <input type="url" name="source_url" id="source_url" value="{{.Source.SourceURL}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="source_username" class="block text-sm font-medium text-gray-700">Username</label>
+                        <input type="text" name="source_username" id="source_username" value="{{.Source.SourceUsername}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="source_password" class="block text-sm font-medium text-gray-700">Password</label>
+                        <input type="password" name="source_password" id="source_password" placeholder="Leave empty to keep current"
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                        <p class="mt-1 text-sm text-gray-500">Leave empty to keep current password.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Destination Server -->
+            <div class="pb-6">
+                <h3 class="text-lg leading-6 font-medium text-gray-900">Destination Server</h3>
+                <div class="mt-4 grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                    <div class="sm:col-span-6">
+                        <label for="dest_url" class="block text-sm font-medium text-gray-700">CalDAV URL</label>
+                        <input type="url" name="dest_url" id="dest_url" value="{{.Source.DestURL}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="dest_username" class="block text-sm font-medium text-gray-700">Username</label>
+                        <input type="text" name="dest_username" id="dest_username" value="{{.Source.DestUsername}}" required
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                    </div>
+
+                    <div class="sm:col-span-3">
+                        <label for="dest_password" class="block text-sm font-medium text-gray-700">Password</label>
+                        <input type="password" name="dest_password" id="dest_password" placeholder="Leave empty to keep current"
+                            class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                        <p class="mt-1 text-sm text-gray-500">Leave empty to keep current password.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status Info -->
+            <div class="bg-gray-50 rounded-lg p-4">
+                <h4 class="text-sm font-medium text-gray-900">Status Information</h4>
+                <dl class="mt-2 grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Status</dt>
+                        <dd class="text-sm text-gray-900">
+                            {{if .Source.Enabled}}Enabled{{else}}Disabled{{end}} -
+                            {{if eq .Source.SyncStatus "success"}}Last sync successful
+                            {{else if eq .Source.SyncStatus "error"}}Last sync failed
+                            {{else if eq .Source.SyncStatus "running"}}Sync in progress
+                            {{else}}Pending first sync{{end}}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Last Sync</dt>
+                        <dd class="text-sm text-gray-900">
+                            {{if .Source.LastSyncAt}}{{.Source.LastSyncAt.Format "Jan 02, 2006 15:04:05"}}{{else}}Never{{end}}
+                        </dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Created</dt>
+                        <dd class="text-sm text-gray-900">{{.Source.CreatedAt.Format "Jan 02, 2006 15:04:05"}}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-sm font-medium text-gray-500">Last Updated</dt>
+                        <dd class="text-sm text-gray-900">{{.Source.UpdatedAt.Format "Jan 02, 2006 15:04:05"}}</dd>
+                    </div>
+                </dl>
+            </div>
+
+            <div class="flex justify-between">
+                <form action="/sources/{{.Source.ID}}" method="POST"
+                    hx-delete="/sources/{{.Source.ID}}"
+                    hx-confirm="Are you sure you want to delete this source? This action cannot be undone.">
+                    <input type="hidden" name="_method" value="DELETE">
+                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                    <button type="submit" class="inline-flex justify-center py-2 px-4 border border-red-300 shadow-sm text-sm font-medium rounded-md text-red-700 bg-white hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                        Delete Source
+                    </button>
+                </form>
+
+                <div class="flex space-x-3">
+                    <a href="/sources" class="bg-white py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                        Cancel
+                    </a>
+                    <button type="submit" class="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                        Save Changes
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+{{end}}

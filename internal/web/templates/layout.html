@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}} - CalBridge</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+        /* Custom loading indicator */
+        .htmx-indicator {
+            display: none;
+        }
+        .htmx-request .htmx-indicator {
+            display: inline;
+        }
+        .htmx-request.htmx-indicator {
+            display: inline;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <nav class="bg-indigo-600 text-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center">
+                    <a href="/" class="text-xl font-bold">CalBridge</a>
+                    {{if .User}}
+                    <div class="ml-10 flex items-baseline space-x-4">
+                        <a href="/" class="px-3 py-2 rounded-md text-sm font-medium hover:bg-indigo-500 {{if eq .ActiveNav "dashboard"}}bg-indigo-700{{end}}">Dashboard</a>
+                        <a href="/sources" class="px-3 py-2 rounded-md text-sm font-medium hover:bg-indigo-500 {{if eq .ActiveNav "sources"}}bg-indigo-700{{end}}">Sources</a>
+                    </div>
+                    {{end}}
+                </div>
+                {{if .User}}
+                <div class="flex items-center">
+                    <span class="text-sm mr-4">{{.User.Email}}</span>
+                    <form action="/auth/logout" method="POST" class="inline">
+                        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                        <button type="submit" class="px-3 py-2 rounded-md text-sm font-medium bg-indigo-700 hover:bg-indigo-800">Logout</button>
+                    </form>
+                </div>
+                {{end}}
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+        {{if .Flash}}
+        <div class="mb-4 p-4 rounded-md {{if eq .Flash.Type "error"}}bg-red-100 text-red-700{{else if eq .Flash.Type "success"}}bg-green-100 text-green-700{{else}}bg-blue-100 text-blue-700{{end}}">
+            {{.Flash.Message}}
+        </div>
+        {{end}}
+
+        {{template "content" .}}
+    </main>
+
+    <footer class="bg-gray-800 text-gray-400 py-4 mt-auto">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center text-sm">
+            CalBridge - CalDAV Synchronization
+        </div>
+    </footer>
+</body>
+</html>
