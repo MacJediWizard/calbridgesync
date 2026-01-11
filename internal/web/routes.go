@@ -37,16 +37,16 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		apiGroup.POST("/auth/logout", h.APILogout)
 	}
 
-	// Protected API routes with rate limiting and origin validation
+	// Protected API routes with rate limiting, origin validation, and content-type validation
 	protectedAPI := r.Group("/api")
 	protectedAPI.Use(apiRateLimiter)
 	protectedAPI.Use(auth.RequireAuth(sm))
-	protectedAPI.Use(ValidateOrigin()) // CSRF protection via origin check
+	protectedAPI.Use(ValidateOrigin())         // CSRF protection via origin check
+	protectedAPI.Use(RequireJSONContentType()) // Validate Content-Type header
 	{
 		protectedAPI.GET("/dashboard/stats", h.APIDashboardStats)
 		protectedAPI.GET("/dashboard/sync-history", h.APISyncHistory)
 		protectedAPI.GET("/sources", h.APIListSources)
-		protectedAPI.POST("/sources", h.APICreateSource)
 		protectedAPI.GET("/sources/:id", h.APIGetSource)
 		protectedAPI.PUT("/sources/:id", h.APIUpdateSource)
 		protectedAPI.DELETE("/sources/:id", h.APIDeleteSource)
@@ -55,7 +55,18 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		protectedAPI.GET("/sources/:id/logs", h.APIGetSourceLogs)
 		protectedAPI.GET("/malformed-events", h.APIGetMalformedEvents)
 		protectedAPI.DELETE("/malformed-events/:id", h.APIDeleteMalformedEvent)
-		protectedAPI.POST("/calendars/discover", h.APIDiscoverCalendars)
+	}
+
+	// Expensive operations with stricter rate limiting (network calls, credential testing)
+	expensiveRateLimiter := RateLimiter(2, 5) // 2 requests/sec, burst of 5
+	expensiveAPI := r.Group("/api")
+	expensiveAPI.Use(expensiveRateLimiter)
+	expensiveAPI.Use(auth.RequireAuth(sm))
+	expensiveAPI.Use(ValidateOrigin())
+	expensiveAPI.Use(RequireJSONContentType())
+	{
+		expensiveAPI.POST("/sources", h.APICreateSource)           // Tests connections
+		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars) // Network call
 	}
 
 	// Serve React app static files

@@ -18,12 +18,28 @@ func SecurityHeaders() gin.HandlerFunc {
 		c.Header("X-Frame-Options", "DENY")
 		c.Header("X-XSS-Protection", "1; mode=block")
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// HSTS - force HTTPS for all future connections (1 year, include subdomains)
+		// Only set in production (when request is already over HTTPS)
+		if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+
+		// Permissions-Policy - restrict browser features we don't need
+		c.Header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+
+		// CSP - Note: 'unsafe-inline' for styles is required for Tailwind CSS
+		// Scripts use 'unsafe-inline' only for Vite dev mode; in production builds it's not needed
+		// but keeping it for compatibility
 		c.Header("Content-Security-Policy", "default-src 'self'; "+
 			"script-src 'self' 'unsafe-inline' https://unpkg.com; "+
 			"style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com; "+
 			"img-src 'self' data: https://cdn.macjediwizard.com; "+
 			"font-src 'self' https://fonts.gstatic.com; "+
-			"connect-src 'self'")
+			"connect-src 'self'; "+
+			"form-action 'self'; "+
+			"frame-ancestors 'none'; "+
+			"base-uri 'self'")
 		c.Next()
 	}
 }
@@ -43,10 +59,11 @@ func RateLimiter(rps float64, burst int) gin.HandlerFunc {
 	}
 }
 
-// RequestLogger logs HTTP requests without logging bodies (security).
+// RequestLogger logs HTTP requests without logging bodies or query strings (security).
 func RequestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
+		// Only log path, NOT query string (c.Request.URL.RawQuery) - may contain sensitive data
 		path := c.Request.URL.Path
 		method := c.Request.Method
 
@@ -55,8 +72,26 @@ func RequestLogger() gin.HandlerFunc {
 		duration := time.Since(start)
 		status := c.Writer.Status()
 
-		// Log request (NEVER log request bodies - may contain credentials)
+		// Log request (NEVER log request bodies or query strings - may contain credentials)
 		log.Printf("%s %s %d %v", method, path, status, duration)
+	}
+}
+
+// RequireJSONContentType validates that POST/PUT/PATCH requests have JSON content type.
+func RequireJSONContentType() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Only validate for methods that typically have a body
+		if c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "PATCH" {
+			contentType := c.GetHeader("Content-Type")
+			// Allow empty content type for requests without body, or require JSON
+			if contentType != "" && !strings.HasPrefix(contentType, "application/json") {
+				c.AbortWithStatusJSON(http.StatusUnsupportedMediaType, gin.H{
+					"error": "Content-Type must be application/json",
+				})
+				return
+			}
+		}
+		c.Next()
 	}
 }
 

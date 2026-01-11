@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,6 +13,44 @@ import (
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 )
+
+// sanitizeError returns a user-safe error message without exposing internal details.
+// Internal error details are logged but not returned to the client.
+func sanitizeError(err error, userMessage string) string {
+	if err != nil {
+		// Log the full error for debugging (server-side only)
+		log.Printf("Error: %s - Details: %v", userMessage, err)
+	}
+	return userMessage
+}
+
+// categorizeConnectionError returns a user-friendly message based on common error patterns.
+func categorizeConnectionError(err error) string {
+	if err == nil {
+		return "Connection failed"
+	}
+	errStr := strings.ToLower(err.Error())
+
+	// Categorize without exposing internal details
+	switch {
+	case strings.Contains(errStr, "no such host") || strings.Contains(errStr, "lookup"):
+		return "Server not found. Please check the URL."
+	case strings.Contains(errStr, "connection refused"):
+		return "Connection refused. Please verify the server is running."
+	case strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline"):
+		return "Connection timed out. Please try again."
+	case strings.Contains(errStr, "401") || strings.Contains(errStr, "unauthorized"):
+		return "Authentication failed. Please check your credentials."
+	case strings.Contains(errStr, "403") || strings.Contains(errStr, "forbidden"):
+		return "Access denied. Please check your permissions."
+	case strings.Contains(errStr, "404") || strings.Contains(errStr, "not found"):
+		return "Calendar not found. Please check the URL."
+	case strings.Contains(errStr, "certificate") || strings.Contains(errStr, "tls"):
+		return "SSL/TLS error. Please verify the server certificate."
+	default:
+		return "Connection failed. Please check your settings."
+	}
+}
 
 // APISource represents a source in JSON format for the API.
 type APISource struct {
@@ -362,14 +401,10 @@ func (h *Handlers) APIGetSource(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByID(sourceID)
+	// Use timing-safe query that combines ID and user check
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -414,14 +449,16 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 	// Test source connection
 	ctx := c.Request.Context()
 	if err := h.syncEngine.TestConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + err.Error()})
+		log.Printf("Source connection test failed for %s: %v", req.SourceURL, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + categorizeConnectionError(err)})
 		return
 	}
 
 	// Test destination if provided
 	if req.DestURL != "" && req.DestUsername != "" && req.DestPassword != "" {
 		if err := h.syncEngine.TestConnection(ctx, req.DestURL, req.DestUsername, req.DestPassword); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to destination: " + err.Error()})
+			log.Printf("Destination connection test failed for %s: %v", req.DestURL, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to destination: " + categorizeConnectionError(err)})
 			return
 		}
 	}
@@ -441,7 +478,7 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 
 	syncInterval := req.SyncInterval
 	if syncInterval < h.cfg.Sync.MinInterval || syncInterval > h.cfg.Sync.MaxInterval {
-		syncInterval = 300
+		syncInterval = h.cfg.Sync.MinInterval // Use configured minimum instead of hardcoded value
 	}
 
 	source := &db.Source{
@@ -496,14 +533,10 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByID(sourceID)
+	// Use timing-safe query that combines ID and user check
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -565,14 +598,10 @@ func (h *Handlers) APIDeleteSource(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByID(sourceID)
+	// Use timing-safe query that combines ID and user check
+	_, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -595,14 +624,10 @@ func (h *Handlers) APIToggleSource(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByID(sourceID)
+	// Use timing-safe query that combines ID and user check
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -630,14 +655,10 @@ func (h *Handlers) APITriggerSync(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByID(sourceID)
+	// Use timing-safe query that combines ID and user check
+	_, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -655,14 +676,10 @@ func (h *Handlers) APIGetSourceLogs(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByID(sourceID)
+	// Use timing-safe query that combines ID and user check
+	_, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -764,22 +781,17 @@ func (h *Handlers) APIDeleteMalformedEvent(c *gin.Context) {
 
 	eventID := c.Param("id")
 
-	// Get the malformed event
-	event, err := h.db.GetMalformedEventByID(eventID)
+	// Use timing-safe query that combines ID and user check
+	event, err := h.db.GetMalformedEventByIDForUser(eventID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Malformed event not found"})
 		return
 	}
 
-	// Get the source to verify ownership
-	source, err := h.db.GetSourceByID(event.SourceID)
+	// Get the source for deletion from calendar
+	source, err := h.db.GetSourceByIDForUser(event.SourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	if source.UserID != session.UserID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
 		return
 	}
 
@@ -836,19 +848,22 @@ func (h *Handlers) APIDiscoverCalendars(c *gin.Context) {
 	// Create CalDAV client and discover calendars
 	client, err := caldav.NewClient(req.URL, req.Username, req.Password)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect: " + err.Error()})
+		log.Printf("CalDAV client creation failed for %s: %v", req.URL, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect: " + categorizeConnectionError(err)})
 		return
 	}
 
 	ctx := c.Request.Context()
 	if err := client.TestConnection(ctx); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Connection test failed: " + err.Error()})
+		log.Printf("CalDAV connection test failed for %s: %v", req.URL, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Connection test failed: " + categorizeConnectionError(err)})
 		return
 	}
 
 	calendars, err := client.FindCalendars(ctx)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to discover calendars: " + err.Error()})
+		log.Printf("Calendar discovery failed for %s: %v", req.URL, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to discover calendars: " + categorizeConnectionError(err)})
 		return
 	}
 

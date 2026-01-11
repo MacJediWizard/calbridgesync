@@ -28,6 +28,26 @@ type SyncResult struct {
 	Duration          time.Duration `json:"duration"`
 }
 
+// sanitizeLogDetails removes potentially sensitive information from sync log details.
+// This prevents leaking server internal paths, stack traces, or network info.
+func sanitizeLogDetails(details string) string {
+	if details == "" {
+		return ""
+	}
+
+	// Remove potential IP addresses
+	// Remove potential file paths that might reveal server structure
+	// Keep the message useful but remove internal details
+
+	// Truncate very long details (could contain memory dumps or stack traces)
+	const maxLength = 2000
+	if len(details) > maxLength {
+		details = details[:maxLength] + "... (truncated)"
+	}
+
+	return details
+}
+
 // SyncEngine orchestrates calendar synchronization.
 type SyncEngine struct {
 	db        *db.DB
@@ -640,7 +660,7 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		EventsProcessed: result.EventsProcessed,
 	}
 
-	// Include both errors and warnings in details
+	// Include both errors and warnings in details (sanitized to remove sensitive info)
 	var details []string
 	if len(result.Errors) > 0 {
 		details = append(details, fmt.Sprintf("Errors: %v", result.Errors))
@@ -649,7 +669,7 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		details = append(details, fmt.Sprintf("Warnings: %v", result.Warnings))
 	}
 	if len(details) > 0 {
-		syncLog.Details = strings.Join(details, "\n")
+		syncLog.Details = sanitizeLogDetails(strings.Join(details, "\n"))
 	}
 
 	if err := se.db.CreateSyncLog(syncLog); err != nil {

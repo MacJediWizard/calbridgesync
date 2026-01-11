@@ -129,6 +129,18 @@ func (db *DB) GetSourceByID(id string) (*Source, error) {
 	return scanSource(row)
 }
 
+// GetSourceByIDForUser returns a source by its ID only if it belongs to the user.
+// This prevents timing attacks by combining auth check with the query.
+func (db *DB) GetSourceByIDForUser(id, userID string) (*Source, error) {
+	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
+		dest_url, dest_username, dest_password, sync_interval, sync_direction, conflict_strategy,
+		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
+		FROM sources WHERE id = ? AND user_id = ?`
+
+	row := db.conn.QueryRow(query, id, userID)
+	return scanSource(row)
+}
+
 // GetSourcesByUserID returns all sources for a user.
 func (db *DB) GetSourcesByUserID(userID string) ([]*Source, error) {
 	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
@@ -642,6 +654,27 @@ func (db *DB) GetMalformedEventByID(id string) (*MalformedEvent, error) {
 
 	event := &MalformedEvent{}
 	err := db.conn.QueryRow(query, id).Scan(&event.ID, &event.SourceID, &event.SourceName,
+		&event.EventPath, &event.ErrorMessage, &event.DiscoveredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get malformed event: %w", err)
+	}
+
+	return event, nil
+}
+
+// GetMalformedEventByIDForUser returns a malformed event by ID only if it belongs to the user.
+// This prevents timing attacks by combining auth check with the query.
+func (db *DB) GetMalformedEventByIDForUser(id, userID string) (*MalformedEvent, error) {
+	query := `SELECT m.id, m.source_id, s.name, m.event_path, m.error_message, m.discovered_at
+		FROM malformed_events m
+		JOIN sources s ON m.source_id = s.id
+		WHERE m.id = ? AND s.user_id = ?`
+
+	event := &MalformedEvent{}
+	err := db.conn.QueryRow(query, id, userID).Scan(&event.ID, &event.SourceID, &event.SourceName,
 		&event.EventPath, &event.ErrorMessage, &event.DiscoveredAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

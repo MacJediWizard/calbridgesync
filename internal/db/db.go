@@ -36,6 +36,14 @@ func New(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("%w: failed to open database: %w", ErrDatabaseInit, err)
 	}
 
+	// Configure connection pool limits to prevent resource exhaustion
+	// SQLite handles concurrency differently than other databases, but these
+	// limits still help prevent file descriptor exhaustion and memory issues
+	conn.SetMaxOpenConns(25)       // Maximum number of open connections
+	conn.SetMaxIdleConns(5)        // Maximum idle connections in pool
+	conn.SetConnMaxLifetime(0)     // Connections are reused forever
+	conn.SetConnMaxIdleTime(0)     // Idle connections are kept forever
+
 	// Configure SQLite for optimal performance and security
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",

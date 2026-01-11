@@ -265,7 +265,7 @@ type sourceFormData struct {
 func (h *Handlers) parseSourceForm(c *gin.Context) *sourceFormData {
 	syncInterval, err := strconv.Atoi(c.PostForm("sync_interval"))
 	if err != nil || syncInterval < h.cfg.Sync.MinInterval || syncInterval > h.cfg.Sync.MaxInterval {
-		syncInterval = 300
+		syncInterval = h.cfg.Sync.MinInterval // Use configured minimum instead of hardcoded value
 	}
 
 	return &sourceFormData{

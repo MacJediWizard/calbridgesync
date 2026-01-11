@@ -45,6 +45,10 @@ func NewSessionManager(secret string, secure bool) *SessionManager {
 		HttpOnly: true,
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
+		// Domain is intentionally NOT set - this is the secure default.
+		// When domain is unset, the cookie is restricted to the exact host only,
+		// preventing subdomain access. Setting a domain (e.g., ".example.com")
+		// would actually make the cookie LESS secure by allowing subdomains to access it.
 	}
 
 	return &SessionManager{
