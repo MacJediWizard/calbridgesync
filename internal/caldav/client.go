@@ -395,7 +395,14 @@ func (c *Client) buildURL(path string) string {
 
 // IsMalformedError checks if an error is a malformed content error.
 func IsMalformedError(err error) bool {
-	return errors.Is(err, ErrMalformedContent)
+	if errors.Is(err, ErrMalformedContent) {
+		return true
+	}
+	// Also check error string for malformed patterns (in case of wrapped errors)
+	errStr := err.Error()
+	return strings.Contains(errStr, "malformed") ||
+		strings.Contains(errStr, "missing colon") ||
+		(strings.Contains(errStr, "invalid") && strings.Contains(errStr, "ical"))
 }
 
 // GetEvent retrieves a single event by path.
