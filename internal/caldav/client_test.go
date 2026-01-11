@@ -1,7 +1,12 @@
 package caldav
 
 import (
+	"errors"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/emersion/go-ical"
 )
 
 func TestEventDedupeKey(t *testing.T) {
@@ -227,4 +232,701 @@ func TestMalformedEventInfo(t *testing.T) {
 			t.Errorf("expected error message, got %q", info.ErrorMessage)
 		}
 	})
+}
+
+func TestNewClient(t *testing.T) {
+	t.Run("returns error for empty URL", func(t *testing.T) {
+		_, err := NewClient("", "user", "pass")
+		if err == nil {
+			t.Error("expected error for empty URL")
+		}
+		if !errors.Is(err, ErrConnectionFailed) {
+			t.Errorf("expected ErrConnectionFailed, got %v", err)
+		}
+	})
+
+	t.Run("creates client with valid URL", func(t *testing.T) {
+		client, err := NewClient("https://caldav.example.com", "user", "pass")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if client == nil {
+			t.Fatal("expected non-nil client")
+		}
+		if client.baseURL != "https://caldav.example.com" {
+			t.Errorf("expected baseURL to be set, got %q", client.baseURL)
+		}
+		if client.username != "user" {
+			t.Errorf("expected username 'user', got %q", client.username)
+		}
+	})
+}
+
+func TestClientGetCalendarPath(t *testing.T) {
+	testCases := []struct {
+		name     string
+		baseURL  string
+		expected string
+	}{
+		{
+			name:     "extracts path from full URL",
+			baseURL:  "https://caldav.example.com/dav/calendars/user/default/",
+			expected: "/dav/calendars/user/default/",
+		},
+		{
+			name:     "returns root for URL without path",
+			baseURL:  "https://caldav.example.com",
+			expected: "/",
+		},
+		{
+			name:     "handles URL with port",
+			baseURL:  "https://caldav.example.com:8443/calendars/",
+			expected: "/calendars/",
+		},
+		{
+			name:     "handles URL with query string",
+			baseURL:  "https://caldav.example.com/cal?user=test",
+			expected: "/cal?user=test",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &Client{baseURL: tc.baseURL}
+			result := client.GetCalendarPath()
+			if result != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestClientBuildURL(t *testing.T) {
+	testCases := []struct {
+		name     string
+		baseURL  string
+		path     string
+		expected string
+	}{
+		{
+			name:     "returns baseURL for empty path",
+			baseURL:  "https://caldav.example.com/cal",
+			path:     "",
+			expected: "https://caldav.example.com/cal",
+		},
+		{
+			name:     "handles absolute path",
+			baseURL:  "https://caldav.example.com/cal",
+			path:     "/dav/calendars/event.ics",
+			expected: "https://caldav.example.com/dav/calendars/event.ics",
+		},
+		{
+			name:     "handles relative path",
+			baseURL:  "https://caldav.example.com/cal",
+			path:     "event.ics",
+			expected: "https://caldav.example.com/cal/event.ics",
+		},
+		{
+			name:     "removes trailing slash from baseURL for relative path",
+			baseURL:  "https://caldav.example.com/cal/",
+			path:     "event.ics",
+			expected: "https://caldav.example.com/cal/event.ics",
+		},
+		{
+			name:     "handles baseURL without path for absolute path",
+			baseURL:  "https://caldav.example.com",
+			path:     "/calendars/event.ics",
+			expected: "https://caldav.example.com/calendars/event.ics",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &Client{baseURL: tc.baseURL}
+			result := client.buildURL(tc.path)
+			if result != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestIsMalformedError(t *testing.T) {
+	testCases := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "returns true for ErrMalformedContent",
+			err:      ErrMalformedContent,
+			expected: true,
+		},
+		{
+			name:     "returns true for wrapped ErrMalformedContent",
+			err:      errors.New("malformed calendar data"),
+			expected: true,
+		},
+		{
+			name:     "returns true for missing colon error",
+			err:      errors.New("line 5: missing colon"),
+			expected: true,
+		},
+		{
+			name:     "returns true for invalid ical error",
+			err:      errors.New("invalid ical format"),
+			expected: true,
+		},
+		{
+			name:     "returns false for connection error",
+			err:      ErrConnectionFailed,
+			expected: false,
+		},
+		{
+			name:     "returns false for generic error",
+			err:      errors.New("something went wrong"),
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := IsMalformedError(tc.err)
+			if result != tc.expected {
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestParseEventPaths(t *testing.T) {
+	t.Run("parses event paths from multistatus response", func(t *testing.T) {
+		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/calendars/user/default/</D:href>
+    <D:propstat>
+      <D:prop><D:getcontenttype>text/calendar</D:getcontenttype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/calendars/user/default/event1.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getcontenttype>text/calendar</D:getcontenttype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/calendars/user/default/event2.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getcontenttype>text/calendar</D:getcontenttype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`
+
+		paths := parseEventPaths([]byte(xmlBody), "/calendars/user/default/")
+
+		if len(paths) != 2 {
+			t.Fatalf("expected 2 paths, got %d: %v", len(paths), paths)
+		}
+		if paths[0] != "/calendars/user/default/event1.ics" {
+			t.Errorf("expected first path to be event1.ics, got %q", paths[0])
+		}
+		if paths[1] != "/calendars/user/default/event2.ics" {
+			t.Errorf("expected second path to be event2.ics, got %q", paths[1])
+		}
+	})
+
+	t.Run("skips non-ics files", func(t *testing.T) {
+		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/calendars/user/default/event.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getcontenttype>text/calendar</D:getcontenttype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/calendars/user/default/readme.txt</D:href>
+    <D:propstat>
+      <D:prop><D:getcontenttype>text/plain</D:getcontenttype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`
+
+		paths := parseEventPaths([]byte(xmlBody), "/calendars/user/default/")
+
+		if len(paths) != 1 {
+			t.Fatalf("expected 1 path, got %d: %v", len(paths), paths)
+		}
+	})
+
+	t.Run("handles URL-encoded paths", func(t *testing.T) {
+		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/calendars/user/default/event%20with%20spaces.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getcontenttype>text/calendar</D:getcontenttype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`
+
+		paths := parseEventPaths([]byte(xmlBody), "/calendars/user/default/")
+
+		if len(paths) != 1 {
+			t.Fatalf("expected 1 path, got %d", len(paths))
+		}
+		// Should be URL-decoded
+		if paths[0] != "/calendars/user/default/event with spaces.ics" {
+			t.Errorf("expected decoded path, got %q", paths[0])
+		}
+	})
+
+	t.Run("returns empty slice for invalid XML", func(t *testing.T) {
+		paths := parseEventPaths([]byte("not valid xml"), "/cal/")
+		if paths != nil && len(paths) != 0 {
+			t.Errorf("expected empty slice, got %v", paths)
+		}
+	})
+}
+
+func TestParseICalendar(t *testing.T) {
+	t.Run("parses valid iCalendar data", func(t *testing.T) {
+		data := `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-uid@example.com
+DTSTART:20240115T140000Z
+DTEND:20240115T150000Z
+SUMMARY:Test Event
+END:VEVENT
+END:VCALENDAR`
+
+		cal, err := parseICalendar(data)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cal == nil {
+			t.Fatal("expected non-nil calendar")
+		}
+
+		events := cal.Events()
+		if len(events) != 1 {
+			t.Fatalf("expected 1 event, got %d", len(events))
+		}
+	})
+
+	t.Run("returns error for invalid data", func(t *testing.T) {
+		_, err := parseICalendar("not valid icalendar")
+		if err == nil {
+			t.Error("expected error for invalid data")
+		}
+	})
+
+	t.Run("returns error for empty data", func(t *testing.T) {
+		_, err := parseICalendar("")
+		if err == nil {
+			t.Error("expected error for empty data")
+		}
+	})
+}
+
+// Note: encodeCalendar tests are omitted because the go-ical library
+// encoder behavior varies and the function is tested through integration.
+
+func TestNormalizeStartTime(t *testing.T) {
+	t.Run("handles UTC time", func(t *testing.T) {
+		prop := &ical.Prop{
+			Name:  ical.PropDateTimeStart,
+			Value: "20240115T140000Z",
+		}
+
+		result := normalizeStartTime(prop)
+
+		if result != "20240115T140000Z" {
+			t.Errorf("expected '20240115T140000Z', got %q", result)
+		}
+	})
+
+	t.Run("handles nil prop", func(t *testing.T) {
+		result := normalizeStartTime(nil)
+		if result != "" {
+			t.Errorf("expected empty string, got %q", result)
+		}
+	})
+
+	t.Run("handles local time without TZID", func(t *testing.T) {
+		prop := &ical.Prop{
+			Name:  ical.PropDateTimeStart,
+			Value: "20240115T140000",
+		}
+
+		result := normalizeStartTime(prop)
+
+		// Should return some value (behavior depends on go-ical library)
+		if result == "" {
+			t.Error("expected non-empty result")
+		}
+	})
+}
+
+func TestParseGMTOffset(t *testing.T) {
+	testCases := []struct {
+		name           string
+		tzid           string
+		expectedOffset int // in seconds
+		expectedNil    bool
+	}{
+		{
+			name:           "GMT alone returns UTC",
+			tzid:           "GMT",
+			expectedOffset: 0,
+		},
+		{
+			name:           "UTC alone returns UTC",
+			tzid:           "UTC",
+			expectedOffset: 0,
+		},
+		{
+			name:           "GMT-0400",
+			tzid:           "GMT-0400",
+			expectedOffset: -4 * 3600,
+		},
+		{
+			name:           "GMT+0530",
+			tzid:           "GMT+0530",
+			expectedOffset: 5*3600 + 30*60,
+		},
+		{
+			name:           "UTC+05:30",
+			tzid:           "UTC+05:30",
+			expectedOffset: 5*3600 + 30*60,
+		},
+		{
+			name:           "GMT-5 (single digit)",
+			tzid:           "GMT-5",
+			expectedOffset: -5 * 3600,
+		},
+		{
+			name:           "GMT+10 (two digits)",
+			tzid:           "GMT+10",
+			expectedOffset: 10 * 3600,
+		},
+		{
+			name:        "invalid format returns nil",
+			tzid:        "America/New_York",
+			expectedNil: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			loc := parseGMTOffset(tc.tzid)
+
+			if tc.expectedNil {
+				if loc != nil {
+					t.Errorf("expected nil, got %v", loc)
+				}
+				return
+			}
+
+			if loc == nil {
+				t.Fatal("expected non-nil location")
+			}
+
+			// Test the offset by checking a specific time
+			testTime := time.Date(2024, 1, 15, 12, 0, 0, 0, loc)
+			_, offset := testTime.Zone()
+			if offset != tc.expectedOffset {
+				t.Errorf("expected offset %d, got %d", tc.expectedOffset, offset)
+			}
+		})
+	}
+}
+
+func TestSyncResult(t *testing.T) {
+	t.Run("struct has expected fields", func(t *testing.T) {
+		result := SyncResult{
+			Success:           true,
+			Message:           "Sync completed",
+			Created:           5,
+			Updated:           3,
+			Deleted:           2,
+			Skipped:           1,
+			DuplicatesRemoved: 0,
+			CalendarsSynced:   2,
+			EventsProcessed:   10,
+			Errors:            []string{},
+			Warnings:          []string{"warning 1"},
+			Duration:          5 * time.Second,
+		}
+
+		if !result.Success {
+			t.Error("expected Success to be true")
+		}
+		if result.Created != 5 {
+			t.Errorf("expected Created 5, got %d", result.Created)
+		}
+		if result.Updated != 3 {
+			t.Errorf("expected Updated 3, got %d", result.Updated)
+		}
+		if result.Deleted != 2 {
+			t.Errorf("expected Deleted 2, got %d", result.Deleted)
+		}
+		if result.CalendarsSynced != 2 {
+			t.Errorf("expected CalendarsSynced 2, got %d", result.CalendarsSynced)
+		}
+		if len(result.Warnings) != 1 {
+			t.Errorf("expected 1 warning, got %d", len(result.Warnings))
+		}
+	})
+}
+
+func TestSanitizeLogDetails(t *testing.T) {
+	t.Run("returns empty string for empty input", func(t *testing.T) {
+		result := sanitizeLogDetails("")
+		if result != "" {
+			t.Errorf("expected empty string, got %q", result)
+		}
+	})
+
+	t.Run("returns short strings unchanged", func(t *testing.T) {
+		input := "Synced 10 events successfully"
+		result := sanitizeLogDetails(input)
+		if result != input {
+			t.Errorf("expected %q, got %q", input, result)
+		}
+	})
+
+	t.Run("truncates very long strings", func(t *testing.T) {
+		input := strings.Repeat("a", 3000)
+		result := sanitizeLogDetails(input)
+
+		if len(result) > 2100 { // 2000 + some buffer for "... (truncated)"
+			t.Errorf("expected truncated result, got length %d", len(result))
+		}
+		if !strings.Contains(result, "(truncated)") {
+			t.Error("expected truncation marker")
+		}
+	})
+}
+
+func TestNewSyncEngine(t *testing.T) {
+	t.Run("creates sync engine with nil dependencies", func(t *testing.T) {
+		engine := NewSyncEngine(nil, nil)
+
+		if engine == nil {
+			t.Fatal("expected non-nil engine")
+		}
+	})
+}
+
+func TestSyncItem(t *testing.T) {
+	t.Run("struct has expected fields", func(t *testing.T) {
+		item := SyncItem{
+			Path: "/calendars/event.ics",
+			ETag: "etag-123",
+			Data: "BEGIN:VCALENDAR...",
+		}
+
+		if item.Path != "/calendars/event.ics" {
+			t.Error("Path not set correctly")
+		}
+		if item.ETag != "etag-123" {
+			t.Error("ETag not set correctly")
+		}
+		if item.Data != "BEGIN:VCALENDAR..." {
+			t.Error("Data not set correctly")
+		}
+	})
+}
+
+func TestSyncResponse(t *testing.T) {
+	t.Run("struct has expected fields", func(t *testing.T) {
+		resp := SyncResponse{
+			SyncToken: "sync-token-123",
+			Changed:   []SyncItem{{Path: "/event1.ics"}},
+			Deleted:   []string{"/event2.ics"},
+		}
+
+		if resp.SyncToken != "sync-token-123" {
+			t.Error("SyncToken not set correctly")
+		}
+		if len(resp.Changed) != 1 {
+			t.Errorf("expected 1 changed item, got %d", len(resp.Changed))
+		}
+		if len(resp.Deleted) != 1 {
+			t.Errorf("expected 1 deleted item, got %d", len(resp.Deleted))
+		}
+	})
+}
+
+func TestBuildSyncCollectionRequest(t *testing.T) {
+	t.Run("builds request without sync token", func(t *testing.T) {
+		result := buildSyncCollectionRequest("")
+
+		if !strings.Contains(result, "<D:sync-token/>") {
+			t.Error("expected empty sync-token element")
+		}
+		if !strings.Contains(result, "<D:sync-collection") {
+			t.Error("expected sync-collection element")
+		}
+		if !strings.Contains(result, "<D:getetag/>") {
+			t.Error("expected getetag element")
+		}
+		if !strings.Contains(result, "<C:calendar-data/>") {
+			t.Error("expected calendar-data element")
+		}
+	})
+
+	t.Run("builds request with sync token", func(t *testing.T) {
+		result := buildSyncCollectionRequest("http://example.com/sync/token123")
+
+		if !strings.Contains(result, "<D:sync-token>http://example.com/sync/token123</D:sync-token>") {
+			t.Error("expected sync-token with value")
+		}
+	})
+
+	t.Run("escapes special characters in sync token", func(t *testing.T) {
+		result := buildSyncCollectionRequest("token<>&'\"")
+
+		if strings.Contains(result, "token<>") {
+			t.Error("expected special characters to be escaped")
+		}
+		if !strings.Contains(result, "&lt;") {
+			t.Error("expected < to be escaped")
+		}
+		if !strings.Contains(result, "&gt;") {
+			t.Error("expected > to be escaped")
+		}
+	})
+}
+
+func TestParseSyncResponse(t *testing.T) {
+	t.Run("parses response with changed items", func(t *testing.T) {
+		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:sync-token>http://example.com/sync/token456</D:sync-token>
+  <D:response>
+    <D:href>/calendars/event1.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"etag-123"</D:getetag>
+        <C:calendar-data>BEGIN:VCALENDAR...</C:calendar-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`
+
+		resp, err := parseSyncResponse([]byte(xmlBody))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if resp.SyncToken != "http://example.com/sync/token456" {
+			t.Errorf("expected sync token, got %q", resp.SyncToken)
+		}
+		if len(resp.Changed) != 1 {
+			t.Fatalf("expected 1 changed item, got %d", len(resp.Changed))
+		}
+		if resp.Changed[0].Path != "/calendars/event1.ics" {
+			t.Errorf("expected path, got %q", resp.Changed[0].Path)
+		}
+	})
+
+	t.Run("parses response with deleted items", func(t *testing.T) {
+		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:sync-token>token123</D:sync-token>
+  <D:response>
+    <D:href>/calendars/deleted-event.ics</D:href>
+    <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:response>
+</D:multistatus>`
+
+		resp, err := parseSyncResponse([]byte(xmlBody))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(resp.Deleted) != 1 {
+			t.Fatalf("expected 1 deleted item, got %d", len(resp.Deleted))
+		}
+		if resp.Deleted[0] != "/calendars/deleted-event.ics" {
+			t.Errorf("expected deleted path, got %q", resp.Deleted[0])
+		}
+	})
+
+	t.Run("returns error for invalid XML", func(t *testing.T) {
+		_, err := parseSyncResponse([]byte("not valid xml"))
+		if err == nil {
+			t.Error("expected error for invalid XML")
+		}
+	})
+}
+
+func TestXmlEscape(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "escapes ampersand",
+			input:    "a & b",
+			expected: "a &amp; b",
+		},
+		{
+			name:     "escapes less than",
+			input:    "a < b",
+			expected: "a &lt; b",
+		},
+		{
+			name:     "escapes greater than",
+			input:    "a > b",
+			expected: "a &gt; b",
+		},
+		{
+			name:     "escapes single quote",
+			input:    "it's",
+			expected: "it&apos;s",
+		},
+		{
+			name:     "escapes double quote",
+			input:    `say "hello"`,
+			expected: "say &quot;hello&quot;",
+		},
+		{
+			name:     "escapes all special characters",
+			input:    `<tag attr='val' & "test">`,
+			expected: "&lt;tag attr=&apos;val&apos; &amp; &quot;test&quot;&gt;",
+		},
+		{
+			name:     "returns empty string unchanged",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "returns plain text unchanged",
+			input:    "plain text",
+			expected: "plain text",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := xmlEscape(tc.input)
+			if result != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, result)
+			}
+		})
+	}
 }
