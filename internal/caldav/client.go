@@ -362,12 +362,29 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 		return fmt.Errorf("failed to parse iCalendar data: %w", err)
 	}
 
-	// Use event path if available, otherwise use calendar path
+	// Determine the path for this event on this server
+	// If event.Path is from a different server (doesn't start with calendarPath),
+	// we need to construct a new path using the UID
 	path := event.Path
-	if path == "" {
-		path = calendarPath
+	if path == "" || !strings.HasPrefix(path, calendarPath) {
+		// Construct path from calendar path and UID
+		if event.UID == "" {
+			// Try to extract UID from calendar data
+			for _, evt := range cal.Events() {
+				if uid, err := evt.Props.Text(ical.PropUID); err == nil {
+					event.UID = uid
+					break
+				}
+			}
+		}
+		if event.UID != "" {
+			path = strings.TrimSuffix(calendarPath, "/") + "/" + event.UID + ".ics"
+		} else {
+			path = calendarPath
+		}
 	}
 
+	log.Printf("PutEvent: putting to path %s", path)
 	_, err = c.caldavClient.PutCalendarObject(ctx, path, cal)
 	if err != nil {
 		return fmt.Errorf("%w: failed to put event: %w", ErrConnectionFailed, err)
