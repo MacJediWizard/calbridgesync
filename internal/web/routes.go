@@ -1,6 +1,10 @@
 package web
 
 import (
+	"net/http"
+	"os"
+	"path/filepath"
+
 	"github.com/gin-gonic/gin"
 	"github.com/macjediwizard/calbridge/internal/auth"
 )
@@ -12,28 +16,75 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	r.GET("/healthz", h.Liveness)
 	r.GET("/ready", h.Readiness)
 
-	// Auth endpoints (no auth required)
+	// Auth endpoints (no auth required) - for SSO redirect flow
 	authGroup := r.Group("/auth")
 	{
-		authGroup.GET("/login", h.LoginPage)
+		authGroup.GET("/login", h.Login)
 		authGroup.POST("/login", h.Login)
 		authGroup.GET("/callback", h.Callback)
 		authGroup.POST("/logout", h.Logout)
 	}
 
-	// Protected routes
-	protected := r.Group("/")
-	protected.Use(auth.RequireAuth(sm))
+	// API routes for React frontend
+	apiGroup := r.Group("/api")
+	apiGroup.Use(auth.OptionalAuth(sm))
 	{
-		protected.GET("/", h.Dashboard)
-		protected.GET("/sources", h.ListSources)
-		protected.GET("/sources/add", h.AddSourcePage)
-		protected.POST("/sources/add", h.AddSource)
-		protected.GET("/sources/:id/edit", h.EditSourcePage)
-		protected.POST("/sources/:id", h.UpdateSource)
-		protected.DELETE("/sources/:id", h.DeleteSource)
-		protected.POST("/sources/:id/sync", h.TriggerSync)
-		protected.POST("/sources/:id/toggle", h.ToggleSource)
-		protected.GET("/sources/:id/logs", h.ViewLogs)
+		apiGroup.GET("/auth/status", h.APIAuthStatus)
+		apiGroup.POST("/auth/logout", h.APILogout)
 	}
+
+	// Protected API routes
+	protectedAPI := r.Group("/api")
+	protectedAPI.Use(auth.RequireAuth(sm))
+	{
+		protectedAPI.GET("/dashboard/stats", h.APIDashboardStats)
+		protectedAPI.GET("/sources", h.APIListSources)
+		protectedAPI.POST("/sources", h.APICreateSource)
+		protectedAPI.GET("/sources/:id", h.APIGetSource)
+		protectedAPI.PUT("/sources/:id", h.APIUpdateSource)
+		protectedAPI.DELETE("/sources/:id", h.APIDeleteSource)
+		protectedAPI.POST("/sources/:id/toggle", h.APIToggleSource)
+		protectedAPI.POST("/sources/:id/sync", h.APITriggerSync)
+		protectedAPI.GET("/sources/:id/logs", h.APIGetSourceLogs)
+	}
+
+	// Serve React app static files
+	setupReactApp(r)
+}
+
+// setupReactApp configures serving of the React frontend.
+func setupReactApp(r *gin.Engine) {
+	// Check if React build exists
+	webDistPath := "web/dist"
+	if _, err := os.Stat(webDistPath); os.IsNotExist(err) {
+		// In development or React app not built yet
+		return
+	}
+
+	// Serve static assets
+	r.Static("/assets", filepath.Join(webDistPath, "assets"))
+
+	// Serve other static files
+	r.StaticFile("/vite.svg", filepath.Join(webDistPath, "vite.svg"))
+
+	// SPA fallback - serve index.html for all unmatched routes
+	r.NoRoute(func(c *gin.Context) {
+		// Don't serve index.html for API routes
+		if len(c.Request.URL.Path) >= 4 && c.Request.URL.Path[:4] == "/api" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
+			return
+		}
+		// Don't serve index.html for auth routes
+		if len(c.Request.URL.Path) >= 5 && c.Request.URL.Path[:5] == "/auth" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
+			return
+		}
+		// Don't serve index.html for health routes
+		if c.Request.URL.Path == "/health" || c.Request.URL.Path == "/healthz" || c.Request.URL.Path == "/ready" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
+			return
+		}
+
+		c.File(filepath.Join(webDistPath, "index.html"))
+	})
 }
