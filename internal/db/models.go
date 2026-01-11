@@ -142,3 +142,15 @@ type SyncLog struct {
 	Duration        time.Duration `json:"duration"`
 	CreatedAt       time.Time     `json:"created_at"`
 }
+
+// SyncedEvent tracks known event UIDs for deletion detection in two-way sync.
+type SyncedEvent struct {
+	ID           string    `json:"id"`
+	SourceID     string    `json:"source_id"`
+	CalendarHref string    `json:"calendar_href"`
+	EventUID     string    `json:"event_uid"`
+	SourceETag   string    `json:"source_etag"` // ETag on source calendar
+	DestETag     string    `json:"dest_etag"`   // ETag on destination calendar
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}

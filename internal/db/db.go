@@ -161,6 +161,23 @@ func (db *DB) migrate() error {
 		`ALTER TABLE sync_logs ADD COLUMN events_skipped INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sync_logs ADD COLUMN calendars_synced INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sync_logs ADD COLUMN events_processed INTEGER NOT NULL DEFAULT 0`,
+
+		// Synced events table for deletion tracking in two-way sync
+		`CREATE TABLE IF NOT EXISTS synced_events (
+			id TEXT PRIMARY KEY,
+			source_id TEXT NOT NULL,
+			calendar_href TEXT NOT NULL,
+			event_uid TEXT NOT NULL,
+			source_etag TEXT,
+			dest_etag TEXT,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(source_id, calendar_href, event_uid),
+			FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+		)`,
+
+		// Index on source_id and calendar_href for synced_events
+		`CREATE INDEX IF NOT EXISTS idx_synced_events_source_calendar ON synced_events(source_id, calendar_href)`,
 	}
 
 	for _, migration := range migrations {

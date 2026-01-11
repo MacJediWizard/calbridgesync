@@ -443,3 +443,99 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 
 	return source, nil
 }
+
+// GetSyncedEvents returns all synced event UIDs for a source and calendar.
+func (db *DB) GetSyncedEvents(sourceID, calendarHref string) ([]*SyncedEvent, error) {
+	query := `SELECT id, source_id, calendar_href, event_uid, source_etag, dest_etag, created_at, updated_at
+		FROM synced_events WHERE source_id = ? AND calendar_href = ?`
+
+	rows, err := db.conn.Query(query, sourceID, calendarHref)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query synced events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*SyncedEvent
+	for rows.Next() {
+		event := &SyncedEvent{}
+		var sourceETag, destETag sql.NullString
+		err := rows.Scan(&event.ID, &event.SourceID, &event.CalendarHref, &event.EventUID,
+			&sourceETag, &destETag, &event.CreatedAt, &event.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan synced event: %w", err)
+		}
+		event.SourceETag = sourceETag.String
+		event.DestETag = destETag.String
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating synced events: %w", err)
+	}
+
+	return events, nil
+}
+
+// UpsertSyncedEvent creates or updates a synced event record.
+func (db *DB) UpsertSyncedEvent(event *SyncedEvent) error {
+	now := time.Now().UTC()
+
+	// Try to update first
+	query := `UPDATE synced_events SET source_etag = ?, dest_etag = ?, updated_at = ?
+		WHERE source_id = ? AND calendar_href = ? AND event_uid = ?`
+
+	result, err := db.conn.Exec(query, event.SourceETag, event.DestETag, now,
+		event.SourceID, event.CalendarHref, event.EventUID)
+	if err != nil {
+		return fmt.Errorf("failed to update synced event: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if affected == 0 {
+		// Insert new record
+		if event.ID == "" {
+			event.ID = uuid.New().String()
+		}
+		event.CreatedAt = now
+		event.UpdatedAt = now
+
+		insertQuery := `INSERT INTO synced_events (id, source_id, calendar_href, event_uid, source_etag, dest_etag, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+
+		_, err = db.conn.Exec(insertQuery, event.ID, event.SourceID, event.CalendarHref,
+			event.EventUID, event.SourceETag, event.DestETag, event.CreatedAt, event.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("failed to insert synced event: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// DeleteSyncedEvent removes a synced event record.
+func (db *DB) DeleteSyncedEvent(sourceID, calendarHref, eventUID string) error {
+	query := `DELETE FROM synced_events WHERE source_id = ? AND calendar_href = ? AND event_uid = ?`
+
+	_, err := db.conn.Exec(query, sourceID, calendarHref, eventUID)
+	if err != nil {
+		return fmt.Errorf("failed to delete synced event: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteSyncedEventsForCalendar removes all synced event records for a calendar.
+func (db *DB) DeleteSyncedEventsForCalendar(sourceID, calendarHref string) error {
+	query := `DELETE FROM synced_events WHERE source_id = ? AND calendar_href = ?`
+
+	_, err := db.conn.Exec(query, sourceID, calendarHref)
+	if err != nil {
+		return fmt.Errorf("failed to delete synced events for calendar: %w", err)
+	}
+
+	return nil
+}

@@ -231,16 +231,27 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	}
 
 	// Get the destination calendar path from the destination client's base URL
-	// The destination URL is already configured to point to the target calendar
 	destCalendarPath := destClient.GetCalendarPath()
 	log.Printf("Using destination calendar path: %s", destCalendarPath)
 
 	// Get all events from destination
 	destEvents, err := destClient.GetEvents(ctx, destCalendarPath)
 	if err != nil {
-		// Destination calendar might not exist yet
 		log.Printf("Failed to get destination events: %v", err)
 		destEvents = []Event{}
+	}
+
+	// Get previously synced events for deletion detection
+	previouslySynced, err := se.db.GetSyncedEvents(source.ID, calendar.Path)
+	if err != nil {
+		log.Printf("Failed to get synced events: %v", err)
+		previouslySynced = []*db.SyncedEvent{}
+	}
+
+	// Build map of previously synced UIDs
+	previouslySyncedMap := make(map[string]*db.SyncedEvent)
+	for _, se := range previouslySynced {
+		previouslySyncedMap[se.EventUID] = se
 	}
 
 	// Create maps for comparison by UID
@@ -259,11 +270,10 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	}
 
 	// Create deduplication map using summary + start time
-	// This catches duplicates with different UIDs but same content
 	destDedupeMap := make(map[string]bool)
 	for _, e := range destEvents {
 		key := e.DedupeKey()
-		if key != "|" { // Skip if both summary and start time are empty
+		if key != "|" {
 			destDedupeMap[key] = true
 			log.Printf("Dest dedupe key: %q (UID: %s)", key, e.UID)
 		}
@@ -271,16 +281,70 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 
 	skippedDupes := 0
 
+	// Track UIDs that exist in current sync (for updating synced_events table)
+	currentUIDs := make(map[string]bool)
+
+	// Handle deletions first (for two-way sync)
+	if source.SyncDirection == db.SyncDirectionTwoWay {
+		for uid, syncedEvent := range previouslySyncedMap {
+			_, existsOnSource := sourceEventMap[uid]
+			destEvent, existsOnDest := destEventMap[uid]
+
+			if !existsOnSource && existsOnDest {
+				// Event was deleted from source - delete from destination too
+				log.Printf("Event %s deleted from source, deleting from destination", uid)
+				if err := destClient.DeleteEvent(ctx, destEvent.Path); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("Failed to delete event from dest: %v", err))
+				} else {
+					result.Deleted++
+				}
+				// Remove from synced_events
+				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+					log.Printf("Failed to delete synced event record: %v", err)
+				}
+				delete(destEventMap, uid)
+				continue
+			}
+
+			sourceEvent, existsOnSource := sourceEventMap[uid]
+			if existsOnSource && !existsOnDest {
+				// Event was deleted from destination - delete from source too
+				log.Printf("Event %s deleted from destination, deleting from source", uid)
+				if err := sourceClient.DeleteEvent(ctx, sourceEvent.Path); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("Failed to delete event from source: %v", err))
+				} else {
+					result.Deleted++
+				}
+				// Remove from synced_events
+				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+					log.Printf("Failed to delete synced event record: %v", err)
+				}
+				delete(sourceEventMap, uid)
+				continue
+			}
+
+			if !existsOnSource && !existsOnDest {
+				// Event deleted from both - just clean up the record
+				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, syncedEvent.EventUID); err != nil {
+					log.Printf("Failed to delete synced event record: %v", err)
+				}
+			}
+		}
+	}
+
 	// Sync source events to destination
 	for _, sourceEvent := range sourceEvents {
+		if sourceEvent.UID == "" {
+			continue
+		}
+
 		destEvent, existsByUID := destEventMap[sourceEvent.UID]
 
 		if !existsByUID {
-			// Check for duplicate by content (same summary + start time)
+			// Check for duplicate by content
 			dedupeKey := sourceEvent.DedupeKey()
 			log.Printf("Source dedupe key: %q (UID: %s)", dedupeKey, sourceEvent.UID)
 			if dedupeKey != "|" && destDedupeMap[dedupeKey] {
-				// Event with same content already exists, skip
 				skippedDupes++
 				log.Printf("Skipping duplicate event: %s at %s (dedupe key match)", sourceEvent.Summary, sourceEvent.StartTime)
 				continue
@@ -291,25 +355,27 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to create event on dest: %v", err))
 			} else {
 				result.Created++
-				// Add to dedupe map to prevent future duplicates in this sync
 				if dedupeKey != "|" {
 					destDedupeMap[dedupeKey] = true
 				}
+				currentUIDs[sourceEvent.UID] = true
 			}
 		} else if sourceEvent.ETag != destEvent.ETag {
-			// Update existing event on destination
-			sourceEvent.Path = destEvent.Path // Use destination path
+			// Update existing event
+			sourceEvent.Path = destEvent.Path
 			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to update event on dest: %v", err))
 			} else {
 				result.Updated++
+				currentUIDs[sourceEvent.UID] = true
 			}
+		} else {
+			// Event unchanged, still track it
+			currentUIDs[sourceEvent.UID] = true
 		}
-		// Remove from map to track what's processed
 		delete(destEventMap, sourceEvent.UID)
 	}
 
-	// Track skipped duplicates and total events processed
 	result.Skipped = skippedDupes
 	result.EventsProcessed = len(sourceEvents)
 
@@ -321,18 +387,27 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	if source.SyncDirection == db.SyncDirectionTwoWay {
 		log.Printf("Two-way sync enabled, syncing destination events to source")
 		for _, destEvent := range destEvents {
+			if destEvent.UID == "" {
+				continue
+			}
+
 			sourceEvent, exists := sourceEventMap[destEvent.UID]
 
 			if !exists {
-				// Create new event on source (event only exists on destination)
+				// Check if this was previously synced (meaning it was deleted from source)
+				if _, wasSynced := previouslySyncedMap[destEvent.UID]; wasSynced {
+					// Already handled in deletion phase above
+					continue
+				}
+
+				// New event on destination - create on source
 				if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to create event on source: %v", err))
 				} else {
 					result.Created++
+					currentUIDs[destEvent.UID] = true
 				}
 			} else if destEvent.ETag != sourceEvent.ETag {
-				// For two-way sync with different ETags, use conflict strategy
-				// If dest_wins or newest_wins, update source with destination version
 				if source.ConflictStrategy == db.ConflictDestWins {
 					destEvent.Path = sourceEvent.Path
 					if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
@@ -341,13 +416,14 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 						result.Updated++
 					}
 				}
-				// For source_wins, we already updated destination above
+				currentUIDs[destEvent.UID] = true
+			} else {
+				currentUIDs[destEvent.UID] = true
 			}
 		}
 	}
 
-	// Events remaining in destEventMap don't exist in source
-	// Based on conflict strategy, we might delete them (only for one-way sync)
+	// One-way sync: delete orphan events on destination
 	if source.SyncDirection == db.SyncDirectionOneWay && source.ConflictStrategy == db.ConflictSourceWins {
 		for _, event := range destEventMap {
 			if err := destClient.DeleteEvent(ctx, event.Path); err != nil {
@@ -355,6 +431,18 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 			} else {
 				result.Deleted++
 			}
+		}
+	}
+
+	// Update synced_events table with current state
+	for uid := range currentUIDs {
+		syncedEvent := &db.SyncedEvent{
+			SourceID:     source.ID,
+			CalendarHref: calendar.Path,
+			EventUID:     uid,
+		}
+		if err := se.db.UpsertSyncedEvent(syncedEvent); err != nil {
+			log.Printf("Failed to upsert synced event: %v", err)
 		}
 	}
 
