@@ -61,7 +61,7 @@ export default function SourceLogs() {
       <div className="flex items-center space-x-4">
         <Link
           to="/sources"
-          className="px-3 py-2 rounded bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700 transition-colors text-sm"
+          className="px-3 py-2 rounded bg-zinc-800 text-gray-400 hover:text-white hover:bg-zinc-700 transition-colors text-sm"
         >
           ← Back
         </Link>
@@ -72,12 +72,12 @@ export default function SourceLogs() {
       </div>
 
       {/* Logs Table */}
-      <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
         {logs.length > 0 ? (
           <>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
-                <thead className="bg-gray-900/50">
+                <thead className="bg-black/50">
                   <tr>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Time</th>
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
@@ -85,9 +85,9 @@ export default function SourceLogs() {
                     <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Duration</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-700">
+                <tbody className="divide-y divide-zinc-800">
                   {logs.map((log) => (
-                    <tr key={log.id} className="hover:bg-gray-700/30">
+                    <tr key={log.id} className="hover:bg-zinc-800/50">
                       <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{formatDate(log.created_at)}</td>
                       <td className="px-4 py-3 whitespace-nowrap">
                         <span
@@ -96,7 +96,7 @@ export default function SourceLogs() {
                               ? 'bg-green-900/50 text-green-400'
                               : log.status === 'error'
                               ? 'bg-red-900/50 text-red-400'
-                              : 'bg-gray-700 text-gray-400'
+                              : 'bg-zinc-800 text-gray-400'
                           }`}
                         >
                           {log.status === 'success' ? 'OK' : log.status === 'error' ? 'Error' : log.status}
@@ -106,10 +106,10 @@ export default function SourceLogs() {
                         <div>{log.message}</div>
                         {log.details && (
                           <details className="mt-1">
-                            <summary className="text-xs text-indigo-400 cursor-pointer hover:text-indigo-300">
+                            <summary className="text-xs text-red-400 cursor-pointer hover:text-red-300">
                               Details
                             </summary>
-                            <pre className="mt-1 text-xs text-gray-400 bg-gray-900 p-2 rounded overflow-x-auto">
+                            <pre className="mt-1 text-xs text-gray-400 bg-black p-2 rounded overflow-x-auto">
                               {log.details}
                             </pre>
                           </details>
@@ -123,7 +123,7 @@ export default function SourceLogs() {
             </div>
 
             {totalPages > 1 && (
-              <div className="px-4 py-3 flex items-center justify-between border-t border-gray-700">
+              <div className="px-4 py-3 flex items-center justify-between border-t border-zinc-800">
                 <p className="text-sm text-gray-400">
                   Page {page} of {totalPages}
                 </p>
@@ -131,7 +131,7 @@ export default function SourceLogs() {
                   {page > 1 && (
                     <button
                       onClick={() => setPage(page - 1)}
-                      className="px-3 py-1.5 rounded text-sm text-gray-400 bg-gray-700 hover:bg-gray-600 hover:text-white"
+                      className="px-3 py-1.5 rounded text-sm text-gray-400 bg-zinc-800 hover:bg-zinc-700 hover:text-white"
                     >
                       Prev
                     </button>
@@ -139,7 +139,7 @@ export default function SourceLogs() {
                   {page < totalPages && (
                     <button
                       onClick={() => setPage(page + 1)}
-                      className="px-3 py-1.5 rounded text-sm text-gray-400 bg-gray-700 hover:bg-gray-600 hover:text-white"
+                      className="px-3 py-1.5 rounded text-sm text-gray-400 bg-zinc-800 hover:bg-zinc-700 hover:text-white"
                     >
                       Next
                     </button>

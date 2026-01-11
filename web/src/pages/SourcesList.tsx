@@ -86,18 +86,18 @@ export default function SourcesList() {
         </div>
         <Link
           to="/sources/add"
-          className="inline-flex items-center px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors"
+          className="inline-flex items-center px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors"
         >
           + Add Source
         </Link>
       </div>
 
       {/* Sources Table */}
-      <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
         {sources.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead className="bg-gray-900/50">
+              <thead className="bg-black/50">
                 <tr>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Name</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Source</th>
@@ -107,9 +107,9 @@ export default function SourcesList() {
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-700">
+              <tbody className="divide-y divide-zinc-800">
                 {sources.map((source) => (
-                  <tr key={source.id} className="hover:bg-gray-700/30">
+                  <tr key={source.id} className="hover:bg-zinc-800/50">
                     <td className="px-4 py-3">
                       <div className="font-medium text-white">{source.name}</div>
                       <div className="text-xs text-gray-500">{source.source_type}</div>
@@ -133,7 +133,7 @@ export default function SourcesList() {
                           onClick={() => handleToggle(source.id)}
                           disabled={actionId === source.id}
                           className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
-                            source.enabled ? 'bg-indigo-600' : 'bg-gray-600'
+                            source.enabled ? 'bg-red-600' : 'bg-gray-600'
                           }`}
                         >
                           <span
@@ -150,7 +150,7 @@ export default function SourcesList() {
                                 : source.sync_status === 'error'
                                 ? 'text-red-400'
                                 : source.sync_status === 'running'
-                                ? 'text-blue-400'
+                                ? 'text-yellow-400'
                                 : 'text-gray-500'
                             }`}
                           >
@@ -170,7 +170,7 @@ export default function SourcesList() {
                         <button
                           onClick={() => handleSync(source.id)}
                           disabled={!source.enabled || actionId === source.id}
-                          className="text-indigo-400 hover:text-indigo-300 text-xs font-medium disabled:opacity-50"
+                          className="text-red-400 hover:text-red-300 text-xs font-medium disabled:opacity-50"
                         >
                           Sync
                         </button>
@@ -206,7 +206,7 @@ export default function SourcesList() {
             <p className="mt-1 text-sm text-gray-400">Add your first source to begin syncing.</p>
             <Link
               to="/sources/add"
-              className="mt-4 inline-flex items-center px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors"
+              className="mt-4 inline-flex items-center px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors"
             >
               + Add Your First Source
             </Link>

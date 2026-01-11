@@ -1,6 +1,8 @@
 import { Link, useLocation, Outlet } from 'react-router-dom';
 import type { User } from '../types';
 
+const LOGO_URL = 'https://cdn.macjediwizard.com/cdn/CalBridge%20Images/calbridge-06070e03.png';
+
 interface LayoutProps {
   user: User | null;
   onLogout: () => void;
@@ -15,14 +17,17 @@ export default function Layout({ user, onLogout }: LayoutProps) {
   };
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen flex flex-col bg-black">
       {/* Navigation */}
-      <nav className="bg-gray-800 border-b border-gray-700">
+      <nav className="bg-zinc-900 border-b border-zinc-800">
         <div className="max-w-6xl mx-auto px-4">
-          <div className="flex items-center justify-between h-14">
+          <div className="flex items-center justify-between h-16">
             <div className="flex items-center">
-              <Link to="/" className="text-lg font-bold text-white" style={{ fontFamily: 'Orbitron, monospace' }}>
-                CalBridge
+              <Link to="/" className="flex items-center space-x-3">
+                <img src={LOGO_URL} alt="CalBridge" className="w-10 h-10" />
+                <span className="text-lg font-bold text-white" style={{ fontFamily: 'Orbitron, monospace' }}>
+                  CalBridge
+                </span>
               </Link>
               {user && (
                 <div className="hidden md:flex ml-8 space-x-1">
@@ -30,8 +35,8 @@ export default function Layout({ user, onLogout }: LayoutProps) {
                     to="/"
                     className={`px-3 py-2 rounded text-sm ${
                       isActive('/') && location.pathname === '/'
-                        ? 'bg-gray-700 text-white'
-                        : 'text-gray-300 hover:text-white hover:bg-gray-700'
+                        ? 'bg-red-600 text-white'
+                        : 'text-gray-300 hover:text-white hover:bg-zinc-800'
                     }`}
                   >
                     Dashboard
@@ -40,8 +45,8 @@ export default function Layout({ user, onLogout }: LayoutProps) {
                     to="/sources"
                     className={`px-3 py-2 rounded text-sm ${
                       isActive('/sources')
-                        ? 'bg-gray-700 text-white'
-                        : 'text-gray-300 hover:text-white hover:bg-gray-700'
+                        ? 'bg-red-600 text-white'
+                        : 'text-gray-300 hover:text-white hover:bg-zinc-800'
                     }`}
                   >
                     Sources
@@ -54,7 +59,7 @@ export default function Layout({ user, onLogout }: LayoutProps) {
                 <span className="hidden sm:block text-sm text-gray-400">{user.email}</span>
                 <button
                   onClick={onLogout}
-                  className="px-3 py-1.5 text-sm text-gray-300 hover:text-white"
+                  className="px-3 py-1.5 text-sm text-gray-300 hover:text-white hover:bg-zinc-800 rounded"
                 >
                   Logout
                 </button>
@@ -70,7 +75,7 @@ export default function Layout({ user, onLogout }: LayoutProps) {
       </main>
 
       {/* Footer */}
-      <footer className="bg-gray-800 border-t border-gray-700 py-4 mt-auto">
+      <footer className="bg-zinc-900 border-t border-zinc-800 py-4 mt-auto">
         <div className="max-w-6xl mx-auto px-4 text-center">
           <p className="text-gray-500 text-sm">CalBridge - CalDAV Synchronization</p>
           <p className="text-gray-600 text-xs mt-1">Powered by MacJediWizard Digital Wizardry</p>

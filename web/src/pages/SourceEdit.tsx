@@ -125,7 +125,7 @@ export default function SourceEdit() {
       </div>
 
       {/* Form */}
-      <div className="bg-gray-800 rounded-lg border border-gray-700">
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800">
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
           {error && (
             <div className="p-3 rounded bg-red-900/50 border border-red-700 text-red-200 text-sm">{error}</div>
@@ -133,7 +133,7 @@ export default function SourceEdit() {
 
           {/* General Settings */}
           <div className="space-y-4">
-            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-gray-700 pb-2">
+            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-zinc-800 pb-2">
               General
             </h3>
             <div>
@@ -182,7 +182,7 @@ export default function SourceEdit() {
 
           {/* Source Server */}
           <div className="space-y-4">
-            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-gray-700 pb-2">
+            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-zinc-800 pb-2">
               Source Server
             </h3>
             <div>
@@ -209,7 +209,7 @@ export default function SourceEdit() {
 
           {/* Destination Server */}
           <div className="space-y-4">
-            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-gray-700 pb-2">
+            <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-zinc-800 pb-2">
               Destination Server
             </h3>
             <div>
@@ -236,7 +236,7 @@ export default function SourceEdit() {
 
           {/* Status Info */}
           {source && (
-            <div className="p-4 rounded bg-gray-900/50 border border-gray-700">
+            <div className="p-4 rounded bg-black/50 border border-zinc-800">
               <h4 className="text-xs font-semibold text-gray-400 uppercase mb-3">Status</h4>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
                 <div>
@@ -276,7 +276,7 @@ export default function SourceEdit() {
           )}
 
           {/* Actions */}
-          <div className="flex flex-col sm:flex-row justify-between gap-4 pt-4 border-t border-gray-700">
+          <div className="flex flex-col sm:flex-row justify-between gap-4 pt-4 border-t border-zinc-800">
             <button
               type="button"
               onClick={handleDelete}
@@ -291,7 +291,7 @@ export default function SourceEdit() {
               <button
                 type="submit"
                 disabled={saving}
-                className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                className="px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
               >
                 {saving ? 'Saving...' : 'Save'}
               </button>
