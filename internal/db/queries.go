@@ -539,3 +539,105 @@ func (db *DB) DeleteSyncedEventsForCalendar(sourceID, calendarHref string) error
 
 	return nil
 }
+
+// SaveMalformedEvent saves or updates a malformed event record.
+func (db *DB) SaveMalformedEvent(sourceID, eventPath, errorMessage string) error {
+	// Use INSERT OR REPLACE to handle the unique constraint
+	query := `INSERT OR REPLACE INTO malformed_events (id, source_id, event_path, error_message, discovered_at)
+		VALUES (?, ?, ?, ?, ?)`
+
+	id := uuid.New().String()
+	now := time.Now().UTC()
+
+	_, err := db.conn.Exec(query, id, sourceID, eventPath, errorMessage, now)
+	if err != nil {
+		return fmt.Errorf("failed to save malformed event: %w", err)
+	}
+
+	return nil
+}
+
+// GetMalformedEvents returns all malformed events for a user (via their sources).
+func (db *DB) GetMalformedEvents(userID string) ([]*MalformedEvent, error) {
+	query := `SELECT m.id, m.source_id, s.name, m.event_path, m.error_message, m.discovered_at
+		FROM malformed_events m
+		JOIN sources s ON m.source_id = s.id
+		WHERE s.user_id = ?
+		ORDER BY m.discovered_at DESC`
+
+	rows, err := db.conn.Query(query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query malformed events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*MalformedEvent
+	for rows.Next() {
+		event := &MalformedEvent{}
+		err := rows.Scan(&event.ID, &event.SourceID, &event.SourceName,
+			&event.EventPath, &event.ErrorMessage, &event.DiscoveredAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan malformed event: %w", err)
+		}
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating malformed events: %w", err)
+	}
+
+	return events, nil
+}
+
+// GetMalformedEventByID returns a single malformed event by ID.
+func (db *DB) GetMalformedEventByID(id string) (*MalformedEvent, error) {
+	query := `SELECT m.id, m.source_id, s.name, m.event_path, m.error_message, m.discovered_at
+		FROM malformed_events m
+		JOIN sources s ON m.source_id = s.id
+		WHERE m.id = ?`
+
+	event := &MalformedEvent{}
+	err := db.conn.QueryRow(query, id).Scan(&event.ID, &event.SourceID, &event.SourceName,
+		&event.EventPath, &event.ErrorMessage, &event.DiscoveredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get malformed event: %w", err)
+	}
+
+	return event, nil
+}
+
+// DeleteMalformedEvent removes a malformed event record.
+func (db *DB) DeleteMalformedEvent(id string) error {
+	query := `DELETE FROM malformed_events WHERE id = ?`
+
+	result, err := db.conn.Exec(query, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete malformed event: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if affected == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+// ClearMalformedEventsForSource removes all malformed events for a source.
+func (db *DB) ClearMalformedEventsForSource(sourceID string) error {
+	query := `DELETE FROM malformed_events WHERE source_id = ?`
+
+	_, err := db.conn.Exec(query, sourceID)
+	if err != nil {
+		return fmt.Errorf("failed to clear malformed events: %w", err)
+	}
+
+	return nil
+}

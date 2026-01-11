@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { getDashboardStats, getSources, triggerSync, getSyncHistory } from '../services/api';
-import type { DashboardStats, Source, SyncHistory } from '../types';
+import { getDashboardStats, getSources, triggerSync, getSyncHistory, getMalformedEvents, deleteMalformedEvent } from '../services/api';
+import type { DashboardStats, Source, SyncHistory, MalformedEvent } from '../types';
 import {
   AreaChart,
   Area,
@@ -19,9 +19,11 @@ export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [syncHistory, setSyncHistory] = useState<SyncHistory | null>(null);
+  const [malformedEvents, setMalformedEvents] = useState<MalformedEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [syncingId, setSyncingId] = useState<string | null>(null);
+  const [deletingEventId, setDeletingEventId] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
@@ -29,14 +31,16 @@ export default function Dashboard() {
 
   const loadData = async () => {
     try {
-      const [statsData, sourcesData, historyData] = await Promise.all([
+      const [statsData, sourcesData, historyData, malformedData] = await Promise.all([
         getDashboardStats(),
         getSources(),
         getSyncHistory(7),
+        getMalformedEvents(),
       ]);
       setStats(statsData);
       setSources(sourcesData);
       setSyncHistory(historyData);
+      setMalformedEvents(malformedData);
     } catch (err) {
       setError('Failed to load dashboard data');
       console.error(err);
@@ -54,6 +58,19 @@ export default function Dashboard() {
       console.error('Sync failed:', err);
     } finally {
       setSyncingId(null);
+    }
+  };
+
+  const handleDeleteMalformedEvent = async (id: string) => {
+    if (!confirm('Delete this corrupted event from the source calendar?')) return;
+    setDeletingEventId(id);
+    try {
+      await deleteMalformedEvent(id);
+      setMalformedEvents((prev) => prev.filter((e) => e.id !== id));
+    } catch (err) {
+      console.error('Failed to delete malformed event:', err);
+    } finally {
+      setDeletingEventId(null);
     }
   };
 
@@ -111,6 +128,43 @@ export default function Dashboard() {
             <p className={`mt-1 text-2xl font-bold ${stats.failed_syncs > 0 ? 'text-red-400' : 'text-gray-500'}`}>
               {stats.failed_syncs}
             </p>
+          </div>
+        </div>
+      )}
+
+      {/* Corrupted Events Alert */}
+      {malformedEvents.length > 0 && (
+        <div className="bg-zinc-900 rounded-lg border border-red-900/50 overflow-hidden">
+          <div className="px-4 py-3 border-b border-red-900/50 bg-red-900/20 flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <span className="text-red-400">!</span>
+              <h2 className="text-sm font-semibold text-red-400">
+                Corrupted Events ({malformedEvents.length})
+              </h2>
+            </div>
+            <p className="text-xs text-gray-400">These events have invalid iCal format and cannot be synced</p>
+          </div>
+          <div className="divide-y divide-zinc-800">
+            {malformedEvents.map((event) => (
+              <div key={event.id} className="px-4 py-3 flex items-center justify-between hover:bg-zinc-800/50">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs font-medium text-gray-400">{event.source_name}</span>
+                  </div>
+                  <p className="text-sm text-white truncate mt-1" title={event.event_path}>
+                    {event.event_path.split('/').pop()}
+                  </p>
+                  <p className="text-xs text-red-400/80 mt-1">{event.error_message}</p>
+                </div>
+                <button
+                  onClick={() => handleDeleteMalformedEvent(event.id)}
+                  disabled={deletingEventId === event.id}
+                  className="ml-4 px-3 py-1 rounded text-xs font-medium bg-red-900/30 text-red-400 hover:bg-red-900/50 disabled:opacity-50"
+                >
+                  {deletingEventId === event.id ? '...' : 'Delete'}
+                </button>
+              </div>
+            ))}
           </div>
         </div>
       )}

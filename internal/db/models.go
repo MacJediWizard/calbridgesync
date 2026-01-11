@@ -155,3 +155,13 @@ type SyncedEvent struct {
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
+
+// MalformedEvent tracks corrupted calendar events that cannot be synced.
+type MalformedEvent struct {
+	ID           string    `json:"id"`
+	SourceID     string    `json:"source_id"`
+	SourceName   string    `json:"source_name"` // Populated via join
+	EventPath    string    `json:"event_path"`
+	ErrorMessage string    `json:"error_message"`
+	DiscoveredAt time.Time `json:"discovered_at"`
+}

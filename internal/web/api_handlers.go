@@ -2,12 +2,14 @@ package web
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/macjediwizard/calbridgesync/internal/auth"
+	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 )
 
@@ -461,6 +463,7 @@ type APIUpdateSourceRequest struct {
 	DestUsername     string `json:"dest_username"`
 	DestPassword     string `json:"dest_password,omitempty"`
 	SyncInterval     int    `json:"sync_interval"`
+	SyncDirection    string `json:"sync_direction"`
 	ConflictStrategy string `json:"conflict_strategy"`
 }
 
@@ -497,6 +500,7 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	source.SourceUsername = req.SourceUsername
 	source.DestURL = req.DestURL
 	source.DestUsername = req.DestUsername
+	source.SyncDirection = db.SyncDirection(req.SyncDirection)
 	source.ConflictStrategy = db.ConflictStrategy(req.ConflictStrategy)
 	if req.SyncInterval > 0 {
 		source.SyncInterval = req.SyncInterval
@@ -683,4 +687,101 @@ func (h *Handlers) APIGetSourceLogs(c *gin.Context) {
 		"page":        page,
 		"total_pages": totalPages,
 	})
+}
+
+// APIMalformedEvent represents a malformed event in API responses.
+type APIMalformedEvent struct {
+	ID           string `json:"id"`
+	SourceID     string `json:"source_id"`
+	SourceName   string `json:"source_name"`
+	EventPath    string `json:"event_path"`
+	ErrorMessage string `json:"error_message"`
+	DiscoveredAt string `json:"discovered_at"`
+}
+
+// malformedEventToAPI converts a db.MalformedEvent to API format.
+func malformedEventToAPI(e *db.MalformedEvent) *APIMalformedEvent {
+	return &APIMalformedEvent{
+		ID:           e.ID,
+		SourceID:     e.SourceID,
+		SourceName:   e.SourceName,
+		EventPath:    e.EventPath,
+		ErrorMessage: e.ErrorMessage,
+		DiscoveredAt: e.DiscoveredAt.Format(time.RFC3339),
+	}
+}
+
+// APIGetMalformedEvents returns all malformed events for the current user.
+func (h *Handlers) APIGetMalformedEvents(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	events, err := h.db.GetMalformedEvents(session.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get malformed events"})
+		return
+	}
+
+	apiEvents := make([]*APIMalformedEvent, len(events))
+	for i, e := range events {
+		apiEvents[i] = malformedEventToAPI(e)
+	}
+
+	c.JSON(http.StatusOK, apiEvents)
+}
+
+// APIDeleteMalformedEvent deletes a malformed event record and optionally the event from the source.
+func (h *Handlers) APIDeleteMalformedEvent(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	eventID := c.Param("id")
+
+	// Get the malformed event
+	event, err := h.db.GetMalformedEventByID(eventID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Malformed event not found"})
+		return
+	}
+
+	// Get the source to verify ownership
+	source, err := h.db.GetSourceByID(event.SourceID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+
+	if source.UserID != session.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+		return
+	}
+
+	// Try to delete the event from the source calendar
+	sourcePassword, err := h.encryptor.Decrypt(source.SourcePassword)
+	if err == nil {
+		client, err := caldav.NewClient(source.SourceURL, source.SourceUsername, sourcePassword)
+		if err == nil {
+			ctx := c.Request.Context()
+			if err := client.DeleteEvent(ctx, event.EventPath); err != nil {
+				log.Printf("Failed to delete malformed event from source: %v", err)
+				// Continue to delete the record anyway
+			} else {
+				log.Printf("Deleted malformed event from source: %s", event.EventPath)
+			}
+		}
+	}
+
+	// Delete the malformed event record
+	if err := h.db.DeleteMalformedEvent(eventID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete malformed event"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Malformed event deleted"})
 }

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory } from '../types';
+import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent } from '../types';
 
 const api = axios.create({
   baseURL: '/api',
@@ -67,6 +67,16 @@ export const triggerSync = async (id: string): Promise<void> => {
 export const getSourceLogs = async (sourceId: string, page: number = 1): Promise<{ logs: SyncLog[]; total_pages: number; page: number }> => {
   const response = await api.get(`/sources/${sourceId}/logs`, { params: { page } });
   return response.data;
+};
+
+// Malformed Events
+export const getMalformedEvents = async (): Promise<MalformedEvent[]> => {
+  const response = await api.get('/malformed-events');
+  return response.data;
+};
+
+export const deleteMalformedEvent = async (id: string): Promise<void> => {
+  await api.delete(`/malformed-events/${id}`);
 };
 
 export default api;

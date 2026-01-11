@@ -93,3 +93,12 @@ export interface SyncHistory {
   history: SyncHistoryPoint[];
   summary: SyncSummary;
 }
+
+export interface MalformedEvent {
+  id: string;
+  source_id: string;
+  source_name: string;
+  event_path: string;
+  error_message: string;
+  discovered_at: string;
+}

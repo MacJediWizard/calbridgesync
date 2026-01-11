@@ -233,19 +233,34 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		Warnings: make([]string, 0),
 	}
 
+	// Create collector for malformed events from source
+	malformedCollector := NewMalformedEventCollector()
+
+	// Clear old malformed events for this source before sync
+	if err := se.db.ClearMalformedEventsForSource(source.ID); err != nil {
+		log.Printf("Failed to clear old malformed events: %v", err)
+	}
+
 	// Get all events from source
-	sourceEvents, err := sourceClient.GetEvents(ctx, calendar.Path)
+	sourceEvents, err := sourceClient.GetEvents(ctx, calendar.Path, malformedCollector)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to get source events: %v", err))
 		return result
+	}
+
+	// Store any malformed events found
+	for _, mf := range malformedCollector.GetEvents() {
+		if err := se.db.SaveMalformedEvent(source.ID, mf.Path, mf.ErrorMessage); err != nil {
+			log.Printf("Failed to save malformed event record: %v", err)
+		}
 	}
 
 	// Get the destination calendar path from the destination client's base URL
 	destCalendarPath := destClient.GetCalendarPath()
 	log.Printf("Using destination calendar path: %s", destCalendarPath)
 
-	// Get all events from destination
-	destEvents, err := destClient.GetEvents(ctx, destCalendarPath)
+	// Get all events from destination (no collector needed - we only track source issues)
+	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
 	if err != nil {
 		log.Printf("Failed to get destination events: %v", err)
 		destEvents = []Event{}

@@ -178,6 +178,20 @@ func (db *DB) migrate() error {
 
 		// Index on source_id and calendar_href for synced_events
 		`CREATE INDEX IF NOT EXISTS idx_synced_events_source_calendar ON synced_events(source_id, calendar_href)`,
+
+		// Malformed events table for tracking corrupted calendar events
+		`CREATE TABLE IF NOT EXISTS malformed_events (
+			id TEXT PRIMARY KEY,
+			source_id TEXT NOT NULL,
+			event_path TEXT NOT NULL,
+			error_message TEXT NOT NULL,
+			discovered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(source_id, event_path),
+			FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+		)`,
+
+		// Index on source_id for malformed_events
+		`CREATE INDEX IF NOT EXISTS idx_malformed_events_source_id ON malformed_events(source_id)`,
 	}
 
 	for _, migration := range migrations {

@@ -57,6 +57,42 @@ func (e *Event) DedupeKey() string {
 	return e.Summary + "|" + e.StartTime
 }
 
+// MalformedEventInfo contains information about a corrupted calendar event.
+type MalformedEventInfo struct {
+	Path         string
+	ErrorMessage string
+}
+
+// MalformedEventCollector collects malformed events during sync operations.
+type MalformedEventCollector struct {
+	events []MalformedEventInfo
+}
+
+// NewMalformedEventCollector creates a new collector.
+func NewMalformedEventCollector() *MalformedEventCollector {
+	return &MalformedEventCollector{
+		events: make([]MalformedEventInfo, 0),
+	}
+}
+
+// Add records a malformed event.
+func (c *MalformedEventCollector) Add(path, errorMessage string) {
+	c.events = append(c.events, MalformedEventInfo{
+		Path:         path,
+		ErrorMessage: errorMessage,
+	})
+}
+
+// GetEvents returns all collected malformed events.
+func (c *MalformedEventCollector) GetEvents() []MalformedEventInfo {
+	return c.events
+}
+
+// Count returns the number of collected malformed events.
+func (c *MalformedEventCollector) Count() int {
+	return len(c.events)
+}
+
 // Client provides CalDAV operations.
 type Client struct {
 	baseURL      string
@@ -142,7 +178,8 @@ func (c *Client) FindCalendars(ctx context.Context) ([]Calendar, error) {
 }
 
 // GetEvents retrieves all events from a calendar.
-func (c *Client) GetEvents(ctx context.Context, calendarPath string) ([]Event, error) {
+// If collector is provided, malformed events will be recorded there.
+func (c *Client) GetEvents(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
 	// Try the standard calendar-query first
 	events, err := c.getEventsViaQuery(ctx, calendarPath)
 	if err == nil {
@@ -151,7 +188,7 @@ func (c *Client) GetEvents(ctx context.Context, calendarPath string) ([]Event, e
 
 	// If query failed (412, etc.), fall back to multiget via PROPFIND
 	log.Printf("Calendar query failed, trying PROPFIND fallback: %v", err)
-	return c.getEventsViaPropfind(ctx, calendarPath)
+	return c.getEventsViaPropfind(ctx, calendarPath, collector)
 }
 
 // getEventsViaQuery uses REPORT calendar-query to get events.
@@ -174,13 +211,13 @@ func (c *Client) getEventsViaQuery(ctx context.Context, calendarPath string) ([]
 }
 
 // getEventsViaPropfind uses PROPFIND to list calendar objects, then fetches each one.
-func (c *Client) getEventsViaPropfind(ctx context.Context, calendarPath string) ([]Event, error) {
+func (c *Client) getEventsViaPropfind(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
 	// Go directly to PROPFIND list since MultiGetCalendar requires specific paths
-	return c.getEventsViaList(ctx, calendarPath)
+	return c.getEventsViaList(ctx, calendarPath, collector)
 }
 
 // getEventsViaList lists calendar contents and fetches each event individually.
-func (c *Client) getEventsViaList(ctx context.Context, calendarPath string) ([]Event, error) {
+func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
 	// Build the full URL - calendarPath might be absolute or relative
 	fullURL := c.buildURL(calendarPath)
 
@@ -225,7 +262,10 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string) ([]E
 		event, err := c.GetEvent(ctx, path)
 		if err != nil {
 			if IsMalformedError(err) {
-				// Silently skip malformed events - these are corrupted at the source
+				// Record malformed event if collector is provided
+				if collector != nil {
+					collector.Add(path, err.Error())
+				}
 				skippedMalformed++
 				continue
 			}
