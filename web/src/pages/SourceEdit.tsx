@@ -32,8 +32,6 @@ export default function SourceEdit() {
     if (!id) return;
     try {
       const data = await getSource(id);
-      console.log('API returned source:', data);
-      console.log('sync_direction from API:', data.sync_direction);
       setSource(data);
       setForm({
         name: data.name,
@@ -48,7 +46,6 @@ export default function SourceEdit() {
         sync_direction: data.sync_direction || 'one_way',
         conflict_strategy: data.conflict_strategy,
       });
-      console.log('Form sync_direction set to:', data.sync_direction || 'one_way');
     } catch (err) {
       setError('Failed to load source');
       console.error(err);
@@ -77,8 +74,6 @@ export default function SourceEdit() {
       if (!form.source_password) delete updateData.source_password;
       if (!form.dest_password) delete updateData.dest_password;
 
-      console.log('Submitting update with data:', updateData);
-      console.log('sync_direction being sent:', updateData.sync_direction);
       await updateSource(id, updateData);
       navigate('/sources');
     } catch (err: unknown) {

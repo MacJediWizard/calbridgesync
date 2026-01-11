@@ -315,7 +315,15 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	// This prevents deleting events that failed to sync to destination
 	syncSafetyThreshold := time.Now().Add(-time.Duration(source.SyncInterval) * time.Second)
 
-	if source.SyncDirection == db.SyncDirectionTwoWay {
+	// SAFETY: Skip two-way deletion if destination query returned empty but we have synced events
+	// This prevents mass deletion from source when destination query fails
+	skipTwoWayDeletion := false
+	if source.SyncDirection == db.SyncDirectionTwoWay && len(destEventMap) == 0 && len(previouslySyncedMap) > 0 {
+		log.Printf("WARNING: Destination returned 0 events but we have %d previously synced events - skipping two-way deletions for safety", len(previouslySyncedMap))
+		skipTwoWayDeletion = true
+	}
+
+	if source.SyncDirection == db.SyncDirectionTwoWay && !skipTwoWayDeletion {
 		for uid, syncedEvent := range previouslySyncedMap {
 			_, existsOnSource := sourceEventMap[uid]
 			destEvent, existsOnDest := destEventMap[uid]

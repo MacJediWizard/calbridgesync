@@ -360,7 +360,6 @@ func (h *Handlers) APIGetSource(c *gin.Context) {
 		return
 	}
 
-	log.Printf("APIGetSource: returning sync_direction='%s' for source %s", source.SyncDirection, sourceID)
 	c.JSON(http.StatusOK, sourceToAPI(source))
 }
 
@@ -496,8 +495,6 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 
-	log.Printf("APIUpdateSource: received sync_direction='%s' for source %s", req.SyncDirection, sourceID)
-
 	// Update fields
 	source.Name = req.Name
 	source.SourceType = db.SourceType(req.SourceType)
@@ -535,7 +532,6 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 
-	log.Printf("APIUpdateSource: saved sync_direction='%s' for source %s", source.SyncDirection, sourceID)
 	h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second)
 
 	c.JSON(http.StatusOK, sourceToAPI(source))
