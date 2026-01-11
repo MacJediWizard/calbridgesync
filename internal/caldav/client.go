@@ -446,6 +446,12 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 
 // PutEvent creates or updates an event.
 func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event) error {
+	// Skip events with empty data
+	if event.Data == "" {
+		log.Printf("PutEvent: skipping event with empty data (UID: %s, summary: %s)", event.UID, event.Summary)
+		return nil
+	}
+
 	// Parse the iCalendar data
 	cal, err := parseICalendar(event.Data)
 	if err != nil {
