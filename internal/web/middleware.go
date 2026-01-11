@@ -18,9 +18,9 @@ func SecurityHeaders() gin.HandlerFunc {
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
 		c.Header("Content-Security-Policy", "default-src 'self'; "+
 			"script-src 'self' 'unsafe-inline' https://unpkg.com; "+
-			"style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "+
-			"img-src 'self' data:; "+
-			"font-src 'self'; "+
+			"style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com; "+
+			"img-src 'self' data: https://cdn.macjediwizard.com; "+
+			"font-src 'self' https://fonts.gstatic.com; "+
 			"connect-src 'self'")
 		c.Next()
 	}

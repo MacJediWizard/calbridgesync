@@ -1,6 +1,6 @@
 import { useState } from 'react';
 
-const LOGO_URL = '/logo.png';
+const LOGO_URL = 'https://cdn.macjediwizard.com/cdn/CalBridge%20Images/calbridge-06070e03.png';
 
 export default function Login() {
   const [logoError, setLogoError] = useState(false);
