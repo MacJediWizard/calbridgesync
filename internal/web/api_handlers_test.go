@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/macjediwizard/calbridgesync/internal/auth"
 	"github.com/macjediwizard/calbridgesync/internal/db"
+	"github.com/macjediwizard/calbridgesync/internal/scheduler"
 )
 
 func init() {
@@ -44,8 +45,12 @@ func setupTestHandlers(t *testing.T) *testHandlers {
 		t.Fatalf("failed to create test database: %v", err)
 	}
 
+	// Create a scheduler with nil dependencies (safe for testing)
+	sched := scheduler.New(nil, nil)
+
 	handlers := &Handlers{
-		db: database,
+		db:        database,
+		scheduler: sched,
 	}
 
 	cleanup := func() {
@@ -894,6 +899,678 @@ func TestAPIDashboardStats(t *testing.T) {
 
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPIDeleteSource(t *testing.T) {
+	t.Run("deletes source for valid owner", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/sources/"+source.ID, nil)
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APIDeleteSource(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		// Verify source is deleted
+		sources, _ := th.db.GetSourcesByUserID(userID)
+		if len(sources) != 0 {
+			t.Errorf("expected 0 sources after deletion, got %d", len(sources))
+		}
+	})
+
+	t.Run("returns 404 for nonexistent source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/sources/nonexistent", nil)
+		c.Params = gin.Params{{Key: "id", Value: "nonexistent"}}
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIDeleteSource(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns 404 for other user's source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		_, source := createTestUserAndSource(t, th.db, "user1@example.com", "User1 Source")
+		user2, _ := th.db.GetOrCreateUser("user2@example.com", "User 2")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/sources/"+source.ID, nil)
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, user2.ID, "user2@example.com")
+
+		th.handlers.APIDeleteSource(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/sources/some-id", nil)
+		c.Params = gin.Params{{Key: "id", Value: "some-id"}}
+
+		th.handlers.APIDeleteSource(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPIToggleSource(t *testing.T) {
+	t.Run("toggles source from enabled to disabled", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources/"+source.ID+"/toggle", nil)
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APIToggleSource(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var apiSource APISource
+		if err := json.Unmarshal(w.Body.Bytes(), &apiSource); err != nil {
+			t.Fatalf("failed to parse response: %v", err)
+		}
+
+		if apiSource.Enabled {
+			t.Error("expected Enabled to be false after toggle")
+		}
+	})
+
+	t.Run("returns 404 for nonexistent source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources/nonexistent/toggle", nil)
+		c.Params = gin.Params{{Key: "id", Value: "nonexistent"}}
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIToggleSource(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources/some-id/toggle", nil)
+		c.Params = gin.Params{{Key: "id", Value: "some-id"}}
+
+		th.handlers.APIToggleSource(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPITriggerSync(t *testing.T) {
+	t.Run("returns 404 for nonexistent source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources/nonexistent/sync", nil)
+		c.Params = gin.Params{{Key: "id", Value: "nonexistent"}}
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APITriggerSync(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources/some-id/sync", nil)
+		c.Params = gin.Params{{Key: "id", Value: "some-id"}}
+
+		th.handlers.APITriggerSync(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPIGetSourceLogs(t *testing.T) {
+	t.Run("returns logs for valid source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		// Create some logs
+		th.db.CreateSyncLog(&db.SyncLog{
+			SourceID:      source.ID,
+			Status:        db.SyncStatusSuccess,
+			Message:       "Sync completed",
+			EventsCreated: 5,
+			Duration:      time.Second * 2,
+		})
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/sources/"+source.ID+"/logs", nil)
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APIGetSourceLogs(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var response map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("failed to parse response: %v", err)
+		}
+
+		logs := response["logs"].([]interface{})
+		if len(logs) != 1 {
+			t.Errorf("expected 1 log, got %d", len(logs))
+		}
+	})
+
+	t.Run("returns paginated logs", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/sources/"+source.ID+"/logs?page=2", nil)
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APIGetSourceLogs(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", w.Code)
+		}
+
+		var response map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &response)
+
+		page := int(response["page"].(float64))
+		if page != 2 {
+			t.Errorf("expected page 2, got %d", page)
+		}
+	})
+
+	t.Run("returns 404 for nonexistent source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/sources/nonexistent/logs", nil)
+		c.Params = gin.Params{{Key: "id", Value: "nonexistent"}}
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIGetSourceLogs(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/sources/some-id/logs", nil)
+		c.Params = gin.Params{{Key: "id", Value: "some-id"}}
+
+		th.handlers.APIGetSourceLogs(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPISyncHistory(t *testing.T) {
+	t.Run("returns sync history with default 7 days", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		// Create some logs
+		th.db.CreateSyncLog(&db.SyncLog{
+			SourceID:      source.ID,
+			Status:        db.SyncStatusSuccess,
+			Message:       "Sync completed",
+			EventsCreated: 5,
+			Duration:      time.Second * 2,
+		})
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/dashboard/sync-history", nil)
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APISyncHistory(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var response APISyncHistory
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("failed to parse response: %v", err)
+		}
+
+		if len(response.History) != 7 {
+			t.Errorf("expected 7 history points, got %d", len(response.History))
+		}
+	})
+
+	t.Run("accepts custom days parameter", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/dashboard/sync-history?days=14", nil)
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APISyncHistory(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", w.Code)
+		}
+
+		var response APISyncHistory
+		json.Unmarshal(w.Body.Bytes(), &response)
+
+		if len(response.History) != 14 {
+			t.Errorf("expected 14 history points, got %d", len(response.History))
+		}
+	})
+
+	t.Run("clamps days parameter to valid range", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/dashboard/sync-history?days=100", nil)
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APISyncHistory(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", w.Code)
+		}
+
+		var response APISyncHistory
+		json.Unmarshal(w.Body.Bytes(), &response)
+
+		// Should default to 7 since 100 > 30
+		if len(response.History) != 7 {
+			t.Errorf("expected 7 history points for invalid days, got %d", len(response.History))
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/dashboard/sync-history", nil)
+
+		th.handlers.APISyncHistory(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPIDeleteMalformedEvent(t *testing.T) {
+	t.Run("returns 404 for nonexistent event", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/malformed-events/nonexistent", nil)
+		c.Params = gin.Params{{Key: "id", Value: "nonexistent"}}
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIDeleteMalformedEvent(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/malformed-events/some-id", nil)
+		c.Params = gin.Params{{Key: "id", Value: "some-id"}}
+
+		th.handlers.APIDeleteMalformedEvent(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPIUpdateSource(t *testing.T) {
+	t.Run("returns 404 for nonexistent source", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		body := `{"name": "Updated"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/nonexistent", strings.NewReader(body))
+		c.Params = gin.Params{{Key: "id", Value: "nonexistent"}}
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIUpdateSource(c)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected status 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns bad request for invalid JSON", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/"+source.ID, strings.NewReader("invalid json"))
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APIUpdateSource(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns bad request for invalid input", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+		body := `{"name": "` + strings.Repeat("a", 200) + `"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/"+source.ID, strings.NewReader(body))
+		c.Params = gin.Params{{Key: "id", Value: source.ID}}
+		setAuthContext(c, userID, "test@example.com")
+
+		th.handlers.APIUpdateSource(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/some-id", nil)
+		c.Params = gin.Params{{Key: "id", Value: "some-id"}}
+
+		th.handlers.APIUpdateSource(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPICreateSource(t *testing.T) {
+	t.Run("returns bad request for invalid JSON", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources", strings.NewReader("invalid json"))
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APICreateSource(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns bad request for missing required fields", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		body := `{"name": "Test"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources", strings.NewReader(body))
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APICreateSource(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns bad request for name too long", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		body := `{"name": "` + strings.Repeat("a", 200) + `", "source_url": "https://caldav.example.com", "source_username": "user", "source_password": "pass"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources", strings.NewReader(body))
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APICreateSource(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/sources", nil)
+
+		th.handlers.APICreateSource(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+func TestAPIDiscoverCalendars(t *testing.T) {
+	t.Run("returns bad request for invalid JSON", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/calendars/discover", strings.NewReader("invalid"))
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIDiscoverCalendars(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns bad request for missing fields", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+
+		body := `{"url": "https://example.com"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/calendars/discover", strings.NewReader(body))
+		setAuthContext(c, user.ID, "test@example.com")
+
+		th.handlers.APIDiscoverCalendars(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("returns unauthorized when not authenticated", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/api/calendars/discover", nil)
+
+		th.handlers.APIDiscoverCalendars(c)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status 401, got %d", w.Code)
+		}
+	})
+}
+
+// Note: APILogout requires a session manager to be present.
+// Full testing would require mocking the session manager.
+// The handler is tested indirectly through integration tests.
+
+func TestValidationInputConstants(t *testing.T) {
+	t.Run("validation constants have expected values", func(t *testing.T) {
+		if maxNameLength != 100 {
+			t.Errorf("expected maxNameLength 100, got %d", maxNameLength)
+		}
+		if maxURLLength != 500 {
+			t.Errorf("expected maxURLLength 500, got %d", maxURLLength)
+		}
+		if maxUsernameLength != 100 {
+			t.Errorf("expected maxUsernameLength 100, got %d", maxUsernameLength)
+		}
+		if maxPasswordLength != 500 {
+			t.Errorf("expected maxPasswordLength 500, got %d", maxPasswordLength)
+		}
+	})
+}
+
+func TestValidateSourceInputUsernameLength(t *testing.T) {
+	t.Run("rejects source username too long", func(t *testing.T) {
+		longUsername := strings.Repeat("a", 150)
+		result := validateSourceInput("Name", "", "", "", "", "", longUsername, "")
+
+		if result == "" || !strings.Contains(result, "Source username") {
+			t.Error("expected error about source username length")
+		}
+	})
+
+	t.Run("rejects dest username too long", func(t *testing.T) {
+		longUsername := strings.Repeat("a", 150)
+		result := validateSourceInput("Name", "", "", "", "", "", "", longUsername)
+
+		if result == "" || !strings.Contains(result, "Destination username") {
+			t.Error("expected error about destination username length")
 		}
 	})
 }
