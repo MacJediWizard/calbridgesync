@@ -1,54 +1,51 @@
 {{define "content"}}
-<div class="space-y-8">
+<div class="space-y-6">
     <!-- Header -->
     <div class="flex items-center space-x-4">
-        <a href="/sources" class="w-10 h-10 rounded-xl glass flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 transition-all">
-            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
-            </svg>
+        <a href="/sources" class="p-2 rounded bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700 transition-colors">
+            &larr;
         </a>
         <div>
-            <h1 class="text-3xl font-bold text-white">Sync Logs</h1>
-            <p class="mt-1 text-gray-400">{{.Source.Name}}</p>
+            <h1 class="text-2xl font-bold text-white">Sync Logs</h1>
+            <p class="text-sm text-gray-400">{{.Source.Name}}</p>
         </div>
     </div>
 
     <!-- Logs Table -->
-    <div class="glass rounded-2xl overflow-hidden">
+    <div class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
         {{if .Logs}}
         <div class="overflow-x-auto">
-            <table class="w-full">
-                <thead>
-                    <tr class="border-b border-white/5">
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Time</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Status</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Message</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Duration</th>
+            <table class="w-full text-sm">
+                <thead class="bg-gray-900/50">
+                    <tr>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Time</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Message</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Duration</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-white/5">
+                <tbody class="divide-y divide-gray-700">
                     {{range .Logs}}
-                    <tr class="hover:bg-white/[0.02] transition-colors">
-                        <td class="px-6 py-4 text-sm text-gray-400 whitespace-nowrap">{{.CreatedAt.Format "Jan 02, 15:04:05"}}</td>
-                        <td class="px-6 py-4 whitespace-nowrap">
-                            <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium
-                                {{if eq .Status "success"}}bg-success/10 text-success border border-success/20
-                                {{else if eq .Status "error"}}bg-error/10 text-error border border-error/20
-                                {{else}}bg-white/5 text-gray-400 border border-white/10{{end}}">
-                                <span class="w-1.5 h-1.5 rounded-full mr-1.5 {{if eq .Status "success"}}bg-success{{else if eq .Status "error"}}bg-error{{else}}bg-gray-500{{end}}"></span>
-                                {{if eq .Status "success"}}Success{{else if eq .Status "error"}}Error{{else}}{{.Status}}{{end}}
+                    <tr class="hover:bg-gray-700/30">
+                        <td class="px-4 py-3 text-gray-400 whitespace-nowrap">{{.CreatedAt.Format "Jan 02, 15:04:05"}}</td>
+                        <td class="px-4 py-3 whitespace-nowrap">
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                                {{if eq .Status "success"}}bg-green-900/50 text-green-400
+                                {{else if eq .Status "error"}}bg-red-900/50 text-red-400
+                                {{else}}bg-gray-700 text-gray-400{{end}}">
+                                {{if eq .Status "success"}}OK{{else if eq .Status "error"}}Error{{else}}{{.Status}}{{end}}
                             </span>
                         </td>
-                        <td class="px-6 py-4 text-sm text-gray-300">
+                        <td class="px-4 py-3 text-gray-300">
                             <div>{{.Message}}</div>
                             {{if .Details}}
-                            <details class="mt-2">
-                                <summary class="text-xs text-primary cursor-pointer hover:text-primary-light transition-colors">Show details</summary>
-                                <pre class="mt-2 text-xs text-gray-400 bg-white/[0.02] p-3 rounded-lg overflow-x-auto border border-white/5">{{.Details}}</pre>
+                            <details class="mt-1">
+                                <summary class="text-xs text-primary cursor-pointer hover:text-blue-300">Details</summary>
+                                <pre class="mt-1 text-xs text-gray-400 bg-gray-900 p-2 rounded overflow-x-auto">{{.Details}}</pre>
                             </details>
                             {{end}}
                         </td>
-                        <td class="px-6 py-4 text-sm text-gray-400 whitespace-nowrap">
+                        <td class="px-4 py-3 text-gray-400 whitespace-nowrap">
                             {{if .Duration}}{{printf "%.2fs" .Duration.Seconds}}{{else}}-{{end}}
                         </td>
                     </tr>
@@ -58,27 +55,22 @@
         </div>
 
         {{if gt .TotalPages 1}}
-        <div class="px-6 py-4 flex items-center justify-between border-t border-white/5">
-            <p class="text-sm text-gray-400">Page <span class="text-white">{{.Page}}</span> of <span class="text-white">{{.TotalPages}}</span></p>
+        <div class="px-4 py-3 flex items-center justify-between border-t border-gray-700">
+            <p class="text-sm text-gray-400">Page {{.Page}} of {{.TotalPages}}</p>
             <div class="flex space-x-2">
                 {{if gt .Page 1}}
-                <a href="/sources/{{.Source.ID}}/logs?page={{minus .Page 1}}" class="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 bg-white/5 hover:bg-white/10 hover:text-white transition-all">Previous</a>
+                <a href="/sources/{{.Source.ID}}/logs?page={{minus .Page 1}}" class="px-3 py-1.5 rounded text-sm text-gray-400 bg-gray-700 hover:bg-gray-600 hover:text-white">Prev</a>
                 {{end}}
                 {{if lt .Page .TotalPages}}
-                <a href="/sources/{{.Source.ID}}/logs?page={{plus .Page 1}}" class="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 bg-white/5 hover:bg-white/10 hover:text-white transition-all">Next</a>
+                <a href="/sources/{{.Source.ID}}/logs?page={{plus .Page 1}}" class="px-3 py-1.5 rounded text-sm text-gray-400 bg-gray-700 hover:bg-gray-600 hover:text-white">Next</a>
                 {{end}}
             </div>
         </div>
         {{end}}
         {{else}}
-        <div class="text-center py-16 px-6">
-            <div class="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-primary/20 to-primary/5 flex items-center justify-center border border-primary/20 mb-4">
-                <svg class="w-8 h-8 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-            </div>
-            <h3 class="text-lg font-semibold text-white">No sync logs yet</h3>
-            <p class="mt-2 text-gray-400">Logs will appear here after the first synchronization.</p>
+        <div class="text-center py-12 px-4">
+            <h3 class="text-base font-medium text-white">No sync logs yet</h3>
+            <p class="mt-1 text-sm text-gray-400">Logs will appear after the first sync.</p>
         </div>
         {{end}}
     </div>

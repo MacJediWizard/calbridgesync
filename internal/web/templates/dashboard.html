@@ -1,144 +1,85 @@
 {{define "content"}}
-<div class="space-y-8">
+<div class="space-y-6">
     <!-- Header -->
     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-            <h1 class="text-3xl font-bold text-white">Dashboard</h1>
-            <p class="mt-1 text-gray-400">Monitor your calendar synchronization status</p>
+            <h1 class="text-2xl font-bold text-white">Dashboard</h1>
+            <p class="text-sm text-gray-400">Monitor your calendar sync status</p>
         </div>
-        <a href="/sources/add" class="inline-flex items-center justify-center px-5 py-2.5 rounded-xl text-white font-medium bg-gradient-to-r from-primary to-primary-dark hover:from-primary-dark hover:to-primary transition-all duration-300 btn-glow">
-            <svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-            </svg>
-            Add Source
+        <a href="/sources/add" class="inline-flex items-center px-4 py-2 rounded bg-primary hover:bg-primary-dark text-white text-sm font-medium transition-colors">
+            + Add Source
         </a>
     </div>
 
     <!-- Stats Grid -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <!-- Total Sources -->
-        <div class="glass glass-hover rounded-2xl p-6 transition-all duration-300">
-            <div class="flex items-center justify-between">
-                <div>
-                    <p class="text-sm font-medium text-gray-400">Total Sources</p>
-                    <p class="mt-2 text-3xl font-bold text-white">{{.Stats.TotalSources}}</p>
-                </div>
-                <div class="w-14 h-14 rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 flex items-center justify-center border border-primary/20">
-                    <svg class="w-7 h-7 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                    </svg>
-                </div>
-            </div>
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+            <p class="text-xs text-gray-400 uppercase tracking-wide">Total Sources</p>
+            <p class="mt-1 text-2xl font-bold text-white">{{.Stats.TotalSources}}</p>
         </div>
-
-        <!-- Active Sources -->
-        <div class="glass glass-hover rounded-2xl p-6 transition-all duration-300">
-            <div class="flex items-center justify-between">
-                <div>
-                    <p class="text-sm font-medium text-gray-400">Active Sources</p>
-                    <p class="mt-2 text-3xl font-bold text-success">{{.Stats.ActiveSources}}</p>
-                </div>
-                <div class="w-14 h-14 rounded-xl bg-gradient-to-br from-success/20 to-success/5 flex items-center justify-center border border-success/20">
-                    <svg class="w-7 h-7 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                </div>
-            </div>
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+            <p class="text-xs text-gray-400 uppercase tracking-wide">Active</p>
+            <p class="mt-1 text-2xl font-bold text-success">{{.Stats.ActiveSources}}</p>
         </div>
-
-        <!-- Syncs Today -->
-        <div class="glass glass-hover rounded-2xl p-6 transition-all duration-300">
-            <div class="flex items-center justify-between">
-                <div>
-                    <p class="text-sm font-medium text-gray-400">Syncs Today</p>
-                    <p class="mt-2 text-3xl font-bold text-accent">{{.Stats.SyncsToday}}</p>
-                </div>
-                <div class="w-14 h-14 rounded-xl bg-gradient-to-br from-accent/20 to-accent/5 flex items-center justify-center border border-accent/20">
-                    <svg class="w-7 h-7 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                </div>
-            </div>
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+            <p class="text-xs text-gray-400 uppercase tracking-wide">Syncs Today</p>
+            <p class="mt-1 text-2xl font-bold text-blue-400">{{.Stats.SyncsToday}}</p>
         </div>
-
-        <!-- Failed Syncs -->
-        <div class="glass glass-hover rounded-2xl p-6 transition-all duration-300">
-            <div class="flex items-center justify-between">
-                <div>
-                    <p class="text-sm font-medium text-gray-400">Failed Syncs</p>
-                    <p class="mt-2 text-3xl font-bold {{if gt .Stats.FailedSyncs 0}}text-error{{else}}text-gray-500{{end}}">{{.Stats.FailedSyncs}}</p>
-                </div>
-                <div class="w-14 h-14 rounded-xl bg-gradient-to-br from-error/20 to-error/5 flex items-center justify-center border border-error/20">
-                    <svg class="w-7 h-7 text-error" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                </div>
-            </div>
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+            <p class="text-xs text-gray-400 uppercase tracking-wide">Failed</p>
+            <p class="mt-1 text-2xl font-bold {{if gt .Stats.FailedSyncs 0}}text-error{{else}}text-gray-500{{end}}">{{.Stats.FailedSyncs}}</p>
         </div>
     </div>
 
     <!-- Sources Table -->
-    <div class="glass rounded-2xl overflow-hidden">
-        <div class="px-6 py-5 border-b border-white/5">
-            <h2 class="text-lg font-semibold text-white">Calendar Sources</h2>
+    <div class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+        <div class="px-4 py-3 border-b border-gray-700">
+            <h2 class="text-sm font-semibold text-white">Calendar Sources</h2>
         </div>
         {{if .Sources}}
         <div class="overflow-x-auto">
-            <table class="w-full">
-                <thead>
-                    <tr class="border-b border-white/5">
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Name</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Type</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Status</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Last Sync</th>
-                        <th class="px-6 py-4 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Actions</th>
+            <table class="w-full text-sm">
+                <thead class="bg-gray-900/50">
+                    <tr>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Name</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Type</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Last Sync</th>
+                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Actions</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-white/5">
+                <tbody class="divide-y divide-gray-700">
                     {{range .Sources}}
-                    <tr class="hover:bg-white/[0.02] transition-colors">
-                        <td class="px-6 py-4">
+                    <tr class="hover:bg-gray-700/30">
+                        <td class="px-4 py-3">
                             <div class="font-medium text-white">{{.Name}}</div>
-                            <div class="text-sm text-gray-500 truncate max-w-xs">{{.SourceURL}}</div>
+                            <div class="text-xs text-gray-500 truncate max-w-xs">{{.SourceURL}}</div>
                         </td>
-                        <td class="px-6 py-4">
-                            <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium bg-white/5 text-gray-300 border border-white/10">
-                                {{.SourceType}}
-                            </span>
-                        </td>
-                        <td class="px-6 py-4">
+                        <td class="px-4 py-3 text-gray-400">{{.SourceType}}</td>
+                        <td class="px-4 py-3">
                             {{if .Enabled}}
-                            <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium
-                                {{if eq .SyncStatus "success"}}bg-success/10 text-success border border-success/20
-                                {{else if eq .SyncStatus "error"}}bg-error/10 text-error border border-error/20
-                                {{else if eq .SyncStatus "running"}}bg-accent/10 text-accent border border-accent/20
-                                {{else}}bg-white/5 text-gray-400 border border-white/10{{end}}">
-                                <span class="w-1.5 h-1.5 rounded-full mr-1.5 {{if eq .SyncStatus "success"}}bg-success{{else if eq .SyncStatus "error"}}bg-error{{else if eq .SyncStatus "running"}}bg-accent animate-pulse{{else}}bg-gray-500{{end}}"></span>
-                                {{if eq .SyncStatus "success"}}Synced
-                                {{else if eq .SyncStatus "error"}}Error
-                                {{else if eq .SyncStatus "running"}}Running
-                                {{else}}Pending{{end}}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                                {{if eq .SyncStatus "success"}}bg-green-900/50 text-green-400
+                                {{else if eq .SyncStatus "error"}}bg-red-900/50 text-red-400
+                                {{else if eq .SyncStatus "running"}}bg-blue-900/50 text-blue-400
+                                {{else}}bg-gray-700 text-gray-400{{end}}">
+                                {{if eq .SyncStatus "success"}}Synced{{else if eq .SyncStatus "error"}}Error{{else if eq .SyncStatus "running"}}Running{{else}}Pending{{end}}
                             </span>
                             {{else}}
-                            <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium bg-white/5 text-gray-500 border border-white/10">
-                                <span class="w-1.5 h-1.5 rounded-full mr-1.5 bg-gray-600"></span>
-                                Disabled
-                            </span>
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-700 text-gray-500">Disabled</span>
                             {{end}}
                         </td>
-                        <td class="px-6 py-4 text-sm text-gray-400">
+                        <td class="px-4 py-3 text-gray-400">
                             {{if .LastSyncAt}}{{.LastSyncAt.Format "Jan 02, 15:04"}}{{else}}Never{{end}}
                         </td>
-                        <td class="px-6 py-4">
+                        <td class="px-4 py-3">
                             <div class="flex items-center space-x-3">
-                                <form action="/sources/{{.ID}}/sync" method="POST" class="inline" hx-post="/sources/{{.ID}}/sync" hx-swap="none">
+                                <form action="/sources/{{.ID}}/sync" method="POST" hx-post="/sources/{{.ID}}/sync" hx-swap="none">
                                     <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                                    <button type="submit" class="text-sm font-medium text-primary hover:text-primary-light transition-colors">
-                                        Sync
-                                    </button>
+                                    <button type="submit" class="text-primary hover:text-blue-300 text-xs font-medium">Sync</button>
                                 </form>
-                                <a href="/sources/{{.ID}}/edit" class="text-sm font-medium text-gray-400 hover:text-white transition-colors">Edit</a>
-                                <a href="/sources/{{.ID}}/logs" class="text-sm font-medium text-gray-400 hover:text-white transition-colors">Logs</a>
+                                <a href="/sources/{{.ID}}/edit" class="text-gray-400 hover:text-white text-xs font-medium">Edit</a>
+                                <a href="/sources/{{.ID}}/logs" class="text-gray-400 hover:text-white text-xs font-medium">Logs</a>
                             </div>
                         </td>
                     </tr>
@@ -147,19 +88,11 @@
             </table>
         </div>
         {{else}}
-        <div class="text-center py-16 px-6">
-            <div class="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-primary/20 to-primary/5 flex items-center justify-center border border-primary/20 mb-4">
-                <svg class="w-8 h-8 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                </svg>
-            </div>
-            <h3 class="text-lg font-semibold text-white">No calendar sources yet</h3>
-            <p class="mt-2 text-gray-400 max-w-sm mx-auto">Get started by adding your first calendar source to begin syncing.</p>
-            <a href="/sources/add" class="mt-6 inline-flex items-center justify-center px-5 py-2.5 rounded-xl text-white font-medium bg-gradient-to-r from-primary to-primary-dark hover:from-primary-dark hover:to-primary transition-all duration-300 btn-glow">
-                <svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-                </svg>
-                Add Your First Source
+        <div class="text-center py-12 px-4">
+            <h3 class="text-base font-medium text-white">No calendar sources yet</h3>
+            <p class="mt-1 text-sm text-gray-400">Add your first source to begin syncing.</p>
+            <a href="/sources/add" class="mt-4 inline-flex items-center px-4 py-2 rounded bg-primary hover:bg-primary-dark text-white text-sm font-medium transition-colors">
+                + Add Your First Source
             </a>
         </div>
         {{end}}
