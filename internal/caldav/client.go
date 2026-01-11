@@ -173,8 +173,11 @@ func (c *Client) getEventsViaPropfind(ctx context.Context, calendarPath string) 
 
 // getEventsViaList lists calendar contents and fetches each event individually.
 func (c *Client) getEventsViaList(ctx context.Context, calendarPath string) ([]Event, error) {
+	// Build the full URL - calendarPath might be absolute or relative
+	fullURL := c.buildURL(calendarPath)
+
 	// Make a simple PROPFIND request to list contents
-	req, err := http.NewRequestWithContext(ctx, "PROPFIND", c.baseURL+calendarPath, strings.NewReader(`<?xml version="1.0" encoding="utf-8" ?>
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", fullURL, strings.NewReader(`<?xml version="1.0" encoding="utf-8" ?>
 <D:propfind xmlns:D="DAV:">
   <D:prop>
     <D:getetag/>
@@ -283,6 +286,32 @@ func parseEventPaths(body []byte, basePath string) []string {
 		}
 	}
 	return paths
+}
+
+// buildURL constructs the full URL for a path.
+// If path is absolute (starts with /), extract host from baseURL and combine.
+// Otherwise, append path to baseURL.
+func (c *Client) buildURL(path string) string {
+	if path == "" {
+		return c.baseURL
+	}
+
+	// If path is absolute, use just the scheme+host from baseURL
+	if strings.HasPrefix(path, "/") {
+		// Parse baseURL to get scheme and host
+		if idx := strings.Index(c.baseURL, "://"); idx != -1 {
+			rest := c.baseURL[idx+3:]
+			if slashIdx := strings.Index(rest, "/"); slashIdx != -1 {
+				// baseURL has a path, use scheme://host + path
+				return c.baseURL[:idx+3] + rest[:slashIdx] + path
+			}
+		}
+		// baseURL is just scheme://host, append path
+		return strings.TrimSuffix(c.baseURL, "/") + path
+	}
+
+	// Relative path - append to baseURL
+	return strings.TrimSuffix(c.baseURL, "/") + "/" + path
 }
 
 // GetEvent retrieves a single event by path.
