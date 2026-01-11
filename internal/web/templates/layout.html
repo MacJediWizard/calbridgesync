@@ -8,7 +8,7 @@
     <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Roboto:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script>
         tailwind.config = {
             theme: {
@@ -25,7 +25,8 @@
                         'surface-hover': 'rgba(255, 255, 255, 0.1)',
                     },
                     fontFamily: {
-                        'sans': ['Inter', 'system-ui', 'sans-serif'],
+                        'sans': ['Roboto', 'system-ui', 'sans-serif'],
+                        'heading': ['Orbitron', 'monospace'],
                     },
                     backdropBlur: {
                         'xl': '24px',
@@ -36,10 +37,13 @@
     </script>
     <style>
         body {
-            font-family: 'Inter', system-ui, sans-serif;
+            font-family: 'Roboto', system-ui, sans-serif;
             background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 25%, #16213e 50%, #1a1a2e 75%, #0f0f23 100%);
             background-attachment: fixed;
             min-height: 100vh;
+        }
+        h1, h2, h3, h4, .font-heading {
+            font-family: 'Orbitron', monospace;
         }
 
         /* Animated gradient orbs in background */
