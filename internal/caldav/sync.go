@@ -114,6 +114,12 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		return result
 	}
 
+	// Log discovered calendars
+	log.Printf("Found %d calendars on source:", len(sourceCalendars))
+	for i, cal := range sourceCalendars {
+		log.Printf("  [%d] Name: %q, Path: %s", i+1, cal.Name, cal.Path)
+	}
+
 	// Sync each calendar
 	for _, cal := range sourceCalendars {
 		calResult := se.syncCalendar(ctx, source, sourceClient, destClient, cal)
