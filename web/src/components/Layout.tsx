@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { Link, useLocation, Outlet } from 'react-router-dom';
 import type { User } from '../types';
 
-const LOGO_URL = 'https://cdn.macjediwizard.com/cdn/CalBridgeSync%20Images/calbridge-06070e03.png';
+// Local logo
+const LOGO_URL = '/logo.png';
 
 interface LayoutProps {
   user: User | null;

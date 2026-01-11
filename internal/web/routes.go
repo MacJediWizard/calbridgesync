@@ -69,6 +69,7 @@ func setupReactApp(r *gin.Engine) {
 
 	// Serve other static files
 	r.StaticFile("/vite.svg", filepath.Join(webDistPath, "vite.svg"))
+	r.StaticFile("/logo.png", filepath.Join(webDistPath, "logo.png"))
 
 	// SPA fallback - serve index.html for all unmatched routes
 	r.NoRoute(func(c *gin.Context) {
