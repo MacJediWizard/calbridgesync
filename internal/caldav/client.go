@@ -20,10 +20,11 @@ import (
 )
 
 var (
-	ErrConnectionFailed = errors.New("connection failed")
-	ErrAuthFailed       = errors.New("authentication failed")
-	ErrNotFound         = errors.New("resource not found")
-	ErrInvalidResponse  = errors.New("invalid server response")
+	ErrConnectionFailed  = errors.New("connection failed")
+	ErrAuthFailed        = errors.New("authentication failed")
+	ErrNotFound          = errors.New("resource not found")
+	ErrInvalidResponse   = errors.New("invalid server response")
+	ErrMalformedContent  = errors.New("malformed calendar content")
 )
 
 const (
@@ -219,13 +220,22 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string) ([]E
 
 	// Fetch each event individually
 	events := make([]Event, 0, len(eventPaths))
+	skippedMalformed := 0
 	for _, path := range eventPaths {
 		event, err := c.GetEvent(ctx, path)
 		if err != nil {
+			if IsMalformedError(err) {
+				// Silently skip malformed events - these are corrupted at the source
+				skippedMalformed++
+				continue
+			}
 			log.Printf("Failed to fetch event %s: %v", path, err)
 			continue
 		}
 		events = append(events, *event)
+	}
+	if skippedMalformed > 0 {
+		log.Printf("Skipped %d malformed events (corrupted at source)", skippedMalformed)
 	}
 
 	return events, nil
@@ -343,10 +353,22 @@ func (c *Client) buildURL(path string) string {
 	return strings.TrimSuffix(c.baseURL, "/") + "/" + path
 }
 
+// IsMalformedError checks if an error is a malformed content error.
+func IsMalformedError(err error) bool {
+	return errors.Is(err, ErrMalformedContent)
+}
+
 // GetEvent retrieves a single event by path.
 func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error) {
 	obj, err := c.caldavClient.GetCalendarObject(ctx, eventPath)
 	if err != nil {
+		// Check for malformed content errors from the iCal parser
+		errStr := err.Error()
+		if strings.Contains(errStr, "malformed") ||
+			strings.Contains(errStr, "missing colon") ||
+			strings.Contains(errStr, "invalid") && strings.Contains(errStr, "ical") {
+			return nil, fmt.Errorf("%w: %s", ErrMalformedContent, eventPath)
+		}
 		return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
 	}
 
