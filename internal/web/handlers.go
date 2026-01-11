@@ -166,10 +166,13 @@ func (h *Handlers) Callback(c *gin.Context) {
 		return
 	}
 
-	// Check for redirect cookie
+	// Check for redirect cookie with validation to prevent open redirect
 	redirectURL := "/"
 	if cookie, err := c.Cookie("redirect_after_login"); err == nil && cookie != "" {
-		redirectURL = cookie
+		// Only use redirect URL if it's safe (relative path, no protocol)
+		if IsSafeRedirectURL(cookie) {
+			redirectURL = cookie
+		}
 		c.SetCookie("redirect_after_login", "", -1, "/", "", h.cfg.IsProduction(), true)
 	}
 

@@ -25,7 +25,7 @@ function App() {
       if (status.authenticated && status.user) {
         setUser(status.user);
       }
-    } catch (err) {
+    } catch {
       // Not authenticated
       console.log('Not authenticated');
     } finally {

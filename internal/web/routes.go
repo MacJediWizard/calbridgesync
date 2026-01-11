@@ -16,8 +16,10 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	r.GET("/healthz", h.Liveness)
 	r.GET("/ready", h.Readiness)
 
-	// Auth endpoints (no auth required) - for SSO redirect flow
+	// Auth endpoints with rate limiting to prevent brute force attacks
+	authRateLimiter := RateLimiter(5, 10) // 5 requests/sec, burst of 10
 	authGroup := r.Group("/auth")
+	authGroup.Use(authRateLimiter)
 	{
 		authGroup.GET("/login", h.Login)
 		authGroup.POST("/login", h.Login)
@@ -25,17 +27,21 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		authGroup.POST("/logout", h.Logout)
 	}
 
-	// API routes for React frontend
+	// API routes for React frontend with rate limiting
+	apiRateLimiter := RateLimiter(30, 60) // 30 requests/sec, burst of 60
 	apiGroup := r.Group("/api")
+	apiGroup.Use(apiRateLimiter)
 	apiGroup.Use(auth.OptionalAuth(sm))
 	{
 		apiGroup.GET("/auth/status", h.APIAuthStatus)
 		apiGroup.POST("/auth/logout", h.APILogout)
 	}
 
-	// Protected API routes
+	// Protected API routes with rate limiting and origin validation
 	protectedAPI := r.Group("/api")
+	protectedAPI.Use(apiRateLimiter)
 	protectedAPI.Use(auth.RequireAuth(sm))
+	protectedAPI.Use(ValidateOrigin()) // CSRF protection via origin check
 	{
 		protectedAPI.GET("/dashboard/stats", h.APIDashboardStats)
 		protectedAPI.GET("/dashboard/sync-history", h.APISyncHistory)
