@@ -237,7 +237,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		destEvents = []Event{}
 	}
 
-	// Create maps for comparison
+	// Create maps for comparison by UID
 	sourceEventMap := make(map[string]Event)
 	for _, e := range sourceEvents {
 		if e.UID != "" {
@@ -252,16 +252,41 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		}
 	}
 
+	// Create deduplication map using summary + start time
+	// This catches duplicates with different UIDs but same content
+	destDedupeMap := make(map[string]bool)
+	for _, e := range destEvents {
+		key := e.DedupeKey()
+		if key != "|" { // Skip if both summary and start time are empty
+			destDedupeMap[key] = true
+		}
+	}
+
+	skippedDupes := 0
+
 	// Sync source events to destination
 	for _, sourceEvent := range sourceEvents {
-		destEvent, exists := destEventMap[sourceEvent.UID]
+		destEvent, existsByUID := destEventMap[sourceEvent.UID]
 
-		if !exists {
+		if !existsByUID {
+			// Check for duplicate by content (same summary + start time)
+			dedupeKey := sourceEvent.DedupeKey()
+			if dedupeKey != "|" && destDedupeMap[dedupeKey] {
+				// Event with same content already exists, skip
+				skippedDupes++
+				log.Printf("Skipping duplicate event: %s at %s", sourceEvent.Summary, sourceEvent.StartTime)
+				continue
+			}
+
 			// Create new event on destination
 			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to create event on dest: %v", err))
 			} else {
 				result.Created++
+				// Add to dedupe map to prevent future duplicates in this sync
+				if dedupeKey != "|" {
+					destDedupeMap[dedupeKey] = true
+				}
 			}
 		} else if sourceEvent.ETag != destEvent.ETag {
 			// Update existing event on destination
@@ -274,6 +299,10 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		}
 		// Remove from map to track what's processed
 		delete(destEventMap, sourceEvent.UID)
+	}
+
+	if skippedDupes > 0 {
+		log.Printf("Skipped %d duplicate events", skippedDupes)
 	}
 
 	// Two-way sync: sync destination events back to source

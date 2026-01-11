@@ -43,11 +43,17 @@ type Calendar struct {
 
 // Event represents a calendar event.
 type Event struct {
-	Path    string `json:"path"`
-	ETag    string `json:"etag"`
-	Data    string `json:"data"` // iCalendar data
-	UID     string `json:"uid"`
-	Summary string `json:"summary"`
+	Path      string `json:"path"`
+	ETag      string `json:"etag"`
+	Data      string `json:"data"` // iCalendar data
+	UID       string `json:"uid"`
+	Summary   string `json:"summary"`
+	StartTime string `json:"start_time"` // DTSTART value for deduplication
+}
+
+// DedupeKey returns a key for deduplication based on summary and start time.
+func (e *Event) DedupeKey() string {
+	return e.Summary + "|" + e.StartTime
 }
 
 // Client provides CalDAV operations.
@@ -238,13 +244,17 @@ func (c *Client) objectsToEvents(objects []caldav.CalendarObject) []Event {
 			// Encode the calendar to string
 			event.Data = encodeCalendar(obj.Data)
 
-			// Extract UID and Summary from events
+			// Extract UID, Summary, and StartTime from events
 			for _, evt := range obj.Data.Events() {
 				if uid, err := evt.Props.Text(ical.PropUID); err == nil {
 					event.UID = uid
 				}
 				if summary, err := evt.Props.Text(ical.PropSummary); err == nil {
 					event.Summary = summary
+				}
+				// Extract start time for deduplication (normalized to UTC)
+				if dtstart := evt.Props.Get(ical.PropDateTimeStart); dtstart != nil {
+					event.StartTime = normalizeStartTime(dtstart)
 				}
 			}
 		}
@@ -355,6 +365,10 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 			if summary, err := evt.Props.Text(ical.PropSummary); err == nil {
 				event.Summary = summary
 			}
+			// Extract start time for deduplication (normalized to UTC)
+			if dtstart := evt.Props.Get(ical.PropDateTimeStart); dtstart != nil {
+				event.StartTime = normalizeStartTime(dtstart)
+			}
 		}
 	}
 
@@ -427,4 +441,23 @@ func encodeCalendar(cal *ical.Calendar) string {
 		return ""
 	}
 	return buf.String()
+}
+
+// normalizeStartTime converts a DTSTART property to a normalized UTC string for comparison.
+// This handles different formats like "20260112T170000Z" (UTC) and "20260113T010000" with TZID.
+func normalizeStartTime(prop *ical.Prop) string {
+	if prop == nil {
+		return ""
+	}
+
+	// Try to parse the datetime properly using the library's method
+	t, err := prop.DateTime(time.UTC)
+	if err == nil {
+		// Successfully parsed - return UTC formatted string
+		return t.UTC().Format("20060102T150405Z")
+	}
+
+	// If parsing fails, fall back to the raw value
+	// This ensures we still have something for comparison
+	return prop.Value
 }
