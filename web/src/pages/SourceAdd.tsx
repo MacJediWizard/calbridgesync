@@ -258,15 +258,34 @@ export default function SourceAdd() {
             </p>
           </div>
 
-          {/* CalDAV URL Help */}
+          {/* Mailcow / SOGo */}
           <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
-            <h3 className="text-sm font-semibold text-white mb-2">CalDAV URL</h3>
-            <p className="text-xs text-gray-400 leading-relaxed mb-3">
-              The URL where your calendar is hosted. Common formats:
+            <h3 className="text-sm font-semibold text-white mb-2">Mailcow / SOGo</h3>
+            <p className="text-xs text-gray-400 leading-relaxed mb-2">
+              Mailcow uses SOGo for calendars. To find your CalDAV URL:
             </p>
+            <ol className="text-xs text-gray-400 list-decimal ml-4 space-y-1 mb-3">
+              <li>Log into SOGo webmail</li>
+              <li>Click <span className="text-white">Calendar</span> tab</li>
+              <li>Right-click your calendar → <span className="text-white">Link to this Calendar</span></li>
+              <li>Copy the <span className="text-red-400">CalDAV URL</span></li>
+            </ol>
+            <div className="bg-black/50 p-2 rounded text-xs">
+              <p className="text-gray-500 mb-1">URL format:</p>
+              <code className="text-red-400 break-all">https://mail.example.com/SOGo/dav/user@example.com/Calendar/personal/</code>
+            </div>
+            <p className="text-xs text-gray-500 mt-2">
+              <span className="text-white">Username:</span> Your full email address<br/>
+              <span className="text-white">Password:</span> Your mailbox password
+            </p>
+          </div>
+
+          {/* Other CalDAV Servers */}
+          <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
+            <h3 className="text-sm font-semibold text-white mb-2">Other CalDAV Servers</h3>
             <div className="space-y-2 text-xs">
               <div className="bg-black/50 p-2 rounded">
-                <p className="text-gray-500 mb-1">Nextcloud / ownCloud:</p>
+                <p className="text-gray-500 mb-1">Nextcloud:</p>
                 <code className="text-red-400 break-all">https://cloud.example.com/remote.php/dav/calendars/username/calendar-name/</code>
               </div>
               <div className="bg-black/50 p-2 rounded">
@@ -280,19 +299,41 @@ export default function SourceAdd() {
               <div className="bg-black/50 p-2 rounded">
                 <p className="text-gray-500 mb-1">iCloud:</p>
                 <code className="text-red-400 break-all">https://caldav.icloud.com/</code>
+                <p className="text-gray-500 mt-1">Use app-specific password from appleid.apple.com</p>
+              </div>
+              <div className="bg-black/50 p-2 rounded">
+                <p className="text-gray-500 mb-1">Google Calendar:</p>
+                <code className="text-red-400 break-all">https://apidata.googleusercontent.com/caldav/v2/calid/events</code>
+                <p className="text-gray-500 mt-1">Requires OAuth or app password</p>
               </div>
             </div>
+          </div>
+
+          {/* How to Find CalDAV URL */}
+          <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
+            <h3 className="text-sm font-semibold text-white mb-2">Finding Your CalDAV URL</h3>
+            <p className="text-xs text-gray-400 leading-relaxed mb-2">
+              Most calendar apps show the CalDAV URL in settings:
+            </p>
+            <ul className="text-xs text-gray-400 list-disc ml-4 space-y-1">
+              <li>Look for <span className="text-white">"CalDAV"</span>, <span className="text-white">"Sync"</span>, or <span className="text-white">"Subscribe"</span> options</li>
+              <li>Check calendar properties or sharing settings</li>
+              <li>The URL usually ends with the calendar name or ID</li>
+              <li>Make sure to use <span className="text-red-400">https://</span> not http://</li>
+            </ul>
           </div>
 
           {/* Credentials Help */}
           <div className="bg-zinc-900 rounded-lg border border-zinc-800 p-4">
             <h3 className="text-sm font-semibold text-white mb-2">Credentials</h3>
             <p className="text-xs text-gray-400 leading-relaxed mb-2">
-              <span className="text-white">Username:</span> Usually your email address or account username.
+              <span className="text-white">Username:</span> Usually your full email address (e.g., user@example.com)
             </p>
-            <p className="text-xs text-gray-400 leading-relaxed">
-              <span className="text-white">Password:</span> Your account password, or an <span className="text-red-400">app-specific password</span> if
-              you have 2FA enabled. Check your provider's settings for how to generate one.
+            <p className="text-xs text-gray-400 leading-relaxed mb-2">
+              <span className="text-white">Password:</span> Your account password, or an <span className="text-red-400">app-specific password</span> if you have 2FA enabled.
+            </p>
+            <p className="text-xs text-gray-500">
+              For iCloud and Google, you must generate an app-specific password in your account security settings.
             </p>
           </div>
 
