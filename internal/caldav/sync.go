@@ -486,12 +486,15 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 // It groups events by Summary+StartTime and keeps the one matching a source UID,
 // or the first one if no match. Returns the number of duplicates removed.
 func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client, destCalendarPath string, sourceEventMap map[string]Event) int {
+	log.Printf("Starting duplicate cleanup for destination: %s", destCalendarPath)
+
 	// Re-fetch destination events to get current state
 	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
 	if err != nil {
 		log.Printf("Failed to get destination events for duplicate cleanup: %v", err)
 		return 0
 	}
+	log.Printf("Fetched %d destination events for duplicate check", len(destEvents))
 
 	// Group events by dedupe key (Summary + StartTime)
 	type eventGroup struct {
@@ -512,11 +515,12 @@ func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client,
 
 	// Find and delete duplicates
 	duplicatesRemoved := 0
+	duplicateGroups := 0
 	for key, group := range groups {
 		if len(group.events) <= 1 {
 			continue // No duplicates
 		}
-
+		duplicateGroups++
 		log.Printf("Found %d duplicates for: %s", len(group.events), key)
 
 		// Determine which event to keep:
@@ -546,6 +550,7 @@ func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client,
 		}
 	}
 
+	log.Printf("Duplicate cleanup complete: found %d duplicate groups, removed %d events", duplicateGroups, duplicatesRemoved)
 	return duplicatesRemoved
 }
 
