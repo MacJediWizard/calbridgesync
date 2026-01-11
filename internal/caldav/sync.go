@@ -14,17 +14,18 @@ import (
 
 // SyncResult represents the result of a sync operation.
 type SyncResult struct {
-	Success         bool          `json:"success"`
-	Message         string        `json:"message"`
-	Created         int           `json:"created"`
-	Updated         int           `json:"updated"`
-	Deleted         int           `json:"deleted"`
-	Skipped         int           `json:"skipped"`
-	CalendarsSynced int           `json:"calendars_synced"`
-	EventsProcessed int           `json:"events_processed"`
-	Errors          []string      `json:"errors,omitempty"`   // Critical errors that prevent sync
-	Warnings        []string      `json:"warnings,omitempty"` // Non-critical issues (individual event failures)
-	Duration        time.Duration `json:"duration"`
+	Success           bool          `json:"success"`
+	Message           string        `json:"message"`
+	Created           int           `json:"created"`
+	Updated           int           `json:"updated"`
+	Deleted           int           `json:"deleted"`
+	Skipped           int           `json:"skipped"`
+	DuplicatesRemoved int           `json:"duplicates_removed"`
+	CalendarsSynced   int           `json:"calendars_synced"`
+	EventsProcessed   int           `json:"events_processed"`
+	Errors            []string      `json:"errors,omitempty"`   // Critical errors that prevent sync
+	Warnings          []string      `json:"warnings,omitempty"` // Non-critical issues (individual event failures)
+	Duration          time.Duration `json:"duration"`
 }
 
 // SyncEngine orchestrates calendar synchronization.
@@ -459,6 +460,13 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		}
 	}
 
+	// Clean up duplicate events on destination
+	duplicatesRemoved := se.cleanupDuplicates(ctx, destClient, destCalendarPath, sourceEventMap)
+	result.DuplicatesRemoved = duplicatesRemoved
+	if duplicatesRemoved > 0 {
+		log.Printf("Removed %d duplicate events from destination", duplicatesRemoved)
+	}
+
 	// Update synced_events table with current state
 	for uid := range currentUIDs {
 		syncedEvent := &db.SyncedEvent{
@@ -472,6 +480,73 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	}
 
 	return result
+}
+
+// cleanupDuplicates removes duplicate events from destination calendar.
+// It groups events by Summary+StartTime and keeps the one matching a source UID,
+// or the first one if no match. Returns the number of duplicates removed.
+func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client, destCalendarPath string, sourceEventMap map[string]Event) int {
+	// Re-fetch destination events to get current state
+	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
+	if err != nil {
+		log.Printf("Failed to get destination events for duplicate cleanup: %v", err)
+		return 0
+	}
+
+	// Group events by dedupe key (Summary + StartTime)
+	type eventGroup struct {
+		events []Event
+	}
+	groups := make(map[string]*eventGroup)
+
+	for _, event := range destEvents {
+		key := event.DedupeKey()
+		if key == "|" { // Empty summary and start time
+			continue
+		}
+		if groups[key] == nil {
+			groups[key] = &eventGroup{events: make([]Event, 0)}
+		}
+		groups[key].events = append(groups[key].events, event)
+	}
+
+	// Find and delete duplicates
+	duplicatesRemoved := 0
+	for key, group := range groups {
+		if len(group.events) <= 1 {
+			continue // No duplicates
+		}
+
+		log.Printf("Found %d duplicates for: %s", len(group.events), key)
+
+		// Determine which event to keep:
+		// 1. Prefer event with UID matching a source event
+		// 2. Otherwise keep the first one (arbitrary but consistent)
+		keepIndex := 0
+		for i, event := range group.events {
+			if _, existsInSource := sourceEventMap[event.UID]; existsInSource {
+				keepIndex = i
+				break
+			}
+		}
+
+		// Delete all except the one we're keeping
+		for i, event := range group.events {
+			if i == keepIndex {
+				log.Printf("Keeping event: %s (UID: %s)", event.Path, event.UID)
+				continue
+			}
+
+			log.Printf("Deleting duplicate event: %s (UID: %s)", event.Path, event.UID)
+			if err := destClient.DeleteEvent(ctx, event.Path); err != nil {
+				log.Printf("Failed to delete duplicate event %s: %v", event.Path, err)
+			} else {
+				duplicatesRemoved++
+			}
+		}
+	}
+
+	return duplicatesRemoved
 }
 
 func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
