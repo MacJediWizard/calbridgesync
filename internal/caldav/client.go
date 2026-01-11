@@ -258,6 +258,7 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, coll
 	// Fetch each event individually
 	events := make([]Event, 0, len(eventPaths))
 	skippedMalformed := 0
+	skippedEmpty := 0
 	for _, path := range eventPaths {
 		event, err := c.GetEvent(ctx, path)
 		if err != nil {
@@ -272,10 +273,21 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, coll
 			log.Printf("Failed to fetch event %s: %v", path, err)
 			continue
 		}
+		// Check for empty event data (corrupted or deleted events)
+		if event.Data == "" {
+			if collector != nil {
+				collector.Add(path, "empty iCalendar data - event may be corrupted or deleted")
+			}
+			skippedEmpty++
+			continue
+		}
 		events = append(events, *event)
 	}
 	if skippedMalformed > 0 {
 		log.Printf("Skipped %d malformed events (corrupted at source)", skippedMalformed)
+	}
+	if skippedEmpty > 0 {
+		log.Printf("Skipped %d empty events (no iCalendar data)", skippedEmpty)
 	}
 
 	return events, nil
