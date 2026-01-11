@@ -13,6 +13,7 @@ import (
 const (
 	cleanupInterval  = 24 * time.Hour
 	logRetentionDays = 30
+	syncTimeout      = 10 * time.Minute // Maximum time for a single sync operation
 )
 
 // Job represents a scheduled sync job.
@@ -28,12 +29,13 @@ type Scheduler struct {
 	db         *db.DB
 	syncEngine *caldav.SyncEngine
 
-	mu      sync.RWMutex
-	jobs    map[string]*Job
-	wg      sync.WaitGroup
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started bool
+	mu        sync.RWMutex
+	jobs      map[string]*Job
+	syncLocks map[string]*sync.Mutex // Per-source locks to prevent concurrent syncs
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	started   bool
 }
 
 // New creates a new scheduler.
@@ -43,6 +45,7 @@ func New(database *db.DB, syncEngine *caldav.SyncEngine) *Scheduler {
 		db:         database,
 		syncEngine: syncEngine,
 		jobs:       make(map[string]*Job),
+		syncLocks:  make(map[string]*sync.Mutex),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -195,8 +198,32 @@ func (s *Scheduler) runJob(job *Job) {
 	}
 }
 
+// getSyncLock returns the mutex for a source, creating one if needed.
+func (s *Scheduler) getSyncLock(sourceID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if lock, exists := s.syncLocks[sourceID]; exists {
+		return lock
+	}
+
+	lock := &sync.Mutex{}
+	s.syncLocks[sourceID] = lock
+	return lock
+}
+
 // executeSync runs the sync for a source.
 func (s *Scheduler) executeSync(sourceID string) {
+	// Get per-source lock to prevent concurrent syncs
+	lock := s.getSyncLock(sourceID)
+
+	// Try to acquire lock without blocking - skip if another sync is in progress
+	if !lock.TryLock() {
+		log.Printf("Skipping sync for source %s - another sync is already in progress", sourceID)
+		return
+	}
+	defer lock.Unlock()
+
 	// Get the source
 	source, err := s.db.GetSourceByID(sourceID)
 	if err != nil {
@@ -211,12 +238,16 @@ func (s *Scheduler) executeSync(sourceID string) {
 
 	log.Printf("Starting sync for source %s (%s)", source.Name, sourceID)
 
-	// Execute sync
-	result := s.syncEngine.SyncSource(s.ctx, source)
+	// Create a timeout context for this sync operation
+	ctx, cancel := context.WithTimeout(s.ctx, syncTimeout)
+	defer cancel()
+
+	// Execute sync with timeout context
+	result := s.syncEngine.SyncSource(ctx, source)
 
 	if result.Success {
-		log.Printf("Sync completed for source %s: %d created, %d updated, %d deleted in %v",
-			source.Name, result.Created, result.Updated, result.Deleted, result.Duration)
+		log.Printf("Sync completed for source %s: %d created, %d updated, %d deleted, %d duplicates removed in %v",
+			source.Name, result.Created, result.Updated, result.Deleted, result.DuplicatesRemoved, result.Duration)
 	} else {
 		log.Printf("Sync failed for source %s: %s", source.Name, result.Message)
 	}
