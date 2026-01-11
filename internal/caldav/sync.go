@@ -311,6 +311,10 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	currentUIDs := make(map[string]bool)
 
 	// Handle deletions first (for two-way sync)
+	// SAFETY: Only delete from source if the event was synced at least one sync cycle ago
+	// This prevents deleting events that failed to sync to destination
+	syncSafetyThreshold := time.Now().Add(-time.Duration(source.SyncInterval) * time.Second)
+
 	if source.SyncDirection == db.SyncDirectionTwoWay {
 		for uid, syncedEvent := range previouslySyncedMap {
 			_, existsOnSource := sourceEventMap[uid]
@@ -334,6 +338,13 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 
 			sourceEvent, existsOnSource := sourceEventMap[uid]
 			if existsOnSource && !existsOnDest {
+				// SAFETY CHECK: Only delete from source if the event was synced before the safety threshold
+				// This prevents deleting events that never synced successfully to destination
+				if syncedEvent.UpdatedAt.After(syncSafetyThreshold) {
+					log.Printf("Event %s not on destination but synced recently - skipping deletion from source (safety)", uid)
+					continue
+				}
+
 				// Event was deleted from destination - delete from source too
 				log.Printf("Event %s deleted from destination, deleting from source", uid)
 				if err := sourceClient.DeleteEvent(ctx, sourceEvent.Path); err != nil {

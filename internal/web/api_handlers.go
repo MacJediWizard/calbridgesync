@@ -23,6 +23,7 @@ type APISource struct {
 	DestURL          string `json:"dest_url"`
 	DestUsername     string `json:"dest_username"`
 	SyncInterval     int    `json:"sync_interval"`
+	SyncDirection    string `json:"sync_direction"`
 	ConflictStrategy string `json:"conflict_strategy"`
 	Enabled          bool   `json:"enabled"`
 	SyncStatus       string `json:"sync_status"`
@@ -108,6 +109,7 @@ func sourceToAPI(s *db.Source) *APISource {
 		DestURL:          s.DestURL,
 		DestUsername:     s.DestUsername,
 		SyncInterval:     s.SyncInterval,
+		SyncDirection:    string(s.SyncDirection),
 		ConflictStrategy: string(s.ConflictStrategy),
 		Enabled:          s.Enabled,
 		SyncStatus:       string(s.LastSyncStatus),
