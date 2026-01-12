@@ -174,7 +174,7 @@ export default function SourceAdd() {
                     <select name="conflict_strategy" id="conflict_strategy" value={form.conflict_strategy} onChange={handleChange} required className="w-full">
                       <option value="source_wins">Source wins</option>
                       <option value="dest_wins">Dest wins</option>
-                      <option value="latest_wins">Latest wins</option>
+                      <option value="latest_wins">Newest wins</option>
                     </select>
                   </div>
                 </div>

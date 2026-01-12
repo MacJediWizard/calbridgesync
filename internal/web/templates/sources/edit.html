@@ -54,7 +54,7 @@
                         <select name="conflict_strategy" id="conflict_strategy" required class="w-full rounded py-2 px-3 bg-gray-900 border border-gray-600 text-white focus:border-primary focus:outline-none">
                             <option value="source_wins" {{if eq .Source.ConflictStrategy "source_wins"}}selected{{end}}>Source wins</option>
                             <option value="dest_wins" {{if eq .Source.ConflictStrategy "dest_wins"}}selected{{end}}>Dest wins</option>
-                            <option value="latest_wins" {{if eq .Source.ConflictStrategy "latest_wins"}}selected{{end}}>Latest wins</option>
+                            <option value="latest_wins" {{if eq .Source.ConflictStrategy "latest_wins"}}selected{{end}}>Newest wins</option>
                         </select>
                     </div>
                 </div>
