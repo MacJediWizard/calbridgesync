@@ -134,8 +134,12 @@ export default function SourceAdd() {
                     </label>
                     <select name="source_type" id="source_type" value={form.source_type} onChange={handleChange} required className="w-full">
                       <option value="caldav">CalDAV</option>
+                      <option value="icloud">iCloud</option>
                       <option value="google">Google</option>
                       <option value="outlook">Outlook</option>
+                      <option value="fastmail">Fastmail</option>
+                      <option value="nextcloud">Nextcloud</option>
+                      <option value="custom">Custom</option>
                     </select>
                   </div>
                   <div>
