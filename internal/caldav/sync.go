@@ -48,6 +48,29 @@ func sanitizeLogDetails(details string) string {
 	return details
 }
 
+// retryDBOperation retries a database operation with exponential backoff.
+// This helps handle SQLite "database is locked" errors during concurrent operations.
+func retryDBOperation(operation func() error, maxRetries int) error {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		if err := operation(); err != nil {
+			lastErr = err
+			// Check if it's a busy/locked error worth retrying
+			if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
+				backoff := time.Duration(100*(1<<i)) * time.Millisecond // 100ms, 200ms, 400ms, ...
+				if backoff > 5*time.Second {
+					backoff = 5 * time.Second
+				}
+				time.Sleep(backoff)
+				continue
+			}
+			return err // Non-retryable error
+		}
+		return nil // Success
+	}
+	return lastErr
+}
+
 // SyncEngine orchestrates calendar synchronization.
 type SyncEngine struct {
 	db        *db.DB
@@ -70,9 +93,11 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		Warnings: make([]string, 0),
 	}
 
-	// Update status to running
-	if err := se.db.UpdateSourceSyncStatus(source.ID, db.SyncStatusRunning, "Sync in progress"); err != nil {
-		log.Printf("Failed to update sync status: %v", err)
+	// Update status to running (with retry for concurrent access)
+	if err := retryDBOperation(func() error {
+		return se.db.UpdateSourceSyncStatus(source.ID, db.SyncStatusRunning, "Sync in progress")
+	}, 5); err != nil {
+		log.Printf("Failed to update sync status after retries: %v", err)
 	}
 
 	// Decrypt credentials - NEVER log these
@@ -643,8 +668,11 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		status = db.SyncStatusSuccess
 	}
 
-	if err := se.db.UpdateSourceSyncStatus(sourceID, status, result.Message); err != nil {
-		log.Printf("Failed to update sync status: %v", err)
+	// Update status with retry for concurrent access
+	if err := retryDBOperation(func() error {
+		return se.db.UpdateSourceSyncStatus(sourceID, status, result.Message)
+	}, 5); err != nil {
+		log.Printf("Failed to update sync status after retries: %v", err)
 	}
 
 	// Create sync log with detailed stats
@@ -673,8 +701,11 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		syncLog.Details = sanitizeLogDetails(strings.Join(details, "\n"))
 	}
 
-	if err := se.db.CreateSyncLog(syncLog); err != nil {
-		log.Printf("Failed to create sync log: %v", err)
+	// Create sync log with retry for concurrent access
+	if err := retryDBOperation(func() error {
+		return se.db.CreateSyncLog(syncLog)
+	}, 5); err != nil {
+		log.Printf("Failed to create sync log after retries: %v", err)
 	}
 }
 

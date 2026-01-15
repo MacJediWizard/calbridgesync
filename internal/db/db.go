@@ -48,7 +48,7 @@ func New(dbPath string) (*DB, error) {
 	// Configure SQLite for optimal performance and security
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=5000",
+		"PRAGMA busy_timeout=30000", // 30 seconds to handle concurrent sync operations
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA secure_delete=ON",
 		"PRAGMA synchronous=NORMAL",
