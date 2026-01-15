@@ -173,6 +173,7 @@ type Source struct {
 	DestUsername      string           `json:"dest_username"`
 	DestPassword      string           `json:"-"` // Never include in JSON
 	SyncInterval      int              `json:"sync_interval"`
+	SyncDaysPast      int              `json:"sync_days_past"` // How many days in the past to sync (0 = unlimited)
 	SyncDirection     SyncDirection    `json:"sync_direction"`
 	ConflictStrategy  ConflictStrategy `json:"conflict_strategy"`
 	SelectedCalendars []string         `json:"selected_calendars"` // Calendar paths to sync (empty = all)

@@ -14,6 +14,7 @@ export interface Source {
   dest_url: string;
   dest_username: string;
   sync_interval: number;
+  sync_days_past: number;
   sync_direction: 'one_way' | 'two_way';
   conflict_strategy: string;
   selected_calendars: string[];
@@ -65,6 +66,7 @@ export interface SourceFormData {
   dest_username: string;
   dest_password: string;
   sync_interval: number;
+  sync_days_past: number;
   sync_direction: 'one_way' | 'two_way';
   conflict_strategy: string;
   selected_calendars: string[];

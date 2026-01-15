@@ -308,6 +308,51 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 	return se.fullSync(ctx, source, sourceClient, destClient, calendar, calendarIndex)
 }
 
+// filterEventsByDate filters events to only include those with start time after cutoff date.
+// Events without a parseable start time are included (to be safe).
+func filterEventsByDate(events []Event, cutoffDate time.Time) []Event {
+	var filtered []Event
+	for _, e := range events {
+		if e.StartTime == "" {
+			// Include events without start time (might be tasks or unparsed)
+			filtered = append(filtered, e)
+			continue
+		}
+
+		// Try to parse the start time - iCalendar format variants
+		var eventTime time.Time
+		var err error
+
+		// Common iCalendar date/time formats
+		formats := []string{
+			"20060102T150405Z",     // UTC datetime
+			"20060102T150405",      // Local datetime
+			"20060102",             // Date only
+			"2006-01-02T15:04:05Z", // ISO with dashes
+			"2006-01-02",           // ISO date only
+		}
+
+		for _, format := range formats {
+			eventTime, err = time.Parse(format, e.StartTime)
+			if err == nil {
+				break
+			}
+		}
+
+		if err != nil {
+			// Can't parse date - include to be safe
+			filtered = append(filtered, e)
+			continue
+		}
+
+		// Include if event is after cutoff date (or is in the future)
+		if eventTime.After(cutoffDate) || eventTime.After(time.Now()) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
 func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int) *SyncResult {
 	result := &SyncResult{
 		Errors:   make([]string, 0),
@@ -340,6 +385,18 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		return result
 	}
 	updateStatus(fmt.Sprintf("loaded %d source events", len(sourceEvents)))
+
+	// Filter events by date if sync_days_past is configured
+	if source.SyncDaysPast > 0 {
+		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
+		originalCount := len(sourceEvents)
+		sourceEvents = filterEventsByDate(sourceEvents, cutoffDate)
+		filteredOut := originalCount - len(sourceEvents)
+		if filteredOut > 0 {
+			log.Printf("Filtered out %d events older than %d days (cutoff: %s)", filteredOut, source.SyncDaysPast, cutoffDate.Format("2006-01-02"))
+			updateStatus(fmt.Sprintf("filtered to %d events (-%d old)", len(sourceEvents), filteredOut))
+		}
+	}
 
 	// Store any malformed events found
 	for _, mf := range malformedCollector.GetEvents() {

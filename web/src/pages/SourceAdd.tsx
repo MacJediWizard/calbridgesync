@@ -20,6 +20,7 @@ export default function SourceAdd() {
     dest_username: '',
     dest_password: '',
     sync_interval: 3600,
+    sync_days_past: 30,
     sync_direction: 'one_way',
     conflict_strategy: 'source_wins',
     selected_calendars: [],
@@ -66,7 +67,7 @@ export default function SourceAdd() {
     const { name, value } = e.target;
     setForm((prev) => ({
       ...prev,
-      [name]: name === 'sync_interval' ? parseInt(value) : value,
+      [name]: (name === 'sync_interval' || name === 'sync_days_past') ? parseInt(value) : value,
     }));
   };
 
@@ -127,7 +128,7 @@ export default function SourceAdd() {
                     className="w-full"
                   />
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                   <div>
                     <label htmlFor="source_type" className="block text-sm font-medium text-gray-300 mb-1">
                       Type
@@ -154,6 +155,19 @@ export default function SourceAdd() {
                       <option value={7200}>2 hours</option>
                       <option value={21600}>6 hours</option>
                       <option value={86400}>24 hours</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="sync_days_past" className="block text-sm font-medium text-gray-300 mb-1">
+                      Past Events
+                    </label>
+                    <select name="sync_days_past" id="sync_days_past" value={form.sync_days_past} onChange={handleChange} required className="w-full">
+                      <option value={7}>7 days</option>
+                      <option value={14}>14 days</option>
+                      <option value={30}>30 days</option>
+                      <option value={60}>60 days</option>
+                      <option value={90}>90 days</option>
+                      <option value={0}>Unlimited</option>
                     </select>
                   </div>
                 </div>

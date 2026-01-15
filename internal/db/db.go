@@ -221,6 +221,9 @@ func (db *DB) migrate() error {
 
 		// Index on user_id for user_alert_preferences
 		`CREATE INDEX IF NOT EXISTS idx_user_alert_preferences_user_id ON user_alert_preferences(user_id)`,
+
+		// Migration: Add sync_days_past column to sources (default 30 days)
+		`ALTER TABLE sources ADD COLUMN sync_days_past INTEGER NOT NULL DEFAULT 30`,
 	}
 
 	for _, migration := range migrations {

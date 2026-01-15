@@ -99,15 +99,15 @@ func (db *DB) CreateSource(source *Source) error {
 
 	query := `INSERT INTO sources (
 		id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_direction, conflict_strategy,
+		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 		selected_calendars, enabled, last_sync_status, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := db.conn.Exec(query,
 		source.ID, source.UserID, source.Name, source.SourceType,
 		source.SourceURL, source.SourceUsername, source.SourcePassword,
 		source.DestURL, source.DestUsername, source.DestPassword,
-		source.SyncInterval, source.SyncDirection, source.ConflictStrategy,
+		source.SyncInterval, source.SyncDaysPast, source.SyncDirection, source.ConflictStrategy,
 		selectedCalendarsJSON, source.Enabled,
 		source.LastSyncStatus, source.CreatedAt, source.UpdatedAt,
 	)
@@ -121,7 +121,7 @@ func (db *DB) CreateSource(source *Source) error {
 // GetSourceByID returns a source by its ID.
 func (db *DB) GetSourceByID(id string) (*Source, error) {
 	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_direction, conflict_strategy,
+		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
 		FROM sources WHERE id = ?`
 
@@ -133,7 +133,7 @@ func (db *DB) GetSourceByID(id string) (*Source, error) {
 // This prevents timing attacks by combining auth check with the query.
 func (db *DB) GetSourceByIDForUser(id, userID string) (*Source, error) {
 	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_direction, conflict_strategy,
+		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
 		FROM sources WHERE id = ? AND user_id = ?`
 
@@ -144,7 +144,7 @@ func (db *DB) GetSourceByIDForUser(id, userID string) (*Source, error) {
 // GetSourcesByUserID returns all sources for a user.
 func (db *DB) GetSourcesByUserID(userID string) ([]*Source, error) {
 	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_direction, conflict_strategy,
+		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
 		FROM sources WHERE user_id = ? ORDER BY name`
 
@@ -173,7 +173,7 @@ func (db *DB) GetSourcesByUserID(userID string) ([]*Source, error) {
 // GetEnabledSources returns all enabled sources.
 func (db *DB) GetEnabledSources() ([]*Source, error) {
 	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_direction, conflict_strategy,
+		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
 		FROM sources WHERE enabled = 1`
 
@@ -221,13 +221,13 @@ func (db *DB) UpdateSource(source *Source) error {
 
 	query := `UPDATE sources SET
 		name = ?, source_type = ?, source_url = ?, source_username = ?, source_password = ?,
-		dest_url = ?, dest_username = ?, dest_password = ?, sync_interval = ?,
+		dest_url = ?, dest_username = ?, dest_password = ?, sync_interval = ?, sync_days_past = ?,
 		sync_direction = ?, conflict_strategy = ?, selected_calendars = ?, enabled = ?, updated_at = ?
 		WHERE id = ?`
 
 	result, err := db.conn.Exec(query,
 		source.Name, source.SourceType, source.SourceURL, source.SourceUsername, source.SourcePassword,
-		source.DestURL, source.DestUsername, source.DestPassword, source.SyncInterval,
+		source.DestURL, source.DestUsername, source.DestPassword, source.SyncInterval, source.SyncDaysPast,
 		source.SyncDirection, source.ConflictStrategy, selectedCalendarsJSON, source.Enabled, source.UpdatedAt, source.ID,
 	)
 	if err != nil {
@@ -446,7 +446,7 @@ func scanSource(row *sql.Row) (*Source, error) {
 		&source.ID, &source.UserID, &source.Name, &source.SourceType,
 		&source.SourceURL, &source.SourceUsername, &source.SourcePassword,
 		&source.DestURL, &source.DestUsername, &source.DestPassword,
-		&source.SyncInterval, &syncDirection, &source.ConflictStrategy,
+		&source.SyncInterval, &source.SyncDaysPast, &syncDirection, &source.ConflictStrategy,
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
 		&source.CreatedAt, &source.UpdatedAt,
@@ -490,7 +490,7 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 		&source.ID, &source.UserID, &source.Name, &source.SourceType,
 		&source.SourceURL, &source.SourceUsername, &source.SourcePassword,
 		&source.DestURL, &source.DestUsername, &source.DestPassword,
-		&source.SyncInterval, &syncDirection, &source.ConflictStrategy,
+		&source.SyncInterval, &source.SyncDaysPast, &syncDirection, &source.ConflictStrategy,
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
 		&source.CreatedAt, &source.UpdatedAt,

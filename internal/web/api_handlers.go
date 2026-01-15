@@ -106,6 +106,7 @@ type APISource struct {
 	DestURL           string   `json:"dest_url"`
 	DestUsername      string   `json:"dest_username"`
 	SyncInterval      int      `json:"sync_interval"`
+	SyncDaysPast      int      `json:"sync_days_past"`
 	SyncDirection     string   `json:"sync_direction"`
 	ConflictStrategy  string   `json:"conflict_strategy"`
 	SelectedCalendars []string `json:"selected_calendars"`
@@ -202,6 +203,7 @@ func sourceToAPI(s *db.Source) *APISource {
 		DestURL:           s.DestURL,
 		DestUsername:      s.DestUsername,
 		SyncInterval:      s.SyncInterval,
+		SyncDaysPast:      s.SyncDaysPast,
 		SyncDirection:     string(s.SyncDirection),
 		ConflictStrategy:  string(s.ConflictStrategy),
 		SelectedCalendars: s.SelectedCalendars,
@@ -487,6 +489,7 @@ type APICreateSourceRequest struct {
 	DestUsername      string   `json:"dest_username"`
 	DestPassword      string   `json:"dest_password"`
 	SyncInterval      int      `json:"sync_interval"`
+	SyncDaysPast      int      `json:"sync_days_past"`
 	SyncDirection     string   `json:"sync_direction"`
 	ConflictStrategy  string   `json:"conflict_strategy"`
 	SelectedCalendars []string `json:"selected_calendars"`
@@ -562,6 +565,12 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		syncInterval = h.cfg.Sync.MinInterval // Use configured minimum instead of hardcoded value
 	}
 
+	// Default sync_days_past to 30 if not set
+	syncDaysPast := req.SyncDaysPast
+	if syncDaysPast <= 0 {
+		syncDaysPast = 30
+	}
+
 	source := &db.Source{
 		UserID:            session.UserID,
 		Name:              req.Name,
@@ -573,6 +582,7 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		DestUsername:      req.DestUsername,
 		DestPassword:      encDestPwd,
 		SyncInterval:      syncInterval,
+		SyncDaysPast:      syncDaysPast,
 		SyncDirection:     db.SyncDirection(req.SyncDirection),
 		ConflictStrategy:  db.ConflictStrategy(req.ConflictStrategy),
 		SelectedCalendars: req.SelectedCalendars,
@@ -600,6 +610,7 @@ type APIUpdateSourceRequest struct {
 	DestUsername      string   `json:"dest_username"`
 	DestPassword      string   `json:"dest_password,omitempty"`
 	SyncInterval      int      `json:"sync_interval"`
+	SyncDaysPast      int      `json:"sync_days_past"`
 	SyncDirection     string   `json:"sync_direction"`
 	ConflictStrategy  string   `json:"conflict_strategy"`
 	SelectedCalendars []string `json:"selected_calendars"`
@@ -655,6 +666,9 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	source.SelectedCalendars = req.SelectedCalendars
 	if req.SyncInterval > 0 {
 		source.SyncInterval = req.SyncInterval
+	}
+	if req.SyncDaysPast > 0 {
+		source.SyncDaysPast = req.SyncDaysPast
 	}
 
 	// Update passwords if provided
