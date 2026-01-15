@@ -13,6 +13,24 @@ import (
 	"github.com/macjediwizard/calbridgesync/internal/db"
 )
 
+// isAlreadyExistsError checks if the error indicates the event already exists (412 Precondition Failed).
+func isAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "412") || strings.Contains(errStr, "Precondition Failed")
+}
+
+// isForbiddenError checks if the error indicates write access is forbidden (403 Forbidden).
+func isForbiddenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "403") || strings.Contains(errStr, "Forbidden")
+}
+
 // SyncResult represents the result of a sync operation.
 type SyncResult struct {
 	Success           bool          `json:"success"`
@@ -626,6 +644,8 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	// Two-way sync: sync destination events back to source
 	if source.SyncDirection == db.SyncDirectionTwoWay {
 		log.Printf("Two-way sync enabled, syncing destination events to source")
+		skippedAlreadyExists := 0
+		skippedForbidden := 0
 		for _, destEvent := range destEvents {
 			if destEvent.UID == "" {
 				continue
@@ -642,7 +662,17 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 
 				// New event on destination - create on source
 				if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to create event on source: %v", err))
+					// Handle expected CalDAV errors gracefully
+					if isAlreadyExistsError(err) {
+						// 412 Precondition Failed - event already exists on source, treat as success
+						skippedAlreadyExists++
+						currentUIDs[destEvent.UID] = true
+					} else if isForbiddenError(err) {
+						// 403 Forbidden - calendar doesn't allow writes, skip silently
+						skippedForbidden++
+					} else {
+						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to create event on source: %v", err))
+					}
 				} else {
 					result.Created++
 					currentUIDs[destEvent.UID] = true
@@ -652,7 +682,13 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 				if source.ConflictStrategy == db.ConflictDestWins {
 					destEvent.Path = sourceEvent.Path
 					if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
-						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on source: %v", err))
+						if isAlreadyExistsError(err) {
+							skippedAlreadyExists++
+						} else if isForbiddenError(err) {
+							skippedForbidden++
+						} else {
+							result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on source: %v", err))
+						}
 					} else {
 						result.Updated++
 					}
@@ -662,6 +698,12 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 			} else {
 				currentUIDs[destEvent.UID] = true
 			}
+		}
+		if skippedAlreadyExists > 0 {
+			log.Printf("Two-way sync: %d events already exist on source (skipped)", skippedAlreadyExists)
+		}
+		if skippedForbidden > 0 {
+			log.Printf("Two-way sync: %d events skipped (source calendar read-only)", skippedForbidden)
 		}
 	}
 
