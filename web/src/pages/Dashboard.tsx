@@ -33,10 +33,14 @@ export default function Dashboard() {
   const [syncingId, setSyncingId] = useState<string | null>(null);
   const [deletingEventId, setDeletingEventId] = useState<string | null>(null);
   const [deletingAll, setDeletingAll] = useState(false);
+  const [refreshCountdown, setRefreshCountdown] = useState(0);
 
   // Check if any source is currently syncing
   const syncingSources = sources.filter(s => s.sync_status === 'running');
   const isAnySyncing = syncingSources.length > 0 || syncingId !== null;
+
+  // Continue refreshing for a bit after sync stops to catch final status update
+  const shouldAutoRefresh = isAnySyncing || refreshCountdown > 0;
 
   const loadData = useCallback(async (showLoading = false) => {
     if (showLoading) setLoading(true);
@@ -63,16 +67,26 @@ export default function Dashboard() {
     loadData(true);
   }, [loadData]);
 
-  // Auto-refresh when syncing is active
+  // Start countdown when syncing stops to catch final status update
   useEffect(() => {
-    if (!isAnySyncing) return;
+    if (isAnySyncing) {
+      setRefreshCountdown(5); // Will do 5 more refreshes after sync appears complete
+    }
+  }, [isAnySyncing]);
+
+  // Auto-refresh when syncing is active or during countdown
+  useEffect(() => {
+    if (!shouldAutoRefresh) return;
 
     const interval = setInterval(() => {
       loadData(false);
-    }, 3000); // Refresh every 3 seconds while syncing
+      if (!isAnySyncing && refreshCountdown > 0) {
+        setRefreshCountdown(prev => prev - 1);
+      }
+    }, 3000); // Refresh every 3 seconds
 
     return () => clearInterval(interval);
-  }, [isAnySyncing, loadData]);
+  }, [shouldAutoRefresh, isAnySyncing, refreshCountdown, loadData]);
 
   const handleSync = async (id: string) => {
     setSyncingId(id);
@@ -143,19 +157,31 @@ export default function Dashboard() {
   return (
     <div className="space-y-6">
       {/* Sync In Progress Banner */}
-      {isAnySyncing && (
-        <div className="bg-blue-900/30 border border-blue-500/50 rounded-lg px-4 py-3 flex items-center space-x-3 animate-pulse">
-          <Spinner className="h-5 w-5 text-blue-400" />
+      {shouldAutoRefresh && (
+        <div className={`border rounded-lg px-4 py-3 flex items-center space-x-3 ${
+          isAnySyncing
+            ? 'bg-blue-900/30 border-blue-500/50 animate-pulse'
+            : 'bg-green-900/30 border-green-500/50'
+        }`}>
+          <Spinner className={`h-5 w-5 ${isAnySyncing ? 'text-blue-400' : 'text-green-400'}`} />
           <div className="flex-1">
-            <p className="text-blue-400 font-medium">
-              Sync in progress
-              {syncingSources.length > 0 && (
-                <span className="text-blue-300 font-normal ml-2">
-                  - {syncingSources.map(s => s.name).join(', ')}
-                </span>
+            <p className={`font-medium ${isAnySyncing ? 'text-blue-400' : 'text-green-400'}`}>
+              {isAnySyncing ? (
+                <>
+                  Sync in progress
+                  {syncingSources.length > 0 && (
+                    <span className="text-blue-300 font-normal ml-2">
+                      - {syncingSources.map(s => s.name).join(', ')}
+                    </span>
+                  )}
+                </>
+              ) : (
+                'Updating status...'
               )}
             </p>
-            <p className="text-blue-400/70 text-xs mt-0.5">Auto-refreshing every 3 seconds...</p>
+            <p className={`text-xs mt-0.5 ${isAnySyncing ? 'text-blue-400/70' : 'text-green-400/70'}`}>
+              Auto-refreshing every 3 seconds...
+            </p>
           </div>
         </div>
       )}
@@ -356,10 +382,10 @@ export default function Dashboard() {
       <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden">
         <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-white">Calendar Sources</h2>
-          {isAnySyncing && (
-            <div className="flex items-center space-x-2 text-blue-400 text-xs">
+          {shouldAutoRefresh && (
+            <div className={`flex items-center space-x-2 text-xs ${isAnySyncing ? 'text-blue-400' : 'text-green-400'}`}>
               <Spinner className="h-3 w-3" />
-              <span>Syncing...</span>
+              <span>{isAnySyncing ? 'Syncing...' : 'Updating...'}</span>
             </div>
           )}
         </div>
