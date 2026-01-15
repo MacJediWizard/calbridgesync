@@ -12,6 +12,7 @@ import (
 	"github.com/macjediwizard/calbridgesync/internal/auth"
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/db"
+	"github.com/macjediwizard/calbridgesync/internal/notify"
 )
 
 // sanitizeError returns a user-safe error message without exposing internal details.
@@ -992,4 +993,130 @@ func (h *Handlers) APIDiscoverCalendars(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, apiCalendars)
+}
+
+// APIAlertPreferences represents user alert preferences in JSON format.
+type APIAlertPreferences struct {
+	EmailEnabled    *bool  `json:"email_enabled"`
+	WebhookEnabled  *bool  `json:"webhook_enabled"`
+	WebhookURL      string `json:"webhook_url"`
+	CooldownMinutes *int   `json:"cooldown_minutes"`
+}
+
+// APIGetAlertPreferences returns the user's alert preferences.
+func (h *Handlers) APIGetAlertPreferences(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	prefs, err := h.db.GetUserAlertPreferences(session.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load preferences"})
+		return
+	}
+
+	// Return empty preferences if none set
+	if prefs == nil {
+		c.JSON(http.StatusOK, APIAlertPreferences{})
+		return
+	}
+
+	c.JSON(http.StatusOK, APIAlertPreferences{
+		EmailEnabled:    prefs.EmailEnabled,
+		WebhookEnabled:  prefs.WebhookEnabled,
+		WebhookURL:      prefs.WebhookURL,
+		CooldownMinutes: prefs.CooldownMinutes,
+	})
+}
+
+// APIUpdateAlertPreferences updates the user's alert preferences.
+func (h *Handlers) APIUpdateAlertPreferences(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var req APIAlertPreferences
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Validate webhook URL if provided
+	if req.WebhookURL != "" {
+		if err := notify.ValidateWebhookURL(req.WebhookURL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	// Validate cooldown if provided
+	if req.CooldownMinutes != nil && *req.CooldownMinutes < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cooldown minutes must be non-negative"})
+		return
+	}
+
+	prefs := &db.UserAlertPreferences{
+		UserID:          session.UserID,
+		EmailEnabled:    req.EmailEnabled,
+		WebhookEnabled:  req.WebhookEnabled,
+		WebhookURL:      req.WebhookURL,
+		CooldownMinutes: req.CooldownMinutes,
+	}
+
+	if err := h.db.UpsertUserAlertPreferences(prefs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save preferences"})
+		return
+	}
+
+	c.JSON(http.StatusOK, APIAlertPreferences{
+		EmailEnabled:    prefs.EmailEnabled,
+		WebhookEnabled:  prefs.WebhookEnabled,
+		WebhookURL:      prefs.WebhookURL,
+		CooldownMinutes: prefs.CooldownMinutes,
+	})
+}
+
+// APITestWebhookRequest represents the request body for testing a webhook.
+type APITestWebhookRequest struct {
+	WebhookURL string `json:"webhook_url"`
+}
+
+// APITestWebhook sends a test message to the specified webhook URL.
+func (h *Handlers) APITestWebhook(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var req APITestWebhookRequest
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.WebhookURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Webhook URL is required"})
+		return
+	}
+
+	// Validate webhook URL
+	if err := notify.ValidateWebhookURL(req.WebhookURL); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Send test webhook
+	ctx := c.Request.Context()
+	if err := h.notifier.SendTestWebhook(ctx, req.WebhookURL); err != nil {
+		log.Printf("Test webhook failed for %s: %v", req.WebhookURL, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to send test webhook"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Test webhook sent successfully"})
 }

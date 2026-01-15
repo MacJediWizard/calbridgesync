@@ -61,6 +61,15 @@ type Config struct {
 	CooldownPeriod time.Duration // How long to wait before re-alerting for same source
 }
 
+// UserPreferences holds per-user alert preferences.
+// Nil values mean "use global default".
+type UserPreferences struct {
+	EmailEnabled    *bool
+	WebhookEnabled  *bool
+	WebhookURL      string // Empty = no personal webhook
+	CooldownMinutes *int
+}
+
 // Notifier sends alert notifications.
 type Notifier struct {
 	cfg        *Config
@@ -466,4 +475,238 @@ func (n *Notifier) GetStaleSourceIDs() []string {
 		}
 	}
 	return ids
+}
+
+// SendStaleAlertWithPrefs sends an alert for a stale source using per-user preferences.
+// userPrefs can be nil to use global defaults only.
+func (n *Notifier) SendStaleAlertWithPrefs(ctx context.Context, sourceID, sourceName, userEmail string, timeSinceSync, threshold time.Duration, userPrefs *UserPreferences) bool {
+	cooldown := n.getCooldownPeriod(userPrefs)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Check if already in stale state and in cooldown
+	if n.staleState[sourceID] {
+		lastAlert, exists := n.lastAlertTimes[sourceID]
+		if exists && time.Since(lastAlert) < cooldown {
+			return false // Still in cooldown
+		}
+	}
+
+	// Mark as stale and update alert time
+	n.staleState[sourceID] = true
+	n.lastAlertTimes[sourceID] = time.Now()
+
+	alert := Alert{
+		Type:       AlertTypeStale,
+		SourceID:   sourceID,
+		SourceName: sourceName,
+		UserEmail:  userEmail,
+		Message:    fmt.Sprintf("Source '%s' is stale", sourceName),
+		Details:    fmt.Sprintf("Last sync was %v ago (threshold: %v)", timeSinceSync.Round(time.Minute), threshold),
+		Timestamp:  time.Now(),
+	}
+
+	// Send in background to not block
+	go n.sendWithPrefs(ctx, alert, userPrefs)
+	return true
+}
+
+// SendRecoveryAlertWithPrefs sends an alert when a source recovers, using per-user preferences.
+// userPrefs can be nil to use global defaults only.
+func (n *Notifier) SendRecoveryAlertWithPrefs(ctx context.Context, sourceID, sourceName, userEmail string, userPrefs *UserPreferences) bool {
+	n.mu.Lock()
+	wasStale := n.staleState[sourceID]
+	if wasStale {
+		delete(n.staleState, sourceID)
+		delete(n.lastAlertTimes, sourceID)
+	}
+	n.mu.Unlock()
+
+	if !wasStale {
+		return false // Wasn't stale, no need to send recovery
+	}
+
+	alert := Alert{
+		Type:       AlertTypeRecovery,
+		SourceID:   sourceID,
+		SourceName: sourceName,
+		UserEmail:  userEmail,
+		Message:    fmt.Sprintf("Source '%s' has recovered", sourceName),
+		Details:    "Source is now syncing normally",
+		Timestamp:  time.Now(),
+	}
+
+	go n.sendWithPrefs(ctx, alert, userPrefs)
+	return true
+}
+
+// getCooldownPeriod returns the effective cooldown period, considering user preferences.
+func (n *Notifier) getCooldownPeriod(userPrefs *UserPreferences) time.Duration {
+	if userPrefs != nil && userPrefs.CooldownMinutes != nil {
+		return time.Duration(*userPrefs.CooldownMinutes) * time.Minute
+	}
+	return n.cfg.CooldownPeriod
+}
+
+// sendWithPrefs sends the alert via configured channels, respecting per-user preferences.
+func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *UserPreferences) {
+	// Determine if webhook is enabled (user pref overrides global)
+	webhookEnabled := n.cfg.WebhookEnabled
+	if userPrefs != nil && userPrefs.WebhookEnabled != nil {
+		webhookEnabled = *userPrefs.WebhookEnabled
+	}
+
+	// Send to global webhook if enabled
+	if webhookEnabled && n.cfg.WebhookURL != "" {
+		if err := n.sendWebhook(ctx, alert); err != nil {
+			log.Printf("[Notify] Webhook error: %v", err)
+		}
+	}
+
+	// Send to user's personal webhook if configured and enabled
+	if userPrefs != nil && userPrefs.WebhookURL != "" {
+		userWebhookEnabled := true // Default to enabled if URL is set
+		if userPrefs.WebhookEnabled != nil {
+			userWebhookEnabled = *userPrefs.WebhookEnabled
+		}
+		if userWebhookEnabled {
+			if err := n.sendWebhookToURL(ctx, alert, userPrefs.WebhookURL); err != nil {
+				log.Printf("[Notify] User webhook error: %v", err)
+			}
+		}
+	}
+
+	// Determine if email is enabled (user pref overrides global)
+	emailEnabled := n.cfg.EmailEnabled
+	if userPrefs != nil && userPrefs.EmailEnabled != nil {
+		emailEnabled = *userPrefs.EmailEnabled
+	}
+
+	if emailEnabled {
+		// Build recipient list: user email + admin emails (deduplicated)
+		recipientSet := make(map[string]struct{})
+
+		// Add user email if provided and valid
+		if alert.UserEmail != "" && isValidEmail(alert.UserEmail) {
+			recipientSet[strings.ToLower(alert.UserEmail)] = struct{}{}
+		}
+
+		// Add admin emails
+		for _, email := range n.cfg.SMTPTo {
+			recipientSet[strings.ToLower(email)] = struct{}{}
+		}
+
+		// Convert to slice
+		recipients := make([]string, 0, len(recipientSet))
+		for email := range recipientSet {
+			recipients = append(recipients, email)
+		}
+
+		if len(recipients) > 0 {
+			if err := n.sendEmail(alert, recipients); err != nil {
+				log.Printf("[Notify] Email error: %v", err)
+			}
+		}
+	}
+}
+
+// sendWebhookToURL sends a webhook to a specific URL (for user webhooks).
+func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL string) error {
+	// Validate URL before sending (security check)
+	if err := validateWebhookURL(webhookURL); err != nil {
+		return fmt.Errorf("invalid webhook URL: %w", err)
+	}
+
+	// Build Slack-compatible message
+	emoji := ""
+	switch alert.Type {
+	case AlertTypeStale:
+		emoji = ":warning:"
+	case AlertTypeRecovery:
+		emoji = ":white_check_mark:"
+	case AlertTypeError:
+		emoji = ":x:"
+	}
+
+	payload := WebhookPayload{
+		AlertType:  string(alert.Type),
+		SourceID:   alert.SourceID,
+		SourceName: alert.SourceName,
+		Message:    alert.Message,
+		Details:    alert.Details,
+		Timestamp:  alert.Timestamp.Format(time.RFC3339),
+		Text:       fmt.Sprintf("%s *%s*\n%s", emoji, alert.Message, alert.Details),
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+	}
+
+	log.Printf("[Notify] User webhook sent: %s", alert.Message)
+	return nil
+}
+
+// SendTestWebhook sends a test message to a webhook URL.
+// Returns an error if the webhook fails or URL is invalid.
+func (n *Notifier) SendTestWebhook(ctx context.Context, webhookURL string) error {
+	// Validate URL before sending (security check)
+	if err := validateWebhookURL(webhookURL); err != nil {
+		return fmt.Errorf("invalid webhook URL: %w", err)
+	}
+
+	payload := WebhookPayload{
+		AlertType:  "test",
+		SourceID:   "test",
+		SourceName: "Test",
+		Message:    "Test webhook from CalBridgeSync",
+		Details:    "This is a test message to verify your webhook configuration",
+		Timestamp:  time.Now().Format(time.RFC3339),
+		Text:       ":rocket: *Test webhook from CalBridgeSync*\nThis is a test message to verify your webhook configuration",
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// ValidateWebhookURL validates that a webhook URL is safe to use (exported for API use).
+func ValidateWebhookURL(webhookURL string) error {
+	return validateWebhookURL(webhookURL)
 }

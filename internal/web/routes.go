@@ -64,6 +64,8 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		protectedAPI.GET("/malformed-events", h.APIGetMalformedEvents)
 		protectedAPI.DELETE("/malformed-events", h.APIDeleteAllMalformedEvents)
 		protectedAPI.DELETE("/malformed-events/:id", h.APIDeleteMalformedEvent)
+		protectedAPI.GET("/settings/alerts", h.APIGetAlertPreferences)
+		protectedAPI.PUT("/settings/alerts", h.APIUpdateAlertPreferences)
 	}
 
 	// Expensive operations - 2 req/s prevents abuse of network-intensive operations
@@ -75,8 +77,9 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	expensiveAPI.Use(ValidateOrigin())
 	expensiveAPI.Use(RequireJSONContentType())
 	{
-		expensiveAPI.POST("/sources", h.APICreateSource)                  // Tests connections to CalDAV servers
-		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars) // Discovers calendars via network
+		expensiveAPI.POST("/sources", h.APICreateSource)                      // Tests connections to CalDAV servers
+		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars)      // Discovers calendars via network
+		expensiveAPI.POST("/settings/alerts/test-webhook", h.APITestWebhook)  // Tests webhook via network
 	}
 
 	// Serve React app static files

@@ -12,6 +12,7 @@ import (
 	"github.com/macjediwizard/calbridgesync/internal/crypto"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 	"github.com/macjediwizard/calbridgesync/internal/health"
+	"github.com/macjediwizard/calbridgesync/internal/notify"
 	"github.com/macjediwizard/calbridgesync/internal/scheduler"
 )
 
@@ -25,6 +26,7 @@ type Handlers struct {
 	syncEngine *caldav.SyncEngine
 	scheduler  *scheduler.Scheduler
 	health     *health.Checker
+	notifier   *notify.Notifier
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -37,6 +39,7 @@ func NewHandlers(
 	syncEngine *caldav.SyncEngine,
 	sched *scheduler.Scheduler,
 	healthChecker *health.Checker,
+	notifier *notify.Notifier,
 ) *Handlers {
 	return &Handlers{
 		cfg:        cfg,
@@ -47,6 +50,7 @@ func NewHandlers(
 		syncEngine: syncEngine,
 		scheduler:  sched,
 		health:     healthChecker,
+		notifier:   notifier,
 	}
 }
 

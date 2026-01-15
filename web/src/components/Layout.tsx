@@ -65,6 +65,16 @@ export default function Layout({ user, onLogout }: LayoutProps) {
                   >
                     Sources
                   </Link>
+                  <Link
+                    to="/settings"
+                    className={`px-3 py-2 rounded text-sm ${
+                      isActive('/settings')
+                        ? 'bg-red-600 text-white'
+                        : 'text-gray-300 hover:text-white hover:bg-zinc-800'
+                    }`}
+                  >
+                    Settings
+                  </Link>
                 </div>
               )}
             </div>

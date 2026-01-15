@@ -17,7 +17,7 @@ func init() {
 
 func TestNewHandlers(t *testing.T) {
 	t.Run("creates handlers with all nil dependencies", func(t *testing.T) {
-		handlers := NewHandlers(nil, nil, nil, nil, nil, nil, nil, nil)
+		handlers := NewHandlers(nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 		if handlers == nil {
 			t.Fatal("expected non-nil handlers")
@@ -26,7 +26,7 @@ func TestNewHandlers(t *testing.T) {
 
 	t.Run("creates handlers with config", func(t *testing.T) {
 		cfg := &config.Config{}
-		handlers := NewHandlers(cfg, nil, nil, nil, nil, nil, nil, nil)
+		handlers := NewHandlers(cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 
 		if handlers == nil {
 			t.Fatal("expected non-nil handlers")
@@ -269,6 +269,7 @@ func TestHandlersStruct(t *testing.T) {
 			syncEngine: nil,
 			scheduler:  nil,
 			health:     nil,
+			notifier:   nil,
 		}
 
 		if h.cfg == nil {

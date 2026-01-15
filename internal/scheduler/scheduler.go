@@ -292,7 +292,10 @@ func (s *Scheduler) executeSync(sourceID string) {
 			if user, err := s.db.GetUserByID(source.UserID); err == nil {
 				userEmail = user.Email
 			}
-			s.notifier.SendRecoveryAlert(s.ctx, sourceID, source.Name, userEmail)
+
+			// Look up user alert preferences
+			userPrefs := s.getUserAlertPrefs(source.UserID)
+			s.notifier.SendRecoveryAlertWithPrefs(s.ctx, sourceID, source.Name, userEmail, userPrefs)
 		}
 	} else {
 		log.Printf("Sync failed for source %s: %s", source.Name, result.Message)
@@ -421,7 +424,10 @@ func (s *Scheduler) checkStaleSources() {
 				if user, err := s.db.GetUserByID(source.UserID); err == nil {
 					userEmail = user.Email
 				}
-				s.notifier.SendStaleAlert(s.ctx, sourceID, source.Name, userEmail, timeSinceSync, staleThreshold)
+
+				// Look up user alert preferences
+				userPrefs := s.getUserAlertPrefs(source.UserID)
+				s.notifier.SendStaleAlertWithPrefs(s.ctx, sourceID, source.Name, userEmail, timeSinceSync, staleThreshold, userPrefs)
 			}
 		}
 	}
@@ -455,4 +461,24 @@ func (s *Scheduler) IsSourceStale(source *db.Source) bool {
 
 	// Never synced - check how long since creation
 	return now.Sub(source.CreatedAt) > staleThreshold
+}
+
+// getUserAlertPrefs retrieves user alert preferences and converts them to notify.UserPreferences.
+// Returns nil if no preferences are set or if there's an error.
+func (s *Scheduler) getUserAlertPrefs(userID string) *notify.UserPreferences {
+	if s.db == nil {
+		return nil
+	}
+
+	dbPrefs, err := s.db.GetUserAlertPreferences(userID)
+	if err != nil || dbPrefs == nil {
+		return nil
+	}
+
+	return &notify.UserPreferences{
+		EmailEnabled:    dbPrefs.EmailEnabled,
+		WebhookEnabled:  dbPrefs.WebhookEnabled,
+		WebhookURL:      dbPrefs.WebhookURL,
+		CooldownMinutes: dbPrefs.CooldownMinutes,
+	}
 }

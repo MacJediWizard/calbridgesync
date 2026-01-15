@@ -147,6 +147,19 @@ type User struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// UserAlertPreferences stores per-user alert notification preferences.
+// Nil values mean "use global default" from environment configuration.
+type UserAlertPreferences struct {
+	ID              string    `json:"id"`
+	UserID          string    `json:"user_id"`
+	EmailEnabled    *bool     `json:"email_enabled"`    // nil = use global default
+	WebhookEnabled  *bool     `json:"webhook_enabled"`  // nil = use global default
+	WebhookURL      string    `json:"webhook_url"`      // empty = no personal webhook
+	CooldownMinutes *int      `json:"cooldown_minutes"` // nil = use global default
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
 // Source represents a calendar source configuration.
 type Source struct {
 	ID                string           `json:"id"`

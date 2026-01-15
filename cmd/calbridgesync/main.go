@@ -131,6 +131,7 @@ func main() {
 		syncEngine,
 		sched,
 		healthChecker,
+		notifier,
 	)
 
 	// Load templates

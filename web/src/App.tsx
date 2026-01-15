@@ -10,6 +10,7 @@ import SourcesList from './pages/SourcesList';
 import SourceAdd from './pages/SourceAdd';
 import SourceEdit from './pages/SourceEdit';
 import SourceLogs from './pages/SourceLogs';
+import Settings from './pages/Settings';
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -66,6 +67,7 @@ function App() {
             <Route path="/sources/add" element={<SourceAdd />} />
             <Route path="/sources/:id/edit" element={<SourceEdit />} />
             <Route path="/sources/:id/logs" element={<SourceLogs />} />
+            <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         )}

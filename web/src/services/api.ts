@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent, Calendar } from '../types';
+import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent, Calendar, AlertPreferences } from '../types';
 
 const api = axios.create({
   baseURL: '/api',
@@ -88,6 +88,21 @@ export const deleteAllMalformedEvents = async (): Promise<{ deleted: number }> =
 export const discoverCalendars = async (url: string, username: string, password: string): Promise<Calendar[]> => {
   const response = await api.post('/calendars/discover', { url, username, password });
   return response.data;
+};
+
+// Alert Preferences
+export const getAlertPreferences = async (): Promise<AlertPreferences> => {
+  const response = await api.get('/settings/alerts');
+  return response.data;
+};
+
+export const updateAlertPreferences = async (data: Partial<AlertPreferences>): Promise<AlertPreferences> => {
+  const response = await api.put('/settings/alerts', data);
+  return response.data;
+};
+
+export const testWebhook = async (url: string): Promise<void> => {
+  await api.post('/settings/alerts/test-webhook', { webhook_url: url });
 };
 
 export default api;

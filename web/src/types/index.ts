@@ -112,3 +112,10 @@ export interface MalformedEvent {
   error_message: string;
   discovered_at: string;
 }
+
+export interface AlertPreferences {
+  email_enabled: boolean | null;
+  webhook_enabled: boolean | null;
+  webhook_url: string;
+  cooldown_minutes: number | null;
+}

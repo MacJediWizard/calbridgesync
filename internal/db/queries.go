@@ -733,3 +733,110 @@ func (db *DB) DeleteAllMalformedEventsForUser(userID string) (int64, error) {
 	deleted, _ := result.RowsAffected()
 	return deleted, nil
 }
+
+// GetUserAlertPreferences returns alert preferences for a user.
+// Returns nil (not ErrNotFound) if preferences haven't been set yet.
+func (db *DB) GetUserAlertPreferences(userID string) (*UserAlertPreferences, error) {
+	query := `SELECT id, user_id, email_enabled, webhook_enabled, webhook_url, cooldown_minutes, created_at, updated_at
+		FROM user_alert_preferences WHERE user_id = ?`
+
+	row := db.conn.QueryRow(query, userID)
+
+	prefs := &UserAlertPreferences{}
+	var emailEnabled, webhookEnabled, cooldownMinutes sql.NullInt64
+	var webhookURL sql.NullString
+
+	err := row.Scan(&prefs.ID, &prefs.UserID, &emailEnabled, &webhookEnabled, &webhookURL, &cooldownMinutes, &prefs.CreatedAt, &prefs.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // Return nil, nil to indicate no preferences set (use defaults)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user alert preferences: %w", err)
+	}
+
+	// Convert nullable fields to pointers
+	if emailEnabled.Valid {
+		val := emailEnabled.Int64 != 0
+		prefs.EmailEnabled = &val
+	}
+	if webhookEnabled.Valid {
+		val := webhookEnabled.Int64 != 0
+		prefs.WebhookEnabled = &val
+	}
+	if webhookURL.Valid {
+		prefs.WebhookURL = webhookURL.String
+	}
+	if cooldownMinutes.Valid {
+		val := int(cooldownMinutes.Int64)
+		prefs.CooldownMinutes = &val
+	}
+
+	return prefs, nil
+}
+
+// UpsertUserAlertPreferences creates or updates alert preferences for a user.
+func (db *DB) UpsertUserAlertPreferences(prefs *UserAlertPreferences) error {
+	now := time.Now().UTC()
+
+	// Convert pointer bools to nullable integers for SQLite
+	var emailEnabled, webhookEnabled, cooldownMinutes sql.NullInt64
+	if prefs.EmailEnabled != nil {
+		emailEnabled.Valid = true
+		if *prefs.EmailEnabled {
+			emailEnabled.Int64 = 1
+		} else {
+			emailEnabled.Int64 = 0
+		}
+	}
+	if prefs.WebhookEnabled != nil {
+		webhookEnabled.Valid = true
+		if *prefs.WebhookEnabled {
+			webhookEnabled.Int64 = 1
+		} else {
+			webhookEnabled.Int64 = 0
+		}
+	}
+	if prefs.CooldownMinutes != nil {
+		cooldownMinutes.Valid = true
+		cooldownMinutes.Int64 = int64(*prefs.CooldownMinutes)
+	}
+
+	var webhookURL sql.NullString
+	if prefs.WebhookURL != "" {
+		webhookURL.Valid = true
+		webhookURL.String = prefs.WebhookURL
+	}
+
+	// Try to update first
+	query := `UPDATE user_alert_preferences SET email_enabled = ?, webhook_enabled = ?, webhook_url = ?, cooldown_minutes = ?, updated_at = ?
+		WHERE user_id = ?`
+
+	result, err := db.conn.Exec(query, emailEnabled, webhookEnabled, webhookURL, cooldownMinutes, now, prefs.UserID)
+	if err != nil {
+		return fmt.Errorf("failed to update user alert preferences: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if affected == 0 {
+		// Insert new record
+		if prefs.ID == "" {
+			prefs.ID = uuid.New().String()
+		}
+		prefs.CreatedAt = now
+		prefs.UpdatedAt = now
+
+		insertQuery := `INSERT INTO user_alert_preferences (id, user_id, email_enabled, webhook_enabled, webhook_url, cooldown_minutes, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+
+		_, err = db.conn.Exec(insertQuery, prefs.ID, prefs.UserID, emailEnabled, webhookEnabled, webhookURL, cooldownMinutes, prefs.CreatedAt, prefs.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("failed to insert user alert preferences: %w", err)
+		}
+	}
+
+	return nil
+}

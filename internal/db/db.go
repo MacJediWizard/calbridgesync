@@ -205,6 +205,22 @@ func (db *DB) migrate() error {
 
 		// Migration: Add selected_calendars column to sources (JSON array of calendar paths)
 		`ALTER TABLE sources ADD COLUMN selected_calendars TEXT`,
+
+		// User alert preferences table for per-user notification settings
+		`CREATE TABLE IF NOT EXISTS user_alert_preferences (
+			id TEXT PRIMARY KEY,
+			user_id TEXT UNIQUE NOT NULL,
+			email_enabled INTEGER,
+			webhook_enabled INTEGER,
+			webhook_url TEXT,
+			cooldown_minutes INTEGER,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+
+		// Index on user_id for user_alert_preferences
+		`CREATE INDEX IF NOT EXISTS idx_user_alert_preferences_user_id ON user_alert_preferences(user_id)`,
 	}
 
 	for _, migration := range migrations {
