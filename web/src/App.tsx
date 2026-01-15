@@ -6,6 +6,7 @@ import type { User } from './types';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
+import Activity from './pages/Activity';
 import SourcesList from './pages/SourcesList';
 import SourceAdd from './pages/SourceAdd';
 import SourceEdit from './pages/SourceEdit';
@@ -63,6 +64,7 @@ function App() {
         ) : (
           <Route element={<Layout user={user} onLogout={handleLogout} />}>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/activity" element={<Activity />} />
             <Route path="/sources" element={<SourcesList />} />
             <Route path="/sources/add" element={<SourceAdd />} />
             <Route path="/sources/:id/edit" element={<SourceEdit />} />

@@ -119,3 +119,27 @@ export interface AlertPreferences {
   webhook_url: string;
   cooldown_minutes: number | null;
 }
+
+export interface SyncActivity {
+  source_id: string;
+  source_name: string;
+  status: 'running' | 'completed' | 'error' | 'partial';
+  current_calendar?: string;
+  total_calendars: number;
+  calendars_synced: number;
+  events_processed: number;
+  events_created: number;
+  events_updated: number;
+  events_deleted: number;
+  events_skipped: number;
+  started_at: string;
+  completed_at?: string;
+  duration?: string;
+  message?: string;
+  errors?: string[];
+}
+
+export interface ActivityData {
+  active: SyncActivity[];
+  recent: SyncActivity[];
+}

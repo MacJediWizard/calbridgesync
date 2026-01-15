@@ -66,6 +66,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		protectedAPI.DELETE("/malformed-events/:id", h.APIDeleteMalformedEvent)
 		protectedAPI.GET("/settings/alerts", h.APIGetAlertPreferences)
 		protectedAPI.PUT("/settings/alerts", h.APIUpdateAlertPreferences)
+		protectedAPI.GET("/activity", h.APIGetActivity)
 	}
 
 	// Expensive operations - 2 req/s prevents abuse of network-intensive operations

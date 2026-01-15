@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/macjediwizard/calbridgesync/internal/activity"
 	"github.com/macjediwizard/calbridgesync/internal/auth"
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/db"
@@ -1119,4 +1120,59 @@ func (h *Handlers) APITestWebhook(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Test webhook sent successfully"})
+}
+
+// APIGetActivity returns real-time sync activity data.
+func (h *Handlers) APIGetActivity(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Get activity tracker from sync engine
+	tracker := h.syncEngine.GetActivityTracker()
+	if tracker == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"active": []interface{}{},
+			"recent": []interface{}{},
+		})
+		return
+	}
+
+	// Get user's sources to filter activity
+	sources, err := h.db.GetSourcesByUserID(session.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load sources"})
+		return
+	}
+
+	// Create a map of user's source IDs for quick lookup
+	userSourceIDs := make(map[string]bool)
+	for _, s := range sources {
+		userSourceIDs[s.ID] = true
+	}
+
+	// Filter active syncs to only include user's sources
+	allActive := tracker.GetActive()
+	userActive := make([]*activity.SyncActivity, 0)
+	for _, act := range allActive {
+		if userSourceIDs[act.SourceID] {
+			userActive = append(userActive, act)
+		}
+	}
+
+	// Filter recent syncs to only include user's sources
+	allRecent := tracker.GetRecent()
+	userRecent := make([]*activity.SyncActivity, 0)
+	for _, act := range allRecent {
+		if userSourceIDs[act.SourceID] {
+			userRecent = append(userRecent, act)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"active": userActive,
+		"recent": userRecent,
+	})
 }

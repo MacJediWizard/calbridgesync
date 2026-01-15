@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/macjediwizard/calbridgesync/internal/activity"
 	"github.com/macjediwizard/calbridgesync/internal/crypto"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 )
@@ -75,6 +76,7 @@ func retryDBOperation(operation func() error, maxRetries int) error {
 type SyncEngine struct {
 	db        *db.DB
 	encryptor *crypto.Encryptor
+	tracker   *activity.Tracker
 }
 
 // NewSyncEngine creates a new sync engine.
@@ -82,7 +84,13 @@ func NewSyncEngine(database *db.DB, encryptor *crypto.Encryptor) *SyncEngine {
 	return &SyncEngine{
 		db:        database,
 		encryptor: encryptor,
+		tracker:   activity.NewTracker(),
 	}
+}
+
+// GetActivityTracker returns the activity tracker for external use.
+func (se *SyncEngine) GetActivityTracker() *activity.Tracker {
+	return se.tracker
 }
 
 // SyncSource performs synchronization for a single source.
@@ -190,8 +198,14 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		sourceCalendars = filteredCalendars
 	}
 
+	// Start activity tracking
+	se.tracker.StartSync(source.ID, source.Name, len(sourceCalendars))
+
 	// Sync each calendar
-	for _, cal := range sourceCalendars {
+	for i, cal := range sourceCalendars {
+		// Update activity tracker with current calendar
+		se.tracker.UpdateCalendar(source.ID, cal.Name, i+1)
+
 		calResult := se.syncCalendar(ctx, source, sourceClient, destClient, cal)
 		result.Created += calResult.Created
 		result.Updated += calResult.Updated
@@ -200,6 +214,9 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		result.EventsProcessed += calResult.EventsProcessed
 		result.Errors = append(result.Errors, calResult.Errors...)
 		result.Warnings = append(result.Warnings, calResult.Warnings...)
+
+		// Update progress in activity tracker
+		se.tracker.UpdateProgress(source.ID, result.Created, result.Updated, result.Deleted, result.Skipped, result.EventsProcessed)
 	}
 
 	result.CalendarsSynced = len(sourceCalendars)
@@ -707,6 +724,9 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 	}, 5); err != nil {
 		log.Printf("Failed to create sync log after retries: %v", err)
 	}
+
+	// Finish activity tracking
+	se.tracker.FinishSync(sourceID, result.Success, result.Message, result.Errors)
 }
 
 // TestConnection tests connection to a CalDAV endpoint.

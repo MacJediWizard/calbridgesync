@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent, Calendar, AlertPreferences } from '../types';
+import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent, Calendar, AlertPreferences, ActivityData } from '../types';
 
 const api = axios.create({
   baseURL: '/api',
@@ -103,6 +103,12 @@ export const updateAlertPreferences = async (data: Partial<AlertPreferences>): P
 
 export const testWebhook = async (url: string): Promise<void> => {
   await api.post('/settings/alerts/test-webhook', { webhook_url: url });
+};
+
+// Activity
+export const getActivity = async (): Promise<ActivityData> => {
+  const response = await api.get('/activity');
+  return response.data;
 };
 
 export default api;

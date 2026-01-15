@@ -56,6 +56,16 @@ export default function Layout({ user, onLogout }: LayoutProps) {
                     Dashboard
                   </Link>
                   <Link
+                    to="/activity"
+                    className={`px-3 py-2 rounded text-sm ${
+                      isActive('/activity')
+                        ? 'bg-red-600 text-white'
+                        : 'text-gray-300 hover:text-white hover:bg-zinc-800'
+                    }`}
+                  >
+                    Activity
+                  </Link>
+                  <Link
                     to="/sources"
                     className={`px-3 py-2 rounded text-sm ${
                       isActive('/sources')
