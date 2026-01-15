@@ -21,6 +21,18 @@ services:
       - SESSION_SECRET=${SESSION_SECRET}
       - DATABASE_PATH=/app/data/calbridgesync.db
       - DEFAULT_DEST_URL=${DEFAULT_DEST_URL}
+      # Alert notifications (optional)
+      - ALERT_WEBHOOK_ENABLED=${ALERT_WEBHOOK_ENABLED:-false}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - ALERT_EMAIL_ENABLED=${ALERT_EMAIL_ENABLED:-false}
+      - ALERT_SMTP_HOST=${ALERT_SMTP_HOST:-}
+      - ALERT_SMTP_PORT=${ALERT_SMTP_PORT:-587}
+      - ALERT_SMTP_USERNAME=${ALERT_SMTP_USERNAME:-}
+      - ALERT_SMTP_PASSWORD=${ALERT_SMTP_PASSWORD:-}
+      - ALERT_SMTP_FROM=${ALERT_SMTP_FROM:-}
+      - ALERT_SMTP_TO=${ALERT_SMTP_TO:-}
+      - ALERT_SMTP_TLS=${ALERT_SMTP_TLS:-false}
+      - ALERT_COOLDOWN_MINUTES=${ALERT_COOLDOWN_MINUTES:-60}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
       interval: 30s
