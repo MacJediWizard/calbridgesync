@@ -374,9 +374,10 @@ func (h *Handlers) APISyncHistory(c *gin.Context) {
 	}
 
 	// Collect all logs for all sources
+	// Use 2000 to support up to ~10 days at 192 syncs/day per source
 	var allLogs []*db.SyncLog
 	for _, s := range sources {
-		logs, _ := h.db.GetSyncLogs(s.ID, 500)
+		logs, _ := h.db.GetSyncLogs(s.ID, 2000)
 		allLogs = append(allLogs, logs...)
 	}
 
