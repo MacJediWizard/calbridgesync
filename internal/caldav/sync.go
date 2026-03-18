@@ -139,6 +139,11 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		log.Printf("Failed to update sync status after retries: %v", err)
 	}
 
+	// Branch for ICS sources (read-only feed, different sync path)
+	if source.SourceType == db.SourceTypeICS {
+		return se.syncICSSource(ctx, source)
+	}
+
 	// Decrypt credentials - NEVER log these
 	sourcePassword, err := se.encryptor.Decrypt(source.SourcePassword)
 	if err != nil {
@@ -394,11 +399,6 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	syncDirection := getSyncDirectionForCalendar(source, calendar.Path)
 	log.Printf("Calendar %q sync direction: %s (source default: %s)", calendar.Name, syncDirection, source.SyncDirection)
 
-	// Helper to update activity tracker with current progress
-	updateProgress := func() {
-		se.tracker.UpdateProgress(source.ID, result.Created, result.Updated, result.Deleted, result.Skipped, result.EventsProcessed)
-	}
-
 	// Helper to update status message during loading phases
 	updateStatus := func(status string) {
 		se.tracker.UpdateCalendar(source.ID, fmt.Sprintf("%s (%s)", calendar.Name, status), calendarIndex)
@@ -440,6 +440,29 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		}
 	}
 
+	// Delegate to shared sync logic
+	return se.syncEventsToDestination(ctx, source, sourceClient, destClient, sourceEvents, calendar, calendarIndex, syncDirection)
+}
+
+// syncEventsToDestination handles the comparison, creation, update, and deletion of events
+// between source events and a destination CalDAV calendar. This is shared by both CalDAV
+// full sync and ICS feed sync paths.
+func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient *Client, destClient *Client, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+	result := &SyncResult{
+		Errors:   make([]string, 0),
+		Warnings: make([]string, 0),
+	}
+
+	// Helper to update activity tracker with current progress
+	updateProgress := func() {
+		se.tracker.UpdateProgress(source.ID, result.Created, result.Updated, result.Deleted, result.Skipped, result.EventsProcessed)
+	}
+
+	// Helper to update status message during loading phases
+	updateStatus := func(status string) {
+		se.tracker.UpdateCalendar(source.ID, fmt.Sprintf("%s (%s)", calendar.Name, status), calendarIndex)
+	}
+
 	// Discover destination calendar path - try calendar discovery first, then fall back to URL path
 	destCalendarPath := ""
 	destCalendars, err := destClient.FindCalendars(ctx)
@@ -454,9 +477,6 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		for i, cal := range destCalendars {
 			log.Printf("  [%d] Name: %q, Path: %s", i+1, cal.Name, cal.Path)
 		}
-		// Use the first calendar found (most destinations have a single calendar for syncing)
-		// Note: Future enhancement could match calendars by name for multi-calendar destinations.
-		// Current behavior: Uses first available calendar, which works for typical single-calendar setups.
 		destCalendarPath = destCalendars[0].Path
 		if len(destCalendars) > 1 {
 			log.Printf("WARNING: Multiple destination calendars found, using first one: %s", destCalendarPath)
@@ -495,8 +515,8 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 
 	// Build map of previously synced UIDs
 	previouslySyncedMap := make(map[string]*db.SyncedEvent)
-	for _, se := range previouslySynced {
-		previouslySyncedMap[se.EventUID] = se
+	for _, syncedEvt := range previouslySynced {
+		previouslySyncedMap[syncedEvt.EventUID] = syncedEvt
 	}
 
 	// Create maps for comparison by UID
@@ -545,7 +565,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		skipTwoWayDeletion = true
 	}
 
-	if syncDirection == db.SyncDirectionTwoWay && !skipTwoWayDeletion {
+	if syncDirection == db.SyncDirectionTwoWay && !skipTwoWayDeletion && sourceClient != nil {
 		for uid, syncedEvent := range previouslySyncedMap {
 			_, existsOnSource := sourceEventMap[uid]
 			destEvent, existsOnDest := destEventMap[uid]
@@ -659,11 +679,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	}
 
 	// Two-way sync: sync destination events back to source
-	// NOTE: We do NOT add destination events to currentUIDs here because:
-	// 1. Events from OTHER source calendars should not be tracked by THIS calendar
-	// 2. Only events that exist on THIS source calendar should be in synced_events
-	// 3. This prevents the bug where calendar A deletes events synced by calendar B
-	if syncDirection == db.SyncDirectionTwoWay {
+	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil {
 		log.Printf("Two-way sync enabled, syncing destination events to source")
 		skippedAlreadyExists := 0
 		skippedForbidden := 0
@@ -675,19 +691,9 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 			sourceEvent, exists := sourceEventMap[destEvent.UID]
 
 			if !exists {
-				// Check if this was previously synced BY THIS CALENDAR (meaning it was deleted from source)
-				if _, wasSynced := previouslySyncedMap[destEvent.UID]; wasSynced {
-					// Already handled in deletion phase above
-					continue
-				}
-
-				// Event exists on destination but not on this source calendar
-				// This could be an event from ANOTHER source calendar - don't sync it back
-				// Only sync back events that we can verify belong to this source
-				// Skip creating on source to avoid cross-calendar pollution
+				// Event only on destination — skip (may be from another source or was already deleted)
 				continue
 			} else if destEvent.ETag != sourceEvent.ETag {
-				// Event exists on both - this is a legitimate update scenario
 				if source.ConflictStrategy == db.ConflictDestWins {
 					destEvent.Path = sourceEvent.Path
 					if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
@@ -702,10 +708,8 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 						result.Updated++
 					}
 				}
-				// Don't add to currentUIDs - already tracked from source→dest sync
 				updateProgress()
 			}
-			// If ETags match, event is unchanged - nothing to do
 		}
 		if skippedAlreadyExists > 0 {
 			log.Printf("Two-way sync: %d events already exist on source (skipped)", skippedAlreadyExists)
@@ -819,6 +823,150 @@ func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client,
 
 	log.Printf("Duplicate cleanup complete: found %d duplicate groups, removed %d events", duplicateGroups, duplicatesRemoved)
 	return duplicatesRemoved
+}
+
+// syncICSSource syncs events from a read-only ICS feed to a CalDAV destination.
+func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *SyncResult {
+	start := time.Now()
+	result := &SyncResult{
+		Errors:   make([]string, 0),
+		Warnings: make([]string, 0),
+	}
+
+	// Decrypt source credentials (may be empty for public feeds)
+	sourcePassword := ""
+	if source.SourcePassword != "" {
+		var err error
+		sourcePassword, err = se.encryptor.Decrypt(source.SourcePassword)
+		if err != nil {
+			result.Message = "Failed to decrypt source credentials"
+			result.Errors = append(result.Errors, err.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+	}
+
+	destPassword, err := se.encryptor.Decrypt(source.DestPassword)
+	if err != nil {
+		result.Message = "Failed to decrypt destination credentials"
+		result.Errors = append(result.Errors, err.Error())
+		result.Duration = time.Since(start)
+		se.finishSync(source.ID, result)
+		return result
+	}
+
+	// Create ICS client for source
+	icsClient, err := NewICSClient(source.SourceURL, source.SourceUsername, sourcePassword)
+	if err != nil {
+		result.Message = "Failed to create ICS client"
+		result.Errors = append(result.Errors, err.Error())
+		result.Duration = time.Since(start)
+		se.finishSync(source.ID, result)
+		return result
+	}
+
+	// Create CalDAV client for destination
+	destClient, err := NewClient(source.DestURL, source.DestUsername, destPassword)
+	if err != nil {
+		result.Message = "Failed to connect to destination"
+		result.Errors = append(result.Errors, err.Error())
+		result.Duration = time.Since(start)
+		se.finishSync(source.ID, result)
+		return result
+	}
+
+	// Test connections
+	if err := icsClient.TestConnection(ctx); err != nil {
+		result.Message = "ICS feed connection test failed"
+		result.Errors = append(result.Errors, err.Error())
+		result.Duration = time.Since(start)
+		se.finishSync(source.ID, result)
+		return result
+	}
+
+	if err := destClient.TestConnection(ctx); err != nil {
+		result.Message = "Destination connection test failed"
+		result.Errors = append(result.Errors, err.Error())
+		result.Duration = time.Since(start)
+		se.finishSync(source.ID, result)
+		return result
+	}
+
+	// Fetch events from ICS feed
+	malformedCollector := NewMalformedEventCollector()
+	if err := se.db.ClearMalformedEventsForSource(source.ID); err != nil {
+		log.Printf("Failed to clear old malformed events: %v", err)
+	}
+
+	sourceEvents, err := icsClient.FetchEvents(ctx, malformedCollector)
+	if err != nil {
+		result.Message = "Failed to fetch ICS feed"
+		result.Errors = append(result.Errors, err.Error())
+		result.Duration = time.Since(start)
+		se.finishSync(source.ID, result)
+		return result
+	}
+
+	// Filter events by date if configured
+	if source.SyncDaysPast > 0 {
+		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
+		sourceEvents = filterEventsByDate(sourceEvents, cutoffDate)
+	}
+
+	// Store malformed events
+	for _, mf := range malformedCollector.GetEvents() {
+		if err := se.db.SaveMalformedEvent(source.ID, mf.Path, mf.ErrorMessage); err != nil {
+			log.Printf("Failed to save malformed event record: %v", err)
+		}
+	}
+
+	// Create synthetic calendar for the ICS feed
+	calendar := Calendar{
+		Path: source.SourceURL,
+		Name: source.Name,
+	}
+
+	// Start activity tracking (single calendar for ICS)
+	se.tracker.StartSync(source.ID, source.Name, 1)
+	se.tracker.UpdateCalendar(source.ID, calendar.Name, 1)
+
+	// Use shared sync logic — ICS is always one-way, sourceClient is nil (no write-back)
+	syncResult := se.syncEventsToDestination(ctx, source, nil, destClient, sourceEvents, calendar, 1, db.SyncDirectionOneWay)
+
+	result.Created = syncResult.Created
+	result.Updated = syncResult.Updated
+	result.Deleted = syncResult.Deleted
+	result.Skipped = syncResult.Skipped
+	result.EventsProcessed = syncResult.EventsProcessed
+	result.DuplicatesRemoved = syncResult.DuplicatesRemoved
+	result.Errors = append(result.Errors, syncResult.Errors...)
+	result.Warnings = append(result.Warnings, syncResult.Warnings...)
+	result.CalendarsSynced = 1
+
+	result.Success = len(result.Errors) == 0
+	if result.Success && len(result.Warnings) == 0 {
+		result.Message = fmt.Sprintf("ICS sync: %d created, %d updated, %d deleted, %d skipped",
+			result.Created, result.Updated, result.Deleted, result.Skipped)
+	} else if result.Success && len(result.Warnings) > 0 {
+		result.Message = fmt.Sprintf("ICS sync with %d warnings: %d created, %d updated, %d deleted, %d skipped",
+			len(result.Warnings), result.Created, result.Updated, result.Deleted, result.Skipped)
+	} else {
+		result.Message = fmt.Sprintf("ICS sync failed with %d errors", len(result.Errors))
+	}
+
+	result.Duration = time.Since(start)
+	se.finishSync(source.ID, result)
+	return result
+}
+
+// TestICSConnection tests connection to an ICS feed URL.
+func (se *SyncEngine) TestICSConnection(ctx context.Context, url, username, password string) error {
+	client, err := NewICSClient(url, username, password)
+	if err != nil {
+		return err
+	}
+	return client.TestConnection(ctx)
 }
 
 func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {

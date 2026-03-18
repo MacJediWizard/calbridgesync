@@ -43,6 +43,7 @@ const (
 	SourceTypeCustom    SourceType = "custom"
 	SourceTypeCalDAV    SourceType = "caldav"
 	SourceTypeOutlook   SourceType = "outlook"
+	SourceTypeICS       SourceType = "ics"
 )
 
 // ValidSourceTypes contains all valid source type values.
@@ -54,6 +55,7 @@ var ValidSourceTypes = map[SourceType]bool{
 	SourceTypeCustom:    true,
 	SourceTypeCalDAV:    true,
 	SourceTypeOutlook:   true,
+	SourceTypeICS:       true,
 }
 
 // IsValid returns true if the source type is a known valid value.
@@ -135,6 +137,12 @@ var SourcePresets = map[SourceType]SourcePreset{
 		Type:        SourceTypeOutlook,
 		BaseURL:     "https://outlook.office365.com/caldav/",
 		Description: "Microsoft Outlook Calendar",
+	},
+	SourceTypeICS: {
+		Name:        "ICS Feed",
+		Type:        SourceTypeICS,
+		BaseURL:     "",
+		Description: "Read-only ICS calendar feed URL",
 	},
 }
 

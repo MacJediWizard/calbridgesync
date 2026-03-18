@@ -186,7 +186,7 @@ type APISyncSummary struct {
 
 // APIAuthStatus represents auth status response.
 type APIAuthStatus struct {
-	Authenticated bool    `json:"authenticated"`
+	Authenticated bool     `json:"authenticated"`
 	User          *APIUser `json:"user,omitempty"`
 }
 
@@ -525,9 +525,22 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		return
 	}
 
-	if req.Name == "" || req.SourceURL == "" || req.SourceUsername == "" || req.SourcePassword == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields"})
-		return
+	isICS := db.SourceType(req.SourceType) == db.SourceTypeICS
+
+	// ICS sources only require Name and SourceURL; CalDAV sources require credentials too
+	if isICS {
+		if req.Name == "" || req.SourceURL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Name and source URL are required"})
+			return
+		}
+		// Force one-way sync for ICS (read-only feed)
+		req.SyncDirection = string(db.SyncDirectionOneWay)
+		req.ConflictStrategy = string(db.ConflictSourceWins)
+	} else {
+		if req.Name == "" || req.SourceURL == "" || req.SourceUsername == "" || req.SourcePassword == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields"})
+			return
+		}
 	}
 
 	// Validate input lengths and enum values
@@ -548,10 +561,18 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 
 	// Test source connection
 	ctx := c.Request.Context()
-	if err := h.syncEngine.TestConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
-		log.Printf("Source connection test failed for %s: %v", req.SourceURL, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + categorizeConnectionError(err)})
-		return
+	if isICS {
+		if err := h.syncEngine.TestICSConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
+			log.Printf("ICS feed connection test failed for %s: %v", req.SourceURL, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to ICS feed: " + categorizeConnectionError(err)})
+			return
+		}
+	} else {
+		if err := h.syncEngine.TestConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
+			log.Printf("Source connection test failed for %s: %v", req.SourceURL, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + categorizeConnectionError(err)})
+			return
+		}
 	}
 
 	// Test destination if provided
@@ -563,7 +584,7 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		}
 	}
 
-	// Encrypt passwords
+	// Encrypt passwords (empty strings are fine for ICS sources without auth)
 	encSourcePwd, err := h.encryptor.Encrypt(req.SourcePassword)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encrypt credentials"})
@@ -1007,6 +1028,12 @@ func (h *Handlers) APIDiscoverCalendars(c *gin.Context) {
 
 	if req.URL == "" || req.Username == "" || req.Password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "URL, username and password are required"})
+		return
+	}
+
+	// ICS feeds don't support calendar discovery
+	if strings.HasSuffix(strings.ToLower(req.URL), ".ics") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Calendar discovery is not supported for ICS feeds. ICS feeds sync as a single calendar."})
 		return
 	}
 

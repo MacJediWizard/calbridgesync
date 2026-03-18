@@ -79,12 +79,23 @@ export default function SourceAdd() {
     return cal?.sync_direction || '';
   };
 
+  const isICS = form.source_type === 'ics';
+
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
-    setForm((prev) => ({
-      ...prev,
-      [name]: (name === 'sync_interval' || name === 'sync_days_past') ? parseInt(value) : value,
-    }));
+    setForm((prev) => {
+      const updated = {
+        ...prev,
+        [name]: (name === 'sync_interval' || name === 'sync_days_past') ? parseInt(value) : value,
+      };
+      // Force one-way + source_wins for ICS
+      if (name === 'source_type' && value === 'ics') {
+        updated.sync_direction = 'one_way';
+        updated.conflict_strategy = 'source_wins';
+        updated.selected_calendars = [];
+      }
+      return updated;
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -151,6 +162,7 @@ export default function SourceAdd() {
                     </label>
                     <select name="source_type" id="source_type" value={form.source_type} onChange={handleChange} required className="w-full">
                       <option value="caldav">CalDAV</option>
+                      <option value="ics">ICS Feed</option>
                       <option value="icloud">iCloud</option>
                       <option value="google">Google</option>
                       <option value="outlook">Outlook</option>
@@ -192,16 +204,17 @@ export default function SourceAdd() {
                     <label htmlFor="sync_direction" className="block text-sm font-medium text-gray-300 mb-1">
                       Sync Direction
                     </label>
-                    <select name="sync_direction" id="sync_direction" value={form.sync_direction} onChange={handleChange} required className="w-full">
+                    <select name="sync_direction" id="sync_direction" value={form.sync_direction} onChange={handleChange} required disabled={isICS} className="w-full">
                       <option value="one_way">One-way (Source to Dest)</option>
                       <option value="two_way">Two-way (Bidirectional)</option>
                     </select>
+                    {isICS && <p className="text-xs text-gray-500 mt-1">ICS feeds are read-only (one-way only)</p>}
                   </div>
                   <div>
                     <label htmlFor="conflict_strategy" className="block text-sm font-medium text-gray-300 mb-1">
                       Conflicts
                     </label>
-                    <select name="conflict_strategy" id="conflict_strategy" value={form.conflict_strategy} onChange={handleChange} required className="w-full">
+                    <select name="conflict_strategy" id="conflict_strategy" value={form.conflict_strategy} onChange={handleChange} required disabled={isICS} className="w-full">
                       <option value="source_wins">Source wins</option>
                       <option value="dest_wins">Dest wins</option>
                       <option value="latest_wins">Newest wins</option>
@@ -213,11 +226,11 @@ export default function SourceAdd() {
               {/* Source Server */}
               <div className="space-y-4">
                 <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-zinc-800 pb-2">
-                  Source Server
+                  {isICS ? 'ICS Feed' : 'Source Server'}
                 </h3>
                 <div>
                   <label htmlFor="source_url" className="block text-sm font-medium text-gray-300 mb-1">
-                    CalDAV URL
+                    {isICS ? 'ICS Feed URL' : 'CalDAV URL'}
                   </label>
                   <input
                     type="url"
@@ -226,14 +239,14 @@ export default function SourceAdd() {
                     value={form.source_url}
                     onChange={handleChange}
                     required
-                    placeholder="https://caldav.example.com/calendars/user/"
+                    placeholder={isICS ? 'https://example.com/calendar.ics' : 'https://caldav.example.com/calendars/user/'}
                     className="w-full"
                   />
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label htmlFor="source_username" className="block text-sm font-medium text-gray-300 mb-1">
-                      Username
+                      Username {isICS && <span className="text-gray-500">(optional)</span>}
                     </label>
                     <input
                       type="text"
@@ -241,14 +254,14 @@ export default function SourceAdd() {
                       id="source_username"
                       value={form.source_username}
                       onChange={handleChange}
-                      required
+                      required={!isICS}
                       placeholder="user@example.com"
                       className="w-full"
                     />
                   </div>
                   <div>
                     <label htmlFor="source_password" className="block text-sm font-medium text-gray-300 mb-1">
-                      Password
+                      Password {isICS && <span className="text-gray-500">(optional)</span>}
                     </label>
                     <input
                       type="password"
@@ -256,14 +269,14 @@ export default function SourceAdd() {
                       id="source_password"
                       value={form.source_password}
                       onChange={handleChange}
-                      required
+                      required={!isICS}
                       className="w-full"
                     />
                   </div>
                 </div>
 
-                {/* Calendar Discovery */}
-                <div className="pt-2">
+                {/* Calendar Discovery (not for ICS) */}
+                {!isICS && <div className="pt-2">
                   <button
                     type="button"
                     onClick={handleDiscoverCalendars}
@@ -315,7 +328,7 @@ export default function SourceAdd() {
                       </p>
                     </div>
                   )}
-                </div>
+                </div>}
               </div>
 
               {/* Destination Server */}
