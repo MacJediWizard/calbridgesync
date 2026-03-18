@@ -346,11 +346,20 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 
 // filterEventsByDate filters events to only include those with start time after cutoff date.
 // Events without a parseable start time are included (to be safe).
+// Recurring events (containing RRULE) are always included since their DTSTART
+// is the original first occurrence which may be far in the past.
 func filterEventsByDate(events []Event, cutoffDate time.Time) []Event {
 	var filtered []Event
 	for _, e := range events {
 		if e.StartTime == "" {
 			// Include events without start time (might be tasks or unparsed)
+			filtered = append(filtered, e)
+			continue
+		}
+
+		// Always include recurring events — their DTSTART is the original
+		// first occurrence, but the event recurs into the future
+		if strings.Contains(e.Data, "RRULE:") {
 			filtered = append(filtered, e)
 			continue
 		}
