@@ -134,8 +134,15 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		return nil, fmt.Errorf("failed to parse ICS feed: %w", err)
 	}
 
-	// Extract events
-	var events []Event
+	// Group VEVENTs by UID so recurring events (master + exceptions) stay together
+	type uidGroup struct {
+		summary   string
+		startTime string
+		vevents   []*ical.Component
+	}
+	groups := make(map[string]*uidGroup)
+	var groupOrder []string
+
 	for _, vevent := range cal.Events() {
 		uid, _ := vevent.Props.Text(ical.PropUID)
 		if uid == "" {
@@ -145,17 +152,36 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 			continue
 		}
 
-		summary, _ := vevent.Props.Text(ical.PropSummary)
-		var startTime string
-		if dtstart := vevent.Props.Get(ical.PropDateTimeStart); dtstart != nil {
-			startTime = normalizeStartTime(dtstart)
+		g, exists := groups[uid]
+		if !exists {
+			g = &uidGroup{}
+			groups[uid] = g
+			groupOrder = append(groupOrder, uid)
 		}
 
-		// Re-wrap this single event in a VCALENDAR envelope
+		g.vevents = append(g.vevents, vevent.Component)
+
+		// Use the master event (no RECURRENCE-ID) for summary and start time
+		if vevent.Props.Get("RECURRENCE-ID") == nil {
+			summary, _ := vevent.Props.Text(ical.PropSummary)
+			g.summary = summary
+			if dtstart := vevent.Props.Get(ical.PropDateTimeStart); dtstart != nil {
+				g.startTime = normalizeStartTime(dtstart)
+			}
+		}
+	}
+
+	// Build events from groups
+	var events []Event
+	for _, uid := range groupOrder {
+		g := groups[uid]
+
 		singleCal := ical.NewCalendar()
 		singleCal.Props.SetText(ical.PropVersion, "2.0")
 		singleCal.Props.SetText(ical.PropProductID, "-//CalBridgeSync//EN")
-		singleCal.Children = append(singleCal.Children, vevent.Component)
+		for _, vevent := range g.vevents {
+			singleCal.Children = append(singleCal.Children, vevent)
+		}
 
 		data := encodeCalendar(singleCal)
 		if data == "" {
@@ -168,12 +194,12 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		events = append(events, Event{
 			Path:      uid + ".ics",
 			UID:       uid,
-			Summary:   summary,
-			StartTime: startTime,
+			Summary:   g.summary,
+			StartTime: g.startTime,
 			Data:      data,
 		})
 	}
 
-	log.Printf("ICS feed: parsed %d events", len(events))
+	log.Printf("ICS feed: parsed %d events (%d UIDs grouped from %d VEVENTs)", len(events), len(groups), len(cal.Events()))
 	return events, nil
 }
