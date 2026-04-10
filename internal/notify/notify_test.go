@@ -1,9 +1,51 @@
 package notify
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+// waitForDrain blocks until all in-flight alert sends have completed,
+// or until the timeout expires. Test helper for sequencing multi-alert
+// scenarios — since Issue #33, the cooldown timestamp is recorded
+// inside the background goroutine only after sendWithPrefs returns,
+// so tests that rely on cooldown-after-first-send must wait for
+// that goroutine to finish before making assertions about state.
+func waitForDrain(t *testing.T, n *Notifier) {
+	t.Helper()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		n.mu.RLock()
+		empty := len(n.inFlightAlerts) == 0
+		n.mu.RUnlock()
+		if empty {
+			return
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+	t.Fatal("in-flight alerts did not drain within 100ms")
+}
+
+// waitForKeyDrain blocks until a specific in-flight key has cleared.
+// Used by tests that synthetically populate some keys and want to wait
+// for only the real goroutine(s) to finish, not the synthetic ones.
+func waitForKeyDrain(t *testing.T, n *Notifier, key string) {
+	t.Helper()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		n.mu.RLock()
+		gone := !n.inFlightAlerts[key]
+		n.mu.RUnlock()
+		if gone {
+			return
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+	t.Fatalf("in-flight key %q did not clear within 100ms", key)
+}
 
 func TestValidateConfig(t *testing.T) {
 	tests := []struct {
@@ -473,6 +515,14 @@ func TestSendSyncFailureAlertUserCooldownOverride(t *testing.T) {
 		t.Fatal("first failure alert should fire")
 	}
 
+	// Wait for the first send's background goroutine to finish and
+	// clear its in-flight guard before attempting the second call.
+	// The in-flight dedup is Issue #33's fix for concurrent duplicate
+	// sends; without this wait the second call would be legitimately
+	// suppressed by the in-flight guard even though the cooldown
+	// itself is zero.
+	waitForDrain(t, n)
+
 	// With zero cooldown the second alert fires immediately.
 	sent = n.SendSyncFailureAlertWithPrefs(
 		nil, "source1", "Test Source", "user@example.com",
@@ -480,6 +530,265 @@ func TestSendSyncFailureAlertUserCooldownOverride(t *testing.T) {
 	)
 	if !sent {
 		t.Error("second alert should fire with zero-minute user cooldown")
+	}
+}
+
+// TestCooldownNotConsumedByFailedSend verifies Issue #33's core fix:
+// when a webhook send fails, the cooldown timestamp must NOT be recorded,
+// so the next alert attempt can fire immediately rather than being
+// silenced for the full cooldown window.
+//
+// Setup: point the webhook at an httptest server that always returns
+// HTTP 500, so the send reaches the server but sendWebhook reports a
+// delivery failure.
+func TestCooldownNotConsumedByFailedSend(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		WebhookEnabled: true,
+		WebhookURL:     server.URL,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+	ctx := context.Background()
+
+	// First attempt. Returns true (queued) but the background send will
+	// fail because the webhook returns 500.
+	sent := n.SendSyncFailureAlertWithPrefs(
+		ctx, "source1", "Test Source", "user@example.com",
+		"Sync failed", "first attempt", nil,
+	)
+	if !sent {
+		t.Fatal("first failure alert should be queued")
+	}
+
+	// Wait for the background send to finish failing.
+	waitForDrain(t, n)
+
+	// Cooldown should NOT be set because the delivery failed.
+	n.mu.RLock()
+	_, cooldownSet := n.lastFailureAlertTimes["source1"]
+	n.mu.RUnlock()
+	if cooldownSet {
+		t.Error("cooldown should NOT be set after a failed send; failed deliveries must not consume the cooldown window")
+	}
+
+	// Second attempt must succeed because the cooldown was not consumed.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		ctx, "source1", "Test Source", "user@example.com",
+		"Sync failed", "second attempt", nil,
+	)
+	if !sent {
+		t.Error("second alert should fire immediately because the first delivery failed (no cooldown consumed)")
+	}
+	waitForDrain(t, n)
+}
+
+// TestCooldownRecordedAfterSuccessfulSend verifies that when a delivery
+// DOES succeed, the cooldown is recorded correctly so repeat alerts
+// are suppressed. This is the happy path for Issue #33.
+//
+// Setup: webhook points at an httptest server that returns 200, so
+// sendWebhook reports a successful delivery.
+func TestCooldownRecordedAfterSuccessfulSend(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		WebhookEnabled: true,
+		WebhookURL:     server.URL,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+	ctx := context.Background()
+
+	sent := n.SendSyncFailureAlertWithPrefs(
+		ctx, "source1", "Test Source", "user@example.com",
+		"Sync failed", "first", nil,
+	)
+	if !sent {
+		t.Fatal("first alert should fire")
+	}
+
+	// Wait for the background send to complete successfully.
+	waitForDrain(t, n)
+
+	// Cooldown should be set now.
+	n.mu.RLock()
+	_, cooldownSet := n.lastFailureAlertTimes["source1"]
+	n.mu.RUnlock()
+	if !cooldownSet {
+		t.Fatal("cooldown should be set after a successful webhook 200 response")
+	}
+
+	// Second attempt must be blocked by the cooldown.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		ctx, "source1", "Test Source", "user@example.com",
+		"Sync failed", "second", nil,
+	)
+	if sent {
+		t.Error("second alert should be blocked by the cooldown set by the first successful send")
+	}
+}
+
+// TestInFlightGuardSuppressesSameSourceAndType verifies that a concurrent
+// second caller for the same source AND same alert type is suppressed
+// while a prior send is still in flight. Uses a manually-set in-flight
+// flag to avoid racing real goroutines.
+func TestInFlightGuardSuppressesSameSourceAndType(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	// Manually set in-flight to simulate a send in progress. We do this
+	// synthetically rather than kicking off a real send so the test
+	// doesn't race against goroutine scheduling.
+	n.mu.Lock()
+	n.inFlightAlerts["failure:source1"] = true
+	n.mu.Unlock()
+
+	// Concurrent attempt for the same source+type must be suppressed.
+	sent := n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "concurrent attempt", nil,
+	)
+	if sent {
+		t.Error("alert must be suppressed while an in-flight send exists for the same source+type")
+	}
+
+	// Clean up so the test leaves no stale state.
+	n.mu.Lock()
+	delete(n.inFlightAlerts, "failure:source1")
+	n.mu.Unlock()
+}
+
+// TestInFlightGuardIsScopedByAlertType verifies that a stale alert in
+// flight does NOT block a failure alert for the same source. The two
+// alert types use different key prefixes in inFlightAlerts so they can
+// fire concurrently for the same source.
+func TestInFlightGuardIsScopedByAlertType(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	// Synthetically mark a stale-alert in flight for source1. This
+	// simulates a stale-alert goroutine that hasn't finished yet.
+	n.mu.Lock()
+	n.inFlightAlerts["stale:source1"] = true
+	n.mu.Unlock()
+
+	// A failure alert for the SAME source should fire — different key.
+	sent := n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "different type", nil,
+	)
+	if !sent {
+		t.Error("failure alert must not be blocked by a stale alert in flight (different key prefix)")
+	}
+
+	// Wait only for the failure key to drain — the synthetic stale key
+	// will never clear because there's no goroutine behind it.
+	waitForKeyDrain(t, n, "failure:source1")
+
+	// Clean up the synthetic stale entry.
+	n.mu.Lock()
+	delete(n.inFlightAlerts, "stale:source1")
+	n.mu.Unlock()
+}
+
+// TestInFlightGuardIsScopedBySourceID verifies that an in-flight alert
+// for one source does not block alerts for a different source.
+func TestInFlightGuardIsScopedBySourceID(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	// Synthetically mark a failure alert in flight for source1.
+	n.mu.Lock()
+	n.inFlightAlerts["failure:source1"] = true
+	n.mu.Unlock()
+
+	// A failure alert for source2 must not be blocked.
+	sent := n.SendSyncFailureAlertWithPrefs(
+		nil, "source2", "Other Source", "user@example.com",
+		"Sync failed", "other source", nil,
+	)
+	if !sent {
+		t.Error("source2 must not be blocked by source1's in-flight guard")
+	}
+
+	// Wait only for the source2 key to drain; source1's synthetic entry
+	// will never clear because no goroutine is running it.
+	waitForKeyDrain(t, n, "failure:source2")
+
+	// Clean up the synthetic source1 entry.
+	n.mu.Lock()
+	delete(n.inFlightAlerts, "failure:source1")
+	n.mu.Unlock()
+}
+
+// TestClearFailureAlertStateClearsInFlight verifies that
+// ClearFailureAlertState cleans up in-flight state too, so a newly
+// re-created source (reusing the same ID) starts with a clean slate.
+func TestClearFailureAlertStateClearsInFlight(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	// Manually set in-flight
+	n.mu.Lock()
+	n.inFlightAlerts["failure:source1"] = true
+	n.mu.Unlock()
+
+	n.ClearFailureAlertState("source1")
+
+	n.mu.RLock()
+	stillInFlight := n.inFlightAlerts["failure:source1"]
+	n.mu.RUnlock()
+	if stillInFlight {
+		t.Error("ClearFailureAlertState must also clear in-flight guard")
+	}
+}
+
+// TestClearStaleStateClearsInFlight — same contract for stale path.
+func TestClearStaleStateClearsInFlight(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	n.mu.Lock()
+	n.inFlightAlerts["stale:source1"] = true
+	n.mu.Unlock()
+
+	n.ClearStaleState("source1")
+
+	n.mu.RLock()
+	stillInFlight := n.inFlightAlerts["stale:source1"]
+	n.mu.RUnlock()
+	if stillInFlight {
+		t.Error("ClearStaleState must also clear in-flight guard")
 	}
 }
 
