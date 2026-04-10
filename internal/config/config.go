@@ -59,6 +59,12 @@ type AlertConfig struct {
 
 	// Cooldown period in minutes (default: 60)
 	CooldownMinutes int
+
+	// Retry configuration (Issue #64). Wired from ALERT_MAX_SEND_ATTEMPTS
+	// and ALERT_INITIAL_BACKOFF_MS env vars. Zero values fall back to the
+	// defaults in the notify package (3 attempts, 500ms).
+	MaxSendAttempts  int
+	InitialBackoffMS int
 }
 
 // ServerConfig holds HTTP server configuration.
@@ -78,9 +84,9 @@ type OIDCConfig struct {
 
 // SecurityConfig holds security-related configuration.
 type SecurityConfig struct {
-	EncryptionKey       []byte
-	SessionSecret       string
-	SessionMaxAgeSecs   int // Session timeout in seconds (default: 86400 = 24 hours)
+	EncryptionKey        []byte
+	SessionSecret        string
+	SessionMaxAgeSecs    int // Session timeout in seconds (default: 86400 = 24 hours)
 	OAuthStateMaxAgeSecs int // OAuth state timeout in seconds (default: 300 = 5 minutes)
 }
 
@@ -227,6 +233,30 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("%w: ALERT_COOLDOWN_MINUTES: %w", ErrInvalidConfig, err)
 	}
 	cfg.Alerts.CooldownMinutes = cooldownMinutes
+
+	// Retry tuning (Issue #64). Optional — unset means "use notify
+	// package defaults" (3 attempts, 500ms initial backoff). Bounded
+	// to prevent pathological values: zero or negative attempts would
+	// silence all alerts; excessive backoff would delay them.
+	maxAttempts, err := getEnvInt("ALERT_MAX_SEND_ATTEMPTS", 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: ALERT_MAX_SEND_ATTEMPTS: %w", ErrInvalidConfig, err)
+	}
+	if maxAttempts < 0 || maxAttempts > 10 {
+		return nil, fmt.Errorf("%w: ALERT_MAX_SEND_ATTEMPTS must be between 0 and 10, got %d",
+			ErrInvalidConfig, maxAttempts)
+	}
+	cfg.Alerts.MaxSendAttempts = maxAttempts
+
+	initialBackoffMS, err := getEnvInt("ALERT_INITIAL_BACKOFF_MS", 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: ALERT_INITIAL_BACKOFF_MS: %w", ErrInvalidConfig, err)
+	}
+	if initialBackoffMS < 0 || initialBackoffMS > 10000 {
+		return nil, fmt.Errorf("%w: ALERT_INITIAL_BACKOFF_MS must be between 0 and 10000, got %d",
+			ErrInvalidConfig, initialBackoffMS)
+	}
+	cfg.Alerts.InitialBackoffMS = initialBackoffMS
 
 	// Check for missing required configuration
 	missing := cfg.getMissingRequired()

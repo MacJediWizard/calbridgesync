@@ -59,6 +59,13 @@ type Config struct {
 
 	// Alert settings
 	CooldownPeriod time.Duration // How long to wait before re-alerting for same source
+
+	// Retry tuning (Issue #64). Zero values fall back to package-level
+	// defaults: defaultMaxSendAttempts (3) and defaultInitialBackoff
+	// (500ms). Callers that want to tune should populate from
+	// ALERT_MAX_SEND_ATTEMPTS / ALERT_INITIAL_BACKOFF_MS env vars.
+	MaxSendAttempts int
+	InitialBackoff  time.Duration
 }
 
 // UserPreferences holds per-user alert preferences.
@@ -221,6 +228,28 @@ func (n *Notifier) IsEnabled() bool {
 	return n.cfg.WebhookEnabled || n.cfg.EmailEnabled
 }
 
+// maxSendAttempts returns the configured retry count for this notifier,
+// falling back to defaultMaxSendAttempts if Config.MaxSendAttempts is
+// zero. Issue #64 allows operators to tune this via
+// ALERT_MAX_SEND_ATTEMPTS env var.
+func (n *Notifier) maxSendAttempts() int {
+	if n.cfg.MaxSendAttempts > 0 {
+		return n.cfg.MaxSendAttempts
+	}
+	return defaultMaxSendAttempts
+}
+
+// initialBackoff returns the configured initial backoff for this
+// notifier, falling back to defaultInitialBackoff if Config.InitialBackoff
+// is zero. Issue #64 allows operators to tune this via
+// ALERT_INITIAL_BACKOFF_MS env var.
+func (n *Notifier) initialBackoff() time.Duration {
+	if n.cfg.InitialBackoff > 0 {
+		return n.cfg.InitialBackoff
+	}
+	return defaultInitialBackoff
+}
+
 // NOTE: The legacy SendStaleAlert, SendRecoveryAlert, and their shared
 // send() helper were removed in Issue #59. They were replaced by:
 //
@@ -277,7 +306,7 @@ func (n *Notifier) sendWebhook(ctx context.Context, alert Alert) error {
 	// Retry the HTTP call itself on transient failures (DNS, TCP, TLS,
 	// 5xx). Permanent errors (4xx, request construction) fall through
 	// immediately — see isTransientHTTPError for the full taxonomy.
-	return retryTransient(ctx, defaultMaxSendAttempts, func(ctx context.Context) error {
+	return retryTransient(ctx, n.maxSendAttempts(), n.initialBackoff(), func(ctx context.Context) error {
 		req, err := http.NewRequestWithContext(ctx, "POST", n.cfg.WebhookURL, bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("create request: %w", err)
@@ -340,7 +369,7 @@ func (n *Notifier) sendEmail(ctx context.Context, alert Alert, recipients []stri
 	// Note: the stdlib smtp.SendMail itself does not take a context,
 	// so a mid-attempt cancellation only affects the sleep between
 	// attempts, not the send in progress.
-	return retryTransient(ctx, defaultMaxSendAttempts, func(ctx context.Context) error {
+	return retryTransient(ctx, n.maxSendAttempts(), n.initialBackoff(), func(ctx context.Context) error {
 		var err error
 		if n.cfg.SMTPTLS {
 			err = n.sendEmailTLS(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
@@ -792,7 +821,7 @@ func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	return retryTransient(ctx, defaultMaxSendAttempts, func(ctx context.Context) error {
+	return retryTransient(ctx, n.maxSendAttempts(), n.initialBackoff(), func(ctx context.Context) error {
 		req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("create request: %w", err)
