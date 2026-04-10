@@ -45,3 +45,4 @@ build/
 # Logs
 *.log
 logs/
+tasks/
