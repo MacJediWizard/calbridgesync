@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +19,40 @@ const (
 	healthLogInterval = 5 * time.Minute   // Interval for scheduler health logging
 	staleMultiplier   = 2                 // Source is stale if last sync > staleMultiplier * interval
 	startupStagger    = 30 * time.Second  // Delay between starting each source's first sync
+
+	// Liveness watchdog constants (Issue #43). The watchdog detects
+	// routines that have crashed (caught by PR #38 panic recovery but
+	// whose goroutine then exited) OR that have hung (infinite loop,
+	// deadlock, stuck CalDAV call).
+	watchdogInterval = 1 * time.Minute
+
+	// Per-routine stale thresholds. A routine whose last heartbeat is
+	// older than its threshold is considered dead/hung by the watchdog.
+	// Thresholds are set to ~2x the routine's tick interval plus slack
+	// so normal ticking doesn't trigger false positives.
+	watchdogStaleDetectionThreshold = 3 * time.Minute  // tick = 1 min
+	watchdogCleanupThreshold        = 26 * time.Hour   // tick = 24 hr
+	watchdogHealthLogThreshold      = 12 * time.Minute // tick = 5 min
+	watchdogWatchdogSelfThreshold   = 3 * time.Minute  // tick = 1 min, covers watchdog itself
+	watchdogJobSlack                = 60 * time.Second // added to 2x job interval for per-job heartbeat threshold
 )
+
+// Routine name constants for the liveness heartbeat map. Using constants
+// instead of string literals so typos are compile errors and the watchdog
+// check knows every name it's supposed to track.
+const (
+	routineStaleDetection = "scheduler.staleDetectionRoutine"
+	routineCleanup        = "scheduler.cleanupRoutine"
+	routineHealthLog      = "scheduler.healthLogRoutine"
+	routineWatchdog       = "scheduler.watchdogRoutine"
+)
+
+// routineJobName returns the heartbeat key for a per-job sync loop.
+// Each source has its own heartbeat slot keyed by source ID so the
+// watchdog can identify exactly which job's loop has stopped.
+func routineJobName(sourceID string) string {
+	return "scheduler.runJob." + sourceID
+}
 
 // Job represents a scheduled sync job.
 type Job struct {
@@ -42,6 +76,14 @@ type Scheduler struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	started   bool
+
+	// heartbeats tracks the last time each long-running goroutine made
+	// progress (Issue #43). The watchdog reads this map periodically
+	// and flags routines whose last heartbeat is older than their
+	// configured threshold. Separate mutex from mu to avoid contention
+	// on the hot path of job lookups.
+	heartbeatsMu sync.RWMutex
+	heartbeats   map[string]time.Time
 }
 
 // New creates a new scheduler.
@@ -55,6 +97,7 @@ func New(database *db.DB, syncEngine *caldav.SyncEngine, notifier *notify.Notifi
 		syncLocks:  make(map[string]*sync.Mutex),
 		ctx:        ctx,
 		cancel:     cancel,
+		heartbeats: make(map[string]time.Time),
 	}
 }
 
@@ -100,8 +143,140 @@ func (s *Scheduler) Start() error {
 	s.wg.Add(1)
 	go s.staleDetectionRoutine()
 
+	// Start liveness watchdog goroutine (Issue #43). Runs AFTER the
+	// routines it monitors so their heartbeats have time to populate.
+	s.wg.Add(1)
+	go s.watchdogRoutine()
+
 	log.Printf("Scheduler started with %d jobs", len(sources))
 	return nil
+}
+
+// heartbeat records that the named routine has made progress. Called
+// at the top of each tick iteration of long-running routines so the
+// watchdog can detect routines that have crashed or hung.
+func (s *Scheduler) heartbeat(name string) {
+	s.heartbeatsMu.Lock()
+	s.heartbeats[name] = time.Now()
+	s.heartbeatsMu.Unlock()
+}
+
+// lastHeartbeat returns the timestamp of the last heartbeat for the
+// named routine, or the zero time if the routine has never beat.
+// Exported only via tests (lower-case name).
+func (s *Scheduler) lastHeartbeat(name string) time.Time {
+	s.heartbeatsMu.RLock()
+	defer s.heartbeatsMu.RUnlock()
+	return s.heartbeats[name]
+}
+
+// expectedHeartbeatThreshold returns the max age for a routine's heartbeat
+// before it is considered dead/hung by the watchdog. Per-job sync loops
+// use 2x their configured interval plus a slack constant; other routines
+// use their own constants.
+func (s *Scheduler) expectedHeartbeatThreshold(name string) time.Duration {
+	switch name {
+	case routineStaleDetection:
+		return watchdogStaleDetectionThreshold
+	case routineCleanup:
+		return watchdogCleanupThreshold
+	case routineHealthLog:
+		return watchdogHealthLogThreshold
+	case routineWatchdog:
+		return watchdogWatchdogSelfThreshold
+	}
+	// Per-job sync loops: look up the job's interval.
+	if strings.HasPrefix(name, "scheduler.runJob.") {
+		sourceID := strings.TrimPrefix(name, "scheduler.runJob.")
+		s.mu.RLock()
+		job, ok := s.jobs[sourceID]
+		s.mu.RUnlock()
+		if ok {
+			return 2*job.interval + watchdogJobSlack
+		}
+	}
+	// Unknown routine — conservative default
+	return 5 * time.Minute
+}
+
+// watchdogRoutine periodically checks that long-running scheduler
+// goroutines are still ticking. If a routine's last heartbeat is older
+// than its configured threshold, the watchdog logs a warning and
+// (if a notifier is configured) fires a failure alert so the operator
+// knows the daemon's background work has degraded.
+//
+// This closes the observability gap that PR #38's panic recovery
+// cannot cover: a routine that panics is caught and its goroutine
+// exits cleanly, but the scheduler keeps running with one fewer
+// routine. Without this watchdog, a crashed staleDetectionRoutine
+// would cause stale detection to silently stop working indefinitely.
+//
+// The watchdog also catches the non-panic failure mode: a routine
+// that is stuck in an infinite loop, deadlocked on a mutex, or
+// blocked on a misbehaving CalDAV call that never returns.
+func (s *Scheduler) watchdogRoutine() {
+	defer s.wg.Done()
+	defer recoverPanic(routineWatchdog)
+
+	ticker := time.NewTicker(watchdogInterval)
+	defer ticker.Stop()
+
+	// Beat once at startup so checkLiveness doesn't immediately
+	// flag the watchdog itself as stale on the very first tick.
+	s.heartbeat(routineWatchdog)
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.heartbeat(routineWatchdog)
+			s.checkLiveness()
+		}
+	}
+}
+
+// checkLiveness scans the heartbeat map and emits a warning + alert
+// for any routine whose last heartbeat is older than its configured
+// threshold. Only tracked routines (those present in the heartbeats
+// map) are checked — routines that never registered a heartbeat are
+// assumed to not exist yet (e.g., the scheduler just started and the
+// routine hasn't run its first tick).
+func (s *Scheduler) checkLiveness() {
+	now := time.Now()
+
+	s.heartbeatsMu.RLock()
+	// Copy the entries so we don't hold the lock across the alert call.
+	snapshot := make(map[string]time.Time, len(s.heartbeats))
+	for k, v := range s.heartbeats {
+		snapshot[k] = v
+	}
+	s.heartbeatsMu.RUnlock()
+
+	for name, lastBeat := range snapshot {
+		threshold := s.expectedHeartbeatThreshold(name)
+		age := now.Sub(lastBeat)
+		if age <= threshold {
+			continue
+		}
+
+		log.Printf("[WATCHDOG] routine %q last heartbeat %v ago (threshold %v) — may be crashed or hung",
+			name, age.Round(time.Second), threshold)
+
+		// Fire an alert so the operator sees this in their alert
+		// channel. Uses SendStaleAlert (the only notifier API
+		// available on main) with a synthetic sourceID derived from
+		// the routine name so the notifier's per-source cooldown
+		// applies per routine, not across all watchdog events.
+		//
+		// NOTE: after PR #24 (SendSyncFailureAlertWithPrefs) merges,
+		// this could switch to the failure-alert path for cleaner
+		// alert-type separation. Follow-up issue.
+		if s.notifier != nil && s.notifier.IsEnabled() {
+			watchdogSourceID := "watchdog:" + name
+			s.notifier.SendStaleAlert(s.ctx, watchdogSourceID, name, "", age, threshold)
+		}
+	}
 }
 
 // Stop gracefully shuts down all jobs.
@@ -266,6 +441,11 @@ func (s *Scheduler) GetJobCount() int {
 func (s *Scheduler) runJob(job *Job) {
 	defer s.wg.Done()
 	defer recoverPanic("scheduler.runJob")
+	defer s.clearJobHeartbeat(job.sourceID)
+
+	// Initial heartbeat so the watchdog sees the job as alive even
+	// if the first executeSync takes longer than the interval.
+	s.heartbeat(routineJobName(job.sourceID))
 
 	// Run immediately on start
 	s.executeSync(job.sourceID)
@@ -278,6 +458,7 @@ func (s *Scheduler) runJob(job *Job) {
 		case <-job.stopCh:
 			return
 		case <-job.ticker.C:
+			s.heartbeat(routineJobName(job.sourceID))
 			s.executeSync(job.sourceID)
 			s.updateNextSyncAt(job.sourceID)
 		}
@@ -289,6 +470,9 @@ func (s *Scheduler) runJob(job *Job) {
 func (s *Scheduler) runJobFromTicker(job *Job) {
 	defer s.wg.Done()
 	defer recoverPanic("scheduler.runJobFromTicker")
+	defer s.clearJobHeartbeat(job.sourceID)
+
+	s.heartbeat(routineJobName(job.sourceID))
 
 	for {
 		select {
@@ -297,6 +481,7 @@ func (s *Scheduler) runJobFromTicker(job *Job) {
 		case <-job.stopCh:
 			return
 		case <-job.ticker.C:
+			s.heartbeat(routineJobName(job.sourceID))
 			s.executeSync(job.sourceID)
 			s.updateNextSyncAt(job.sourceID)
 		}
@@ -307,6 +492,9 @@ func (s *Scheduler) runJobFromTicker(job *Job) {
 func (s *Scheduler) runJobWithDelay(job *Job, initialDelay time.Duration) {
 	defer s.wg.Done()
 	defer recoverPanic("scheduler.runJobWithDelay")
+	defer s.clearJobHeartbeat(job.sourceID)
+
+	s.heartbeat(routineJobName(job.sourceID))
 
 	// Wait for initial delay before first sync
 	if initialDelay > 0 {
@@ -321,6 +509,7 @@ func (s *Scheduler) runJobWithDelay(job *Job, initialDelay time.Duration) {
 	}
 
 	// Run first sync
+	s.heartbeat(routineJobName(job.sourceID))
 	s.executeSync(job.sourceID)
 	s.updateNextSyncAt(job.sourceID)
 
@@ -332,10 +521,21 @@ func (s *Scheduler) runJobWithDelay(job *Job, initialDelay time.Duration) {
 		case <-job.stopCh:
 			return
 		case <-job.ticker.C:
+			s.heartbeat(routineJobName(job.sourceID))
 			s.executeSync(job.sourceID)
 			s.updateNextSyncAt(job.sourceID)
 		}
 	}
+}
+
+// clearJobHeartbeat removes the heartbeat entry for a job when its
+// goroutine exits (via stopCh close or ctx cancel). Without this, a
+// legitimately-stopped job would leave a stale heartbeat and the
+// watchdog would eventually flag it as dead and fire a false alert.
+func (s *Scheduler) clearJobHeartbeat(sourceID string) {
+	s.heartbeatsMu.Lock()
+	defer s.heartbeatsMu.Unlock()
+	delete(s.heartbeats, routineJobName(sourceID))
 }
 
 // updateNextSyncAt updates the next sync time for a job after execution.
@@ -424,11 +624,14 @@ func (s *Scheduler) cleanupRoutine() {
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
+	s.heartbeat(routineCleanup)
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			s.heartbeat(routineCleanup)
 			s.cleanupOldLogs()
 		}
 	}
@@ -455,11 +658,14 @@ func (s *Scheduler) healthLogRoutine() {
 	ticker := time.NewTicker(healthLogInterval)
 	defer ticker.Stop()
 
+	s.heartbeat(routineHealthLog)
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			s.heartbeat(routineHealthLog)
 			s.logHealth()
 		}
 	}
@@ -483,11 +689,16 @@ func (s *Scheduler) staleDetectionRoutine() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
+	// Initial heartbeat so the watchdog doesn't flag us as stale
+	// before our first tick fires.
+	s.heartbeat(routineStaleDetection)
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			s.heartbeat(routineStaleDetection)
 			s.checkStaleSources()
 		}
 	}
