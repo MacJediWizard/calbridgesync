@@ -195,15 +195,16 @@ func TestEventStruct(t *testing.T) {
 
 func TestErrorConstants(t *testing.T) {
 	t.Run("error constants are not nil", func(t *testing.T) {
-		errors := []error{
+		errs := []error{
 			ErrConnectionFailed,
 			ErrAuthFailed,
 			ErrNotFound,
 			ErrInvalidResponse,
 			ErrMalformedContent,
+			ErrEventSkipped,
 		}
 
-		for _, err := range errors {
+		for _, err := range errs {
 			if err == nil {
 				t.Error("expected error constant to be non-nil")
 			}
@@ -219,6 +220,82 @@ func TestErrorConstants(t *testing.T) {
 		}
 		if ErrNotFound.Error() != "resource not found" {
 			t.Errorf("unexpected error message: %q", ErrNotFound.Error())
+		}
+		if ErrEventSkipped.Error() != "event skipped" {
+			t.Errorf("unexpected error message: %q", ErrEventSkipped.Error())
+		}
+	})
+}
+
+// TestPutEventSkipPaths verifies that PutEvent returns a wrapped
+// ErrEventSkipped sentinel (instead of nil) for events that cannot be
+// written due to bad input. This is the Issue #31 fix — previously the
+// two skip paths returned nil, causing callers to falsely increment
+// result.Created / result.Updated and pollute synced_events tracking
+// with UIDs that were never actually written to the destination.
+func TestPutEventSkipPaths(t *testing.T) {
+	// Any URL works here — the short-circuit paths we're testing fire
+	// before any HTTP request is constructed, so the URL is never dialed.
+	client, err := NewClient("https://example.test/cal", "user", "pass")
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	t.Run("empty data returns wrapped ErrEventSkipped", func(t *testing.T) {
+		event := &Event{
+			UID:     "some-uid",
+			Summary: "empty data test",
+			Data:    "",
+		}
+
+		putErr := client.PutEvent(context.Background(), "/cal", event)
+		if putErr == nil {
+			t.Fatal("expected error for empty data, got nil — PutEvent is silently skipping (the Issue #31 bug)")
+		}
+		if !errors.Is(putErr, ErrEventSkipped) {
+			t.Errorf("expected wrapped ErrEventSkipped, got %v", putErr)
+		}
+		// The error message should contain context about why the skip happened.
+		if !strings.Contains(putErr.Error(), "empty") {
+			t.Errorf("expected error message to mention 'empty', got %q", putErr.Error())
+		}
+	})
+
+	t.Run("missing UID returns wrapped ErrEventSkipped", func(t *testing.T) {
+		// Valid iCalendar data but no UID property — triggers the second
+		// skip path where PutEvent tries to extract a UID from the parsed
+		// calendar data, fails, and refuses to construct a destination path.
+		data := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nBEGIN:VEVENT\r\nDTSTAMP:20240115T120000Z\r\nDTSTART:20240115T140000Z\r\nSUMMARY:No UID\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+		event := &Event{
+			Summary: "no UID test",
+			Data:    data,
+			// UID and Path deliberately unset
+		}
+
+		putErr := client.PutEvent(context.Background(), "/cal", event)
+		if putErr == nil {
+			t.Fatal("expected error for missing UID, got nil — PutEvent is silently skipping (the Issue #31 bug)")
+		}
+		if !errors.Is(putErr, ErrEventSkipped) {
+			t.Errorf("expected wrapped ErrEventSkipped, got %v", putErr)
+		}
+		if !strings.Contains(putErr.Error(), "UID") {
+			t.Errorf("expected error message to mention 'UID', got %q", putErr.Error())
+		}
+	})
+
+	t.Run("errors.Is distinguishes ErrEventSkipped from other errors", func(t *testing.T) {
+		// Sanity check the errors.Is semantics callers rely on.
+		skipErr := &Event{Data: ""}
+		err := client.PutEvent(context.Background(), "/cal", skipErr)
+		if !errors.Is(err, ErrEventSkipped) {
+			t.Error("errors.Is(err, ErrEventSkipped) should be true for skip errors")
+		}
+		if errors.Is(err, ErrConnectionFailed) {
+			t.Error("errors.Is(err, ErrConnectionFailed) must be false for skip errors — they are not connection failures")
+		}
+		if errors.Is(err, ErrMalformedContent) {
+			t.Error("errors.Is(err, ErrMalformedContent) must be false for skip errors — empty data is not malformed, just absent")
 		}
 	})
 }

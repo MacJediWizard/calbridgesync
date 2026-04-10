@@ -377,7 +377,14 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 						Data: item.Data,
 					}
 					if err := destClient.PutEvent(ctx, destCalendarPath, event); err != nil {
-						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to sync event: %v", err))
+						if errors.Is(err, ErrEventSkipped) {
+							// PutEvent refused to write this event (empty data,
+							// missing UID). Count it as skipped rather than
+							// falsely incrementing Updated.
+							result.Skipped++
+						} else {
+							result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to sync event: %v", err))
+						}
 					} else {
 						result.Updated++
 					}
@@ -722,7 +729,15 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 
 			// Create new event on destination
 			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to create event on dest: %v", err))
+				if errors.Is(err, ErrEventSkipped) {
+					// PutEvent refused (empty data, missing UID). Count
+					// it as skipped. Do NOT mark the event as "ours" in
+					// destDedupeMap or currentUIDs since nothing was
+					// actually written to the destination.
+					result.Skipped++
+				} else {
+					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to create event on dest: %v", err))
+				}
 			} else {
 				result.Created++
 				if dedupeKey != "|" {
@@ -736,7 +751,15 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			// Update existing event
 			sourceEvent.Path = destEvent.Path
 			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on dest: %v", err))
+				if errors.Is(err, ErrEventSkipped) {
+					// PutEvent refused. Don't add to currentUIDs —
+					// the destination still has the OLD version of
+					// this event, not an updated one, so we should
+					// not track it as freshly synced.
+					result.Skipped++
+				} else {
+					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on dest: %v", err))
+				}
 			} else {
 				result.Updated++
 				currentUIDs[sourceEvent.UID] = true
@@ -775,11 +798,15 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				if source.ConflictStrategy == db.ConflictDestWins {
 					destEvent.Path = sourceEvent.Path
 					if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
-						if isAlreadyExistsError(err) {
+						switch {
+						case errors.Is(err, ErrEventSkipped):
+							// Source PutEvent refused. Count as skipped.
+							result.Skipped++
+						case isAlreadyExistsError(err):
 							skippedAlreadyExists++
-						} else if isForbiddenError(err) {
+						case isForbiddenError(err):
 							skippedForbidden++
-						} else {
+						default:
 							result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on source: %v", err))
 						}
 					} else {
