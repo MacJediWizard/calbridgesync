@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,12 +14,12 @@ import (
 )
 
 const (
-	cleanupInterval     = 24 * time.Hour
-	logRetentionDays    = 30
-	syncTimeout         = 120 * time.Minute // Maximum time for a single sync operation (2 hours for slow iCloud with multiple calendars)
-	healthLogInterval   = 5 * time.Minute   // Interval for scheduler health logging
-	staleMultiplier     = 2                 // Source is stale if last sync > staleMultiplier * interval
-	startupStagger      = 30 * time.Second  // Delay between starting each source's first sync
+	cleanupInterval   = 24 * time.Hour
+	logRetentionDays  = 30
+	syncTimeout       = 120 * time.Minute // Maximum time for a single sync operation (2 hours for slow iCloud with multiple calendars)
+	healthLogInterval = 5 * time.Minute   // Interval for scheduler health logging
+	staleMultiplier   = 2                 // Source is stale if last sync > staleMultiplier * interval
+	startupStagger    = 30 * time.Second  // Delay between starting each source's first sync
 )
 
 // Job represents a scheduled sync job.
@@ -204,9 +206,12 @@ func (s *Scheduler) RemoveJob(sourceID string) {
 		log.Printf("Removed sync job for source %s", sourceID)
 	}
 
-	// Clear stale state in notifier if configured
+	// Clear alert state in notifier if configured. Both stale and failure
+	// cooldowns must be cleared so a newly-added source with a reused ID
+	// (unlikely but possible) starts with a clean slate.
 	if s.notifier != nil {
 		s.notifier.ClearStaleState(sourceID)
+		s.notifier.ClearFailureAlertState(sourceID)
 	}
 }
 
@@ -410,6 +415,79 @@ func (s *Scheduler) executeSync(sourceID string) {
 	} else {
 		log.Printf("Sync failed for source %s: %s", source.Name, result.Message)
 	}
+
+	// Fire a failure alert when appropriate. This covers two cases:
+	//   1. The sync itself returned Success=false (hard failure).
+	//   2. The sync succeeded but a data-loss protection guard was
+	//      triggered, producing a "dangerous" warning in result.Warnings.
+	//      These warnings come from planOrphanDeletion in caldav/sync.go
+	//      (PR #22 / issue #21) and indicate that the sync refused to
+	//      delete events because the inputs looked unsafe. The user MUST
+	//      know about these — before PR #22 they would have silently
+	//      deleted data; after PR #22 they silently preserve data, but
+	//      the underlying problem (broken source, auth expired, etc.)
+	//      still needs user attention.
+	s.maybeSendFailureAlert(sourceID, source, result)
+}
+
+// maybeSendFailureAlert inspects a sync result and fires a failure alert if
+// the sync failed or if any data-loss protection guard was triggered.
+// It respects the notifier's cooldown window — called on every sync, the
+// per-source cooldown map prevents alert storms on a persistently broken
+// source.
+func (s *Scheduler) maybeSendFailureAlert(sourceID string, source *db.Source, result *caldav.SyncResult) {
+	if s.notifier == nil || !s.notifier.IsEnabled() {
+		return
+	}
+
+	var (
+		shouldAlert  bool
+		alertMessage string
+		alertDetails string
+	)
+
+	if !result.Success {
+		shouldAlert = true
+		alertMessage = fmt.Sprintf("Sync failed for source '%s'", source.Name)
+		if len(result.Errors) > 0 {
+			alertDetails = strings.Join(result.Errors, "\n")
+		} else {
+			alertDetails = result.Message
+		}
+	} else {
+		// Successful sync — check warnings for data-loss protection signals.
+		var dangerous []string
+		for _, w := range result.Warnings {
+			if notify.IsDangerousWarning(w) {
+				dangerous = append(dangerous, w)
+			}
+		}
+		if len(dangerous) > 0 {
+			shouldAlert = true
+			alertMessage = fmt.Sprintf("Data-loss protection triggered for source '%s'", source.Name)
+			alertDetails = strings.Join(dangerous, "\n")
+		}
+	}
+
+	if !shouldAlert {
+		return
+	}
+
+	// Look up user email for per-user notifications. nil-safe so tests
+	// can exercise this path with a no-DB scheduler; production always
+	// has a real db.
+	userEmail := ""
+	if s.db != nil {
+		if user, err := s.db.GetUserByID(source.UserID); err == nil {
+			userEmail = user.Email
+		}
+	}
+	userPrefs := s.getUserAlertPrefs(source.UserID)
+
+	s.notifier.SendSyncFailureAlertWithPrefs(
+		s.ctx, sourceID, source.Name, userEmail,
+		alertMessage, alertDetails, userPrefs,
+	)
 }
 
 // cleanupRoutine runs periodic cleanup of old sync logs.

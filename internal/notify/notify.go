@@ -48,14 +48,14 @@ type Config struct {
 	WebhookURL     string
 
 	// Email settings
-	EmailEnabled   bool
-	SMTPHost       string
-	SMTPPort       int
-	SMTPUsername   string
-	SMTPPassword   string
-	SMTPFrom       string
-	SMTPTo         []string // Recipients
-	SMTPTLS        bool
+	EmailEnabled bool
+	SMTPHost     string
+	SMTPPort     int
+	SMTPUsername string
+	SMTPPassword string
+	SMTPFrom     string
+	SMTPTo       []string // Recipients
+	SMTPTLS      bool
 
 	// Alert settings
 	CooldownPeriod time.Duration // How long to wait before re-alerting for same source
@@ -79,6 +79,11 @@ type Notifier struct {
 	mu             sync.RWMutex
 	lastAlertTimes map[string]time.Time
 	staleState     map[string]bool // Track if source is currently in stale state
+
+	// Failure alert cooldown is tracked separately from stale alerts so a
+	// source that is both stale and failing doesn't lose one signal because
+	// the other already consumed the cooldown window.
+	lastFailureAlertTimes map[string]time.Time
 }
 
 // New creates a new Notifier.
@@ -88,8 +93,9 @@ func New(cfg *Config) *Notifier {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		lastAlertTimes: make(map[string]time.Time),
-		staleState:     make(map[string]bool),
+		lastAlertTimes:        make(map[string]time.Time),
+		staleState:            make(map[string]bool),
+		lastFailureAlertTimes: make(map[string]time.Time),
 	}
 }
 
@@ -547,6 +553,81 @@ func (n *Notifier) getCooldownPeriod(userPrefs *UserPreferences) time.Duration {
 		return time.Duration(*userPrefs.CooldownMinutes) * time.Minute
 	}
 	return n.cfg.CooldownPeriod
+}
+
+// SendSyncFailureAlertWithPrefs sends an alert when a sync fails or when a
+// data-loss protection guard is triggered, using per-user preferences.
+// userPrefs can be nil to use global defaults only.
+//
+// This method has its own cooldown window independent from stale alerts:
+// a source that is both stale AND failing will not lose one signal because
+// the other already consumed the cooldown.
+//
+// errorMessage is a short human-readable summary shown in the alert subject.
+// details is the full error/warning text shown in the alert body.
+//
+// Returns true if the alert was queued for send, false if still in cooldown.
+func (n *Notifier) SendSyncFailureAlertWithPrefs(
+	ctx context.Context,
+	sourceID, sourceName, userEmail, errorMessage, details string,
+	userPrefs *UserPreferences,
+) bool {
+	cooldown := n.getCooldownPeriod(userPrefs)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Cooldown check — failure alerts use their own map, independent of
+	// the stale-alert cooldown.
+	if lastAlert, exists := n.lastFailureAlertTimes[sourceID]; exists {
+		if time.Since(lastAlert) < cooldown {
+			return false
+		}
+	}
+	n.lastFailureAlertTimes[sourceID] = time.Now()
+
+	alert := Alert{
+		Type:       AlertTypeError,
+		SourceID:   sourceID,
+		SourceName: sourceName,
+		UserEmail:  userEmail,
+		Message:    errorMessage,
+		Details:    details,
+		Timestamp:  time.Now(),
+	}
+
+	// Send in background to not block the scheduler.
+	go n.sendWithPrefs(ctx, alert, userPrefs)
+	return true
+}
+
+// ClearFailureAlertState clears the failure-alert cooldown for a source
+// (used on source deletion). Safe to call for sources that have never
+// triggered a failure alert.
+func (n *Notifier) ClearFailureAlertState(sourceID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.lastFailureAlertTimes, sourceID)
+}
+
+// IsDangerousWarning returns true if a sync warning indicates a data-loss
+// protection guard was triggered and the user should be alerted, even if
+// the overall sync result reports success.
+//
+// These patterns are produced by planOrphanDeletion in internal/caldav/sync.go
+// (added in PR #22, issue #21). They represent cases where the sync engine
+// refused to delete destination events because the inputs looked unsafe
+// (source returned zero events, or the planned deletion ratio exceeded the
+// configured safety threshold).
+//
+// Harmless warnings (individual event put/delete failures, 403/412 skip
+// counts, etc.) do NOT match and do not trigger alerts.
+func IsDangerousWarning(w string) bool {
+	if w == "" {
+		return false
+	}
+	return strings.Contains(w, "previously-synced records exist") ||
+		strings.Contains(w, "exceeds safety threshold")
 }
 
 // sendWithPrefs sends the alert via configured channels, respecting per-user preferences.
