@@ -377,3 +377,105 @@ func TestRewriteDeletePathForDestination_FilenameMatchesPutEventConvention(t *te
 			deletePath, putPath)
 	}
 }
+
+// TestExtractUIDFromEventPath verifies the UID extraction helper used by
+// the WebDAV-Sync path to keep synced_events in sync with destination
+// writes and deletes. PutEvent writes events as "{path}/{UID}.ics", so
+// extractUIDFromEventPath must be able to recover the UID from any path
+// in that shape.
+func TestExtractUIDFromEventPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "normal destination path",
+			path: "/SOGo/dav/user@host/Calendar/personal/abc123.ics",
+			want: "abc123",
+		},
+		{
+			name: "normal source path",
+			path: "/calendar/work-acct/event-uid-1234.ics",
+			want: "event-uid-1234",
+		},
+		{
+			name: "trailing slash tolerated",
+			path: "/cal/abc.ics/",
+			want: "abc",
+		},
+		{
+			name: "UID with dots and hyphens",
+			path: "/cal/user/20260101T120000Z-event-uid-1234.ics",
+			want: "20260101T120000Z-event-uid-1234",
+		},
+		{
+			name: "URL-encoded characters preserved in UID",
+			path: "/cal/event%20with%20spaces.ics",
+			want: "event%20with%20spaces",
+		},
+		{
+			name: "filename only, no leading slash",
+			path: "abc.ics",
+			want: "abc",
+		},
+		{
+			name: "root-level filename",
+			path: "/abc.ics",
+			want: "abc",
+		},
+		{
+			name: "empty string returns empty",
+			path: "",
+			want: "",
+		},
+		{
+			name: "slash only returns empty",
+			path: "/",
+			want: "",
+		},
+		{
+			name: "path without .ics extension returns empty",
+			path: "/cal/some-directory",
+			want: "",
+		},
+		{
+			name: "filename is just .ics returns empty",
+			path: "/cal/.ics",
+			want: "",
+		},
+		{
+			name: "deep nested path extracts only the last segment",
+			path: "/very/deeply/nested/path/final-uid.ics",
+			want: "final-uid",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractUIDFromEventPath(tt.path)
+			if got != tt.want {
+				t.Errorf("extractUIDFromEventPath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractUIDFromEventPath_RoundTripWithRewrite verifies that a UID
+// survives the full round-trip: a source path rewritten by
+// rewriteDeletePathForDestination and then passed to extractUIDFromEventPath
+// must yield the original UID back. This is the contract the
+// WebDAV-Sync delete loop relies on: after successfully deleting an
+// event from the destination, the loop needs to be able to recover
+// the UID from the rewritten path so it can call DeleteSyncedEvent.
+func TestExtractUIDFromEventPath_RoundTripWithRewrite(t *testing.T) {
+	uid := "round-trip-uid-1234"
+	sourcePath := "/source/server/layout/" + uid + ".ics"
+	destCalendarPath := "/destination/server/layout"
+
+	rewritten := rewriteDeletePathForDestination(sourcePath, destCalendarPath)
+	got := extractUIDFromEventPath(rewritten)
+	if got != uid {
+		t.Errorf("round-trip lost the UID: source=%q → rewritten=%q → extracted=%q, want %q",
+			sourcePath, rewritten, got, uid)
+	}
+}
