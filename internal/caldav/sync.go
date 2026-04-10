@@ -31,6 +31,48 @@ func isForbiddenError(err error) bool {
 	return strings.Contains(errStr, "403") || strings.Contains(errStr, "Forbidden")
 }
 
+// shouldSkipTwoWayDeletion returns true if the two-way deletion pass
+// should be skipped entirely for this sync cycle. This is the guard
+// introduced in commit b772c56 (and extended by PR #22) against mass
+// deletion when the destination query returned empty but we have
+// prior sync records.
+//
+// The rationale: if we previously synced N events and the destination
+// suddenly says it has zero, that's almost certainly a destination
+// query failure (network hiccup, bad auth, server bug), NOT a user
+// who just deleted N events in rapid succession. Deleting the
+// corresponding events from the source based on that empty query
+// would be a disaster.
+//
+// Extracted as a pure helper in Issue #68 so it can be unit-tested
+// directly. Behavior is byte-for-byte identical to the previous
+// inline implementation.
+func shouldSkipTwoWayDeletion(direction db.SyncDirection, destEventCount, previouslySyncedCount int) bool {
+	return direction == db.SyncDirectionTwoWay &&
+		destEventCount == 0 &&
+		previouslySyncedCount > 0
+}
+
+// isWithinSyncSafetyThreshold returns true if the given
+// "last synced at" timestamp is within the safety window — meaning
+// the event was synced recently enough that we should NOT delete it
+// from the source yet, even if it appears to be missing from the
+// destination.
+//
+// This is the guard introduced in commit 23e88c1. The rationale: if
+// an event was just synced to the destination but hasn't propagated
+// yet (destination eventual consistency, caching, indexing delay),
+// a naive "event missing from destination → delete from source"
+// reaction would cause data loss. The threshold is one full sync
+// interval plus the slack needed for the destination to catch up.
+//
+// Extracted as a pure helper in Issue #68 for testability.
+// Behavior is byte-for-byte identical to the previous inline check.
+func isWithinSyncSafetyThreshold(syncedAt time.Time, sourceSyncInterval time.Duration, now time.Time) bool {
+	threshold := now.Add(-sourceSyncInterval)
+	return syncedAt.After(threshold)
+}
+
 // getSyncDirectionForCalendar returns the effective sync direction for a calendar.
 // It checks per-calendar settings first, then falls back to the source default.
 func getSyncDirectionForCalendar(source *db.Source, calendarPath string) db.SyncDirection {
@@ -762,17 +804,19 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// Update status to show processing phase
 	updateStatus(fmt.Sprintf("processing %d events", len(sourceEvents)))
 
-	// Handle deletions first (for two-way sync)
-	// SAFETY: Only delete from source if the event was synced at least one sync cycle ago
-	// This prevents deleting events that failed to sync to destination
-	syncSafetyThreshold := time.Now().Add(-time.Duration(source.SyncInterval) * time.Second)
+	// Handle deletions first (for two-way sync). Both safety guards
+	// below are extracted as pure helpers (Issue #68) so they can be
+	// unit-tested directly — see shouldSkipTwoWayDeletion and
+	// isWithinSyncSafetyThreshold in this file.
+	sourceInterval := time.Duration(source.SyncInterval) * time.Second
+	now := time.Now()
 
-	// SAFETY: Skip two-way deletion if destination query returned empty but we have synced events
-	// This prevents mass deletion from source when destination query fails
-	skipTwoWayDeletion := false
-	if syncDirection == db.SyncDirectionTwoWay && len(destEventMap) == 0 && len(previouslySyncedMap) > 0 {
+	// SAFETY: Skip two-way deletion entirely if destination query
+	// returned empty but we have synced events. Prevents mass
+	// deletion from source when the destination query fails.
+	skipTwoWayDeletion := shouldSkipTwoWayDeletion(syncDirection, len(destEventMap), len(previouslySyncedMap))
+	if skipTwoWayDeletion {
 		log.Printf("WARNING: Destination returned 0 events but we have %d previously synced events - skipping two-way deletions for safety", len(previouslySyncedMap))
-		skipTwoWayDeletion = true
 	}
 
 	if syncDirection == db.SyncDirectionTwoWay && !skipTwoWayDeletion && sourceClient != nil {
@@ -799,9 +843,11 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 
 			sourceEvent, existsOnSource := sourceEventMap[uid]
 			if existsOnSource && !existsOnDest {
-				// SAFETY CHECK: Only delete from source if the event was synced before the safety threshold
-				// This prevents deleting events that never synced successfully to destination
-				if syncedEvent.UpdatedAt.After(syncSafetyThreshold) {
+				// SAFETY CHECK: Only delete from source if the event was
+				// synced before the safety threshold (commit 23e88c1).
+				// Prevents deleting events that failed to sync to
+				// destination or haven't propagated yet.
+				if isWithinSyncSafetyThreshold(syncedEvent.UpdatedAt, sourceInterval, now) {
 					log.Printf("Event %s not on destination but synced recently - skipping deletion from source (safety)", uid)
 					continue
 				}
