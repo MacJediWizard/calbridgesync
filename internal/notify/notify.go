@@ -313,7 +313,7 @@ func (n *Notifier) send(ctx context.Context, alert Alert) {
 		}
 
 		if len(recipients) > 0 {
-			if err := n.sendEmail(alert, recipients); err != nil {
+			if err := n.sendEmail(ctx, alert, recipients); err != nil {
 				log.Printf("[Notify] Email error: %v", err)
 			}
 		}
@@ -333,7 +333,9 @@ type WebhookPayload struct {
 }
 
 func (n *Notifier) sendWebhook(ctx context.Context, alert Alert) error {
-	// Build Slack-compatible message
+	// Build Slack-compatible message.
+	// Idempotent setup lives outside the retry: re-marshaling the same
+	// payload every attempt is wasted work.
 	emoji := ""
 	switch alert.Type {
 	case AlertTypeStale:
@@ -359,28 +361,34 @@ func (n *Notifier) sendWebhook(ctx context.Context, alert Alert) error {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", n.cfg.WebhookURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
+	// Retry the HTTP call itself on transient failures (DNS, TCP, TLS,
+	// 5xx). Permanent errors (4xx, request construction) fall through
+	// immediately — see isTransientHTTPError for the full taxonomy.
+	return retryTransient(ctx, defaultMaxSendAttempts, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, "POST", n.cfg.WebhookURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := n.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := n.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("send request: %w", err)
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
-	}
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+		}
 
-	log.Printf("[Notify] Webhook sent: %s", alert.Message)
-	return nil
+		log.Printf("[Notify] Webhook sent: %s", alert.Message)
+		return nil
+	}, isTransientHTTPError)
 }
 
-func (n *Notifier) sendEmail(alert Alert, recipients []string) error {
-	// Sanitize user-controlled inputs to prevent email header injection
+func (n *Notifier) sendEmail(ctx context.Context, alert Alert, recipients []string) error {
+	// Sanitize user-controlled inputs to prevent email header injection.
+	// This is idempotent setup and stays outside the retry.
 	sanitizedSourceName := sanitizeForEmail(alert.SourceName)
 	sanitizedMessage := sanitizeForEmail(alert.Message)
 	sanitizedDetails := sanitizeForEmail(alert.Details)
@@ -408,19 +416,30 @@ func (n *Notifier) sendEmail(alert Alert, recipients []string) error {
 		auth = smtp.PlainAuth("", n.cfg.SMTPUsername, n.cfg.SMTPPassword, n.cfg.SMTPHost)
 	}
 
-	var err error
-	if n.cfg.SMTPTLS {
-		err = n.sendEmailTLS(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
-	} else {
-		err = smtp.SendMail(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
-	}
-
-	if err != nil {
-		return fmt.Errorf("send email: %w", err)
-	}
-
-	log.Printf("[Notify] Email sent to %d recipients: %s", len(recipients), sanitizedMessage)
-	return nil
+	// Retry transient SMTP failures. SMTP errors are mostly transient
+	// (connection drops, TLS hiccups, temporary server rejection) and
+	// the isTransientSMTPError classifier is intentionally permissive —
+	// the outer cooldown loop (PR #34) will eventually give up on
+	// persistently broken destinations by not retrying for another
+	// full cooldown window.
+	//
+	// Context is honored during backoff sleeps via retryTransient.
+	// Note: the stdlib smtp.SendMail itself does not take a context,
+	// so a mid-attempt cancellation only affects the sleep between
+	// attempts, not the send in progress.
+	return retryTransient(ctx, defaultMaxSendAttempts, func(ctx context.Context) error {
+		var err error
+		if n.cfg.SMTPTLS {
+			err = n.sendEmailTLS(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
+		} else {
+			err = smtp.SendMail(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
+		}
+		if err != nil {
+			return fmt.Errorf("send email: %w", err)
+		}
+		log.Printf("[Notify] Email sent to %d recipients: %s", len(recipients), sanitizedMessage)
+		return nil
+	}, isTransientSMTPError)
 }
 
 // sendEmailTLS sends email over TLS (for port 465).
@@ -779,7 +798,7 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 
 		if len(recipients) > 0 {
 			anyAttempted = true
-			if err := n.sendEmail(alert, recipients); err != nil {
+			if err := n.sendEmail(ctx, alert, recipients); err != nil {
 				log.Printf("[Notify] Email error: %v", err)
 			} else {
 				anyDelivered = true
@@ -799,12 +818,14 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 
 // sendWebhookToURL sends a webhook to a specific URL (for user webhooks).
 func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL string) error {
-	// Validate URL before sending (security check)
+	// Validate URL before sending (security check). Validation failures
+	// are permanent — no point retrying a URL that will never pass.
 	if err := validateWebhookURL(webhookURL); err != nil {
 		return fmt.Errorf("invalid webhook URL: %w", err)
 	}
 
-	// Build Slack-compatible message
+	// Build Slack-compatible message. Idempotent setup stays outside
+	// the retry.
 	emoji := ""
 	switch alert.Type {
 	case AlertTypeStale:
@@ -830,24 +851,26 @@ func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
+	return retryTransient(ctx, defaultMaxSendAttempts, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := n.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := n.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("send request: %w", err)
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
-	}
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+		}
 
-	log.Printf("[Notify] User webhook sent: %s", alert.Message)
-	return nil
+		log.Printf("[Notify] User webhook sent: %s", alert.Message)
+		return nil
+	}, isTransientHTTPError)
 }
 
 // SendTestWebhook sends a test message to a webhook URL.

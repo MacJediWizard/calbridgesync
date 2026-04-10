@@ -8,15 +8,23 @@ import (
 	"time"
 )
 
+// drainTimeout is the max time we wait for in-flight alert sends to
+// complete in tests. Must comfortably exceed the full retry window
+// (defaultMaxSendAttempts attempts with exponential backoff + jitter,
+// ~1.5s total for 3 attempts at 500ms base) for tests that exercise
+// failure paths. Issue #39 introduced the retry behavior that pushed
+// failed-send durations into the low-seconds range.
+const drainTimeout = 5 * time.Second
+
 // waitForDrain blocks until all in-flight alert sends have completed,
-// or until the timeout expires. Test helper for sequencing multi-alert
+// or until drainTimeout expires. Test helper for sequencing multi-alert
 // scenarios — since Issue #33, the cooldown timestamp is recorded
 // inside the background goroutine only after sendWithPrefs returns,
 // so tests that rely on cooldown-after-first-send must wait for
 // that goroutine to finish before making assertions about state.
 func waitForDrain(t *testing.T, n *Notifier) {
 	t.Helper()
-	deadline := time.Now().Add(100 * time.Millisecond)
+	deadline := time.Now().Add(drainTimeout)
 	for time.Now().Before(deadline) {
 		n.mu.RLock()
 		empty := len(n.inFlightAlerts) == 0
@@ -24,9 +32,9 @@ func waitForDrain(t *testing.T, n *Notifier) {
 		if empty {
 			return
 		}
-		time.Sleep(500 * time.Microsecond)
+		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("in-flight alerts did not drain within 100ms")
+	t.Fatalf("in-flight alerts did not drain within %v", drainTimeout)
 }
 
 // waitForKeyDrain blocks until a specific in-flight key has cleared.
@@ -34,7 +42,7 @@ func waitForDrain(t *testing.T, n *Notifier) {
 // for only the real goroutine(s) to finish, not the synthetic ones.
 func waitForKeyDrain(t *testing.T, n *Notifier, key string) {
 	t.Helper()
-	deadline := time.Now().Add(100 * time.Millisecond)
+	deadline := time.Now().Add(drainTimeout)
 	for time.Now().Before(deadline) {
 		n.mu.RLock()
 		gone := !n.inFlightAlerts[key]
@@ -42,9 +50,9 @@ func waitForKeyDrain(t *testing.T, n *Notifier, key string) {
 		if gone {
 			return
 		}
-		time.Sleep(500 * time.Microsecond)
+		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("in-flight key %q did not clear within 100ms", key)
+	t.Fatalf("in-flight key %q did not clear within %v", key, drainTimeout)
 }
 
 func TestValidateConfig(t *testing.T) {
