@@ -50,6 +50,45 @@ func getSyncDirectionForCalendar(source *db.Source, calendarPath string) db.Sync
 // or filter misconfiguration rather than a legitimate bulk cleanup.
 const defaultOrphanDeleteRatioThreshold = 0.5
 
+// extractUIDFromEventPath returns the event UID embedded in a CalDAV object
+// path. By PutEvent convention (client.go:602), events are written as
+// "{calendarPath}/{UID}.ics" so the UID is the basename of the path with
+// the ".ics" extension stripped.
+//
+// This is used by the WebDAV-Sync path in syncCalendar to keep the
+// synced_events table in sync with destination writes and deletes:
+// SyncCollection.Deleted only tells us the source-side path, not the UID,
+// so we have to recover the UID from the last URL segment.
+//
+// Returns an empty string for inputs that cannot yield a UID (empty path,
+// path with no trailing filename, filename without the ".ics" extension).
+// Callers MUST check for the empty return before passing the result to
+// DeleteSyncedEvent — a DELETE with an empty UID would match no rows but
+// still wastes a DB round-trip and pollutes logs.
+func extractUIDFromEventPath(eventPath string) string {
+	trimmed := strings.TrimSuffix(eventPath, "/")
+	if trimmed == "" {
+		return ""
+	}
+	filename := trimmed
+	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
+		filename = trimmed[idx+1:]
+	}
+	if filename == "" {
+		return ""
+	}
+	// Strip the .ics extension if present. Filenames without .ics are
+	// likely not event objects — return empty so callers skip them.
+	if !strings.HasSuffix(filename, ".ics") {
+		return ""
+	}
+	uid := strings.TrimSuffix(filename, ".ics")
+	if uid == "" {
+		return ""
+	}
+	return uid
+}
+
 // rewriteDeletePathForDestination translates a CalDAV object path from the
 // source server's URL namespace into the destination server's URL namespace.
 //
@@ -430,6 +469,22 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to sync event: %v", err))
 					} else {
 						result.Updated++
+						// Track in synced_events so PR #22's ownership filter
+						// and two-way deletion logic can see these writes.
+						// PutEvent populates event.UID in-place when it
+						// successfully parses the calendar data; if the
+						// event had no UID it cannot reach this branch
+						// (PutEvent returns nil early without writing).
+						if event.UID != "" {
+							syncedEvent := &db.SyncedEvent{
+								SourceID:     source.ID,
+								CalendarHref: calendar.Path,
+								EventUID:     event.UID,
+							}
+							if err := se.db.UpsertSyncedEvent(syncedEvent); err != nil {
+								log.Printf("Failed to upsert synced event record for %s: %v", event.UID, err)
+							}
+						}
 					}
 				}
 			}
@@ -450,6 +505,16 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 					log.Printf("Failed to delete event (source: %s, dest: %s): %v", sourcePath, destEventPath, err)
 				} else {
 					result.Deleted++
+					// Remove the synced_events record too so the next sync's
+					// previouslySyncedMap doesn't still think we own it.
+					// The UID is encoded in the filename of the destination
+					// path (and equivalently in the source path) per the
+					// PutEvent convention.
+					if uid := extractUIDFromEventPath(destEventPath); uid != "" {
+						if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+							log.Printf("Failed to delete synced event record for %s: %v", uid, err)
+						}
+					}
 				}
 			}
 
