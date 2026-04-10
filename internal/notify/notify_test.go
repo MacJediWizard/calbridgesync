@@ -322,22 +322,24 @@ func TestNotifierCooldown(t *testing.T) {
 	n := New(cfg)
 
 	// First alert should succeed
-	sent := n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	sent := n.SendStaleAlertWithPrefs(context.Background(), "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour, nil)
 	if !sent {
 		t.Error("First stale alert should be sent")
 	}
+	waitForDrain(t, n)
 
 	// Second alert within cooldown should be blocked
-	sent = n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	sent = n.SendStaleAlertWithPrefs(context.Background(), "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour, nil)
 	if sent {
 		t.Error("Second stale alert within cooldown should be blocked")
 	}
 
 	// Different source should still work
-	sent = n.SendStaleAlert(nil, "source2", "Test Source 2", "user@example.com", 2*time.Hour, time.Hour)
+	sent = n.SendStaleAlertWithPrefs(context.Background(), "source2", "Test Source 2", "user@example.com", 2*time.Hour, time.Hour, nil)
 	if !sent {
 		t.Error("Alert for different source should be sent")
 	}
+	waitForDrain(t, n)
 }
 
 func TestNotifierRecovery(t *testing.T) {
@@ -347,24 +349,26 @@ func TestNotifierRecovery(t *testing.T) {
 		CooldownPeriod: time.Hour,
 	}
 	n := New(cfg)
+	ctx := context.Background()
 
 	// Recovery without prior stale should return false
-	recovered := n.SendRecoveryAlert(nil, "source1", "Test Source", "user@example.com")
+	recovered := n.SendRecoveryAlertWithPrefs(ctx, "source1", "Test Source", "user@example.com", nil)
 	if recovered {
 		t.Error("Recovery without prior stale should return false")
 	}
 
 	// Send stale alert first
-	n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	n.SendStaleAlertWithPrefs(ctx, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour, nil)
+	waitForDrain(t, n)
 
 	// Now recovery should work
-	recovered = n.SendRecoveryAlert(nil, "source1", "Test Source", "user@example.com")
+	recovered = n.SendRecoveryAlertWithPrefs(ctx, "source1", "Test Source", "user@example.com", nil)
 	if !recovered {
 		t.Error("Recovery after stale should return true")
 	}
 
 	// Second recovery should fail (already recovered)
-	recovered = n.SendRecoveryAlert(nil, "source1", "Test Source", "user@example.com")
+	recovered = n.SendRecoveryAlertWithPrefs(ctx, "source1", "Test Source", "user@example.com", nil)
 	if recovered {
 		t.Error("Second recovery should return false")
 	}
@@ -377,18 +381,21 @@ func TestClearStaleState(t *testing.T) {
 		CooldownPeriod: time.Hour,
 	}
 	n := New(cfg)
+	ctx := context.Background()
 
 	// Send stale alert
-	n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	n.SendStaleAlertWithPrefs(ctx, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour, nil)
+	waitForDrain(t, n)
 
 	// Clear stale state
 	n.ClearStaleState("source1")
 
 	// Should be able to send stale alert again (not in cooldown)
-	sent := n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	sent := n.SendStaleAlertWithPrefs(ctx, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour, nil)
 	if !sent {
 		t.Error("Should be able to send alert after clearing stale state")
 	}
+	waitForDrain(t, n)
 }
 
 // TestSendSyncFailureAlertCooldown verifies that a second failure alert for
@@ -442,7 +449,7 @@ func TestSendSyncFailureAlertIndependentFromStale(t *testing.T) {
 	n := New(cfg)
 
 	// Fire a stale alert first.
-	sent := n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	sent := n.SendStaleAlertWithPrefs(context.Background(), "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour, nil)
 	if !sent {
 		t.Fatal("stale alert should fire")
 	}
@@ -450,12 +457,13 @@ func TestSendSyncFailureAlertIndependentFromStale(t *testing.T) {
 	// A failure alert for the same source should NOT be blocked by the
 	// stale cooldown — they use independent maps.
 	sent = n.SendSyncFailureAlertWithPrefs(
-		nil, "source1", "Test Source", "user@example.com",
+		context.Background(), "source1", "Test Source", "user@example.com",
 		"Sync failed", "some error", nil,
 	)
 	if !sent {
 		t.Error("failure alert should not be blocked by stale cooldown")
 	}
+	waitForDrain(t, n)
 }
 
 // TestClearFailureAlertState verifies that clearing the failure-alert state
