@@ -264,18 +264,24 @@ func (s *Scheduler) checkLiveness() {
 		log.Printf("[WATCHDOG] routine %q last heartbeat %v ago (threshold %v) — may be crashed or hung",
 			name, age.Round(time.Second), threshold)
 
-		// Fire an alert so the operator sees this in their alert
-		// channel. Uses SendStaleAlert (the only notifier API
-		// available on main) with a synthetic sourceID derived from
-		// the routine name so the notifier's per-source cooldown
-		// applies per routine, not across all watchdog events.
-		//
-		// NOTE: after PR #24 (SendSyncFailureAlertWithPrefs) merges,
-		// this could switch to the failure-alert path for cleaner
-		// alert-type separation. Follow-up issue.
+		// Fire a failure alert so the operator sees this in their
+		// alert channel. Uses the per-user-prefs failure alert API
+		// (PR #24) with a synthetic sourceID derived from the routine
+		// name so the notifier's per-source cooldown + in-flight
+		// dedup (PR #34) apply per routine, not across all watchdog
+		// events. This is the semantic upgrade from the original
+		// PR #50 implementation which used SendStaleAlert (now
+		// deleted in Issue #59) — a stuck routine is a failure, not
+		// a "stale data" condition.
 		if s.notifier != nil && s.notifier.IsEnabled() {
 			watchdogSourceID := "watchdog:" + name
-			s.notifier.SendStaleAlert(s.ctx, watchdogSourceID, name, "", age, threshold)
+			message := fmt.Sprintf("Scheduler routine %q is not responsive", name)
+			details := fmt.Sprintf("Last heartbeat was %v ago (threshold %v). Routine may have crashed or hung.",
+				age.Round(time.Second), threshold)
+			s.notifier.SendSyncFailureAlertWithPrefs(
+				s.ctx, watchdogSourceID, name, "",
+				message, details, nil,
+			)
 		}
 	}
 }

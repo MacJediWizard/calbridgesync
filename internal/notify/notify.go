@@ -221,111 +221,17 @@ func (n *Notifier) IsEnabled() bool {
 	return n.cfg.WebhookEnabled || n.cfg.EmailEnabled
 }
 
-// SendStaleAlert sends an alert for a stale source.
-// userEmail is the email of the user who owns the source (for per-user notifications).
-// Returns true if alert was sent, false if still in cooldown.
-func (n *Notifier) SendStaleAlert(ctx context.Context, sourceID, sourceName, userEmail string, timeSinceSync, threshold time.Duration) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	// Check if already in stale state and in cooldown
-	if n.staleState[sourceID] {
-		lastAlert, exists := n.lastAlertTimes[sourceID]
-		if exists && time.Since(lastAlert) < n.cfg.CooldownPeriod {
-			return false // Still in cooldown
-		}
-	}
-
-	// Mark as stale and update alert time
-	n.staleState[sourceID] = true
-	n.lastAlertTimes[sourceID] = time.Now()
-
-	alert := Alert{
-		Type:       AlertTypeStale,
-		SourceID:   sourceID,
-		SourceName: sourceName,
-		UserEmail:  userEmail,
-		Message:    fmt.Sprintf("Source '%s' is stale", sourceName),
-		Details:    fmt.Sprintf("Last sync was %v ago (threshold: %v)", timeSinceSync.Round(time.Minute), threshold),
-		Timestamp:  time.Now(),
-	}
-
-	// Send in background to not block. Wrapped in a closure with
-	// recoverPanic to prevent a crash in send() from killing the daemon.
-	go func() {
-		defer recoverPanic("notify.SendStaleAlert")
-		n.send(ctx, alert)
-	}()
-	return true
-}
-
-// SendRecoveryAlert sends an alert when a source recovers from stale state.
-// userEmail is the email of the user who owns the source (for per-user notifications).
-func (n *Notifier) SendRecoveryAlert(ctx context.Context, sourceID, sourceName, userEmail string) bool {
-	n.mu.Lock()
-	wasStale := n.staleState[sourceID]
-	if wasStale {
-		delete(n.staleState, sourceID)
-		delete(n.lastAlertTimes, sourceID)
-	}
-	n.mu.Unlock()
-
-	if !wasStale {
-		return false // Wasn't stale, no need to send recovery
-	}
-
-	alert := Alert{
-		Type:       AlertTypeRecovery,
-		SourceID:   sourceID,
-		SourceName: sourceName,
-		UserEmail:  userEmail,
-		Message:    fmt.Sprintf("Source '%s' has recovered", sourceName),
-		Details:    "Source is now syncing normally",
-		Timestamp:  time.Now(),
-	}
-
-	go func() {
-		defer recoverPanic("notify.SendRecoveryAlert")
-		n.send(ctx, alert)
-	}()
-	return true
-}
-
-// send sends the alert via all configured channels.
-func (n *Notifier) send(ctx context.Context, alert Alert) {
-	if n.cfg.WebhookEnabled && n.cfg.WebhookURL != "" {
-		if err := n.sendWebhook(ctx, alert); err != nil {
-			log.Printf("[Notify] Webhook error: %v", err)
-		}
-	}
-
-	if n.cfg.EmailEnabled {
-		// Build recipient list: user email + admin emails (deduplicated)
-		recipientSet := make(map[string]struct{})
-
-		// Add user email if provided and valid
-		if alert.UserEmail != "" && isValidEmail(alert.UserEmail) {
-			recipientSet[strings.ToLower(alert.UserEmail)] = struct{}{}
-		}
-
-		// Add admin emails
-		for _, email := range n.cfg.SMTPTo {
-			recipientSet[strings.ToLower(email)] = struct{}{}
-		}
-
-		// Convert to slice
-		recipients := make([]string, 0, len(recipientSet))
-		for email := range recipientSet {
-			recipients = append(recipients, email)
-		}
-
-		if len(recipients) > 0 {
-			if err := n.sendEmail(ctx, alert, recipients); err != nil {
-				log.Printf("[Notify] Email error: %v", err)
-			}
-		}
-	}
-}
+// NOTE: The legacy SendStaleAlert, SendRecoveryAlert, and their shared
+// send() helper were removed in Issue #59. They were replaced by:
+//
+//   - SendStaleAlertWithPrefs      (PR #24, per-user preferences)
+//   - SendRecoveryAlertWithPrefs   (PR #24, per-user preferences)
+//   - SendSyncFailureAlertWithPrefs (PR #24, failure + data-loss
+//                                    protection alerts)
+//   - sendWithPrefs                (PR #34, returns delivered bool)
+//
+// All call sites in the codebase have been migrated to the *WithPrefs
+// variants. The legacy functions had no callers and were just dead code.
 
 // WebhookPayload is the JSON payload sent to webhooks.
 type WebhookPayload struct {
