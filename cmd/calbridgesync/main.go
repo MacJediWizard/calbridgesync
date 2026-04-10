@@ -88,17 +88,19 @@ func main() {
 
 	// Initialize notifier for alerts
 	notifyCfg := &notify.Config{
-		WebhookEnabled: cfg.Alerts.WebhookEnabled,
-		WebhookURL:     cfg.Alerts.WebhookURL,
-		EmailEnabled:   cfg.Alerts.EmailEnabled,
-		SMTPHost:       cfg.Alerts.SMTPHost,
-		SMTPPort:       cfg.Alerts.SMTPPort,
-		SMTPUsername:   cfg.Alerts.SMTPUsername,
-		SMTPPassword:   cfg.Alerts.SMTPPassword,
-		SMTPFrom:       cfg.Alerts.SMTPFrom,
-		SMTPTo:         cfg.Alerts.SMTPTo,
-		SMTPTLS:        cfg.Alerts.SMTPTLS,
-		CooldownPeriod: time.Duration(cfg.Alerts.CooldownMinutes) * time.Minute,
+		WebhookEnabled:  cfg.Alerts.WebhookEnabled,
+		WebhookURL:      cfg.Alerts.WebhookURL,
+		EmailEnabled:    cfg.Alerts.EmailEnabled,
+		SMTPHost:        cfg.Alerts.SMTPHost,
+		SMTPPort:        cfg.Alerts.SMTPPort,
+		SMTPUsername:    cfg.Alerts.SMTPUsername,
+		SMTPPassword:    cfg.Alerts.SMTPPassword,
+		SMTPFrom:        cfg.Alerts.SMTPFrom,
+		SMTPTo:          cfg.Alerts.SMTPTo,
+		SMTPTLS:         cfg.Alerts.SMTPTLS,
+		CooldownPeriod:  time.Duration(cfg.Alerts.CooldownMinutes) * time.Minute,
+		MaxSendAttempts: cfg.Alerts.MaxSendAttempts,
+		InitialBackoff:  time.Duration(cfg.Alerts.InitialBackoffMS) * time.Millisecond,
 	}
 
 	// Validate notification config if any alerts are enabled

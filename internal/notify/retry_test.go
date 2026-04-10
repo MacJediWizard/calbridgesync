@@ -16,7 +16,7 @@ import (
 // the retry loop ever sleeping or running a second attempt.
 func TestRetryTransient_ReturnsNilOnFirstSuccess(t *testing.T) {
 	var attempts int32
-	err := retryTransient(context.Background(), 3, func(_ context.Context) error {
+	err := retryTransient(context.Background(), 3, defaultInitialBackoff, func(_ context.Context) error {
 		atomic.AddInt32(&attempts, 1)
 		return nil
 	}, func(error) bool { return true })
@@ -35,7 +35,7 @@ func TestRetryTransient_ReturnsNilOnFirstSuccess(t *testing.T) {
 func TestRetryTransient_StopsImmediatelyOnPermanentError(t *testing.T) {
 	var attempts int32
 	permanentErr := errors.New("permanent failure")
-	err := retryTransient(context.Background(), 5, func(_ context.Context) error {
+	err := retryTransient(context.Background(), 5, defaultInitialBackoff, func(_ context.Context) error {
 		atomic.AddInt32(&attempts, 1)
 		return permanentErr
 	}, func(error) bool { return false })
@@ -53,7 +53,7 @@ func TestRetryTransient_StopsImmediatelyOnPermanentError(t *testing.T) {
 func TestRetryTransient_RetriesUpToMaxOnTransientError(t *testing.T) {
 	var attempts int32
 	transientErr := errors.New("transient failure")
-	err := retryTransient(context.Background(), 3, func(_ context.Context) error {
+	err := retryTransient(context.Background(), 3, defaultInitialBackoff, func(_ context.Context) error {
 		atomic.AddInt32(&attempts, 1)
 		return transientErr
 	}, func(error) bool { return true })
@@ -71,7 +71,7 @@ func TestRetryTransient_RetriesUpToMaxOnTransientError(t *testing.T) {
 // correct attempt count.
 func TestRetryTransient_SuccessAfterTransientFailures(t *testing.T) {
 	var attempts int32
-	err := retryTransient(context.Background(), 3, func(_ context.Context) error {
+	err := retryTransient(context.Background(), 3, defaultInitialBackoff, func(_ context.Context) error {
 		n := atomic.AddInt32(&attempts, 1)
 		if n < 3 {
 			return errors.New("still flaky")
@@ -102,7 +102,7 @@ func TestRetryTransient_RespectsContextCancellation(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err := retryTransient(ctx, 5, func(_ context.Context) error {
+	err := retryTransient(ctx, 5, defaultInitialBackoff, func(_ context.Context) error {
 		atomic.AddInt32(&attempts, 1)
 		return errors.New("always fails")
 	}, func(error) bool { return true })
@@ -122,6 +122,93 @@ func TestRetryTransient_RespectsContextCancellation(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("expected non-nil error from cancelled retry")
+	}
+}
+
+// TestNotifier_MaxSendAttempts_DefaultWhenZero verifies that a
+// zero-valued Config.MaxSendAttempts falls back to the package default
+// rather than meaning "zero attempts" (which would silence all alerts).
+// Issue #64.
+func TestNotifier_MaxSendAttempts_DefaultWhenZero(t *testing.T) {
+	n := New(&Config{MaxSendAttempts: 0})
+	if got := n.maxSendAttempts(); got != defaultMaxSendAttempts {
+		t.Errorf("expected default %d, got %d", defaultMaxSendAttempts, got)
+	}
+}
+
+// TestNotifier_MaxSendAttempts_Configured verifies that a non-zero
+// Config.MaxSendAttempts is honored. Operators tuning via
+// ALERT_MAX_SEND_ATTEMPTS should see their value take effect.
+func TestNotifier_MaxSendAttempts_Configured(t *testing.T) {
+	n := New(&Config{MaxSendAttempts: 5})
+	if got := n.maxSendAttempts(); got != 5 {
+		t.Errorf("expected configured 5, got %d", got)
+	}
+}
+
+// TestNotifier_InitialBackoff_DefaultWhenZero verifies that a
+// zero-valued Config.InitialBackoff falls back to the package default
+// rather than meaning "no backoff at all" (which would hammer the
+// endpoint with no delay between retries). Issue #64.
+func TestNotifier_InitialBackoff_DefaultWhenZero(t *testing.T) {
+	n := New(&Config{InitialBackoff: 0})
+	if got := n.initialBackoff(); got != defaultInitialBackoff {
+		t.Errorf("expected default %v, got %v", defaultInitialBackoff, got)
+	}
+}
+
+// TestNotifier_InitialBackoff_Configured verifies that a non-zero
+// Config.InitialBackoff is honored.
+func TestNotifier_InitialBackoff_Configured(t *testing.T) {
+	want := 250 * time.Millisecond
+	n := New(&Config{InitialBackoff: want})
+	if got := n.initialBackoff(); got != want {
+		t.Errorf("expected configured %v, got %v", want, got)
+	}
+}
+
+// TestRetryTransient_HonorsInitialBackoffArgument verifies that the
+// initialBackoff parameter actually controls the delay between
+// retries. A 10ms backoff should complete 3 attempts very quickly;
+// a 200ms backoff should take noticeably longer.
+func TestRetryTransient_HonorsInitialBackoffArgument(t *testing.T) {
+	var attempts int32
+	fast := time.Now()
+	err := retryTransient(context.Background(), 3, 10*time.Millisecond, func(_ context.Context) error {
+		atomic.AddInt32(&attempts, 1)
+		return errors.New("transient")
+	}, func(error) bool { return true })
+	fastElapsed := time.Since(fast)
+	if err == nil {
+		t.Error("expected error after exhausted retries")
+	}
+	if atomic.LoadInt32(&attempts) != 3 {
+		t.Errorf("expected 3 attempts, got %d", atomic.LoadInt32(&attempts))
+	}
+	// 3 attempts with 10ms initial backoff: delays of 10ms + 20ms = 30ms
+	// plus jitter ≤ 7.5ms = 37.5ms worst case. Give 500ms headroom for
+	// scheduler variance.
+	if fastElapsed > 500*time.Millisecond {
+		t.Errorf("fast backoff took too long: %v", fastElapsed)
+	}
+}
+
+// TestRetryTransient_ZeroInitialBackoffFallsBackToDefault verifies the
+// zero-value safety: callers who pass 0 for initialBackoff get the
+// package default instead of "no delay at all".
+func TestRetryTransient_ZeroInitialBackoffFallsBackToDefault(t *testing.T) {
+	var attempts int32
+	start := time.Now()
+	_ = retryTransient(context.Background(), 2, 0, func(_ context.Context) error {
+		atomic.AddInt32(&attempts, 1)
+		return errors.New("transient")
+	}, func(error) bool { return true })
+	elapsed := time.Since(start)
+	// 2 attempts with defaultInitialBackoff (500ms): one delay of 500ms.
+	// The zero fallback means we must have slept at least close to
+	// defaultInitialBackoff, not 0.
+	if elapsed < defaultInitialBackoff/2 {
+		t.Errorf("zero initialBackoff appears to have used 0 instead of default; elapsed=%v", elapsed)
 	}
 }
 

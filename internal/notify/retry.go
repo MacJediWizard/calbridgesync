@@ -29,7 +29,7 @@ const defaultInitialBackoff = 500 * time.Millisecond
 // cancelled while waiting to retry, the function returns the last error
 // immediately rather than waiting out the full backoff.
 //
-// Backoff sequence with defaultInitialBackoff=500ms:
+// Backoff sequence with initialBackoff=500ms:
 //
 //	attempt 1: no delay
 //	attempt 2: 500ms + jitter (retry after first failure)
@@ -37,15 +37,22 @@ const defaultInitialBackoff = 500 * time.Millisecond
 //
 // Jitter is uniform random in [0, backoff/4) to avoid thundering-herd
 // retries from multiple concurrent failed sends synchronizing.
-func retryTransient(ctx context.Context, maxAttempts int, fn func(ctx context.Context) error, isTransient func(error) bool) error {
+//
+// initialBackoff controls the base delay before the first retry; it
+// was introduced in Issue #64 to allow per-notifier tuning via env
+// vars. A zero or negative value falls back to defaultInitialBackoff.
+func retryTransient(ctx context.Context, maxAttempts int, initialBackoff time.Duration, fn func(ctx context.Context) error, isTransient func(error) bool) error {
 	if maxAttempts < 1 {
 		maxAttempts = 1
+	}
+	if initialBackoff <= 0 {
+		initialBackoff = defaultInitialBackoff
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff with jitter.
-			backoff := defaultInitialBackoff * time.Duration(1<<(attempt-1))
+			backoff := initialBackoff * time.Duration(1<<(attempt-1))
 			jitterMax := int64(backoff / 4)
 			var jitter time.Duration
 			if jitterMax > 0 {
