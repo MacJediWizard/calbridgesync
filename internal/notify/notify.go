@@ -250,8 +250,12 @@ func (n *Notifier) SendStaleAlert(ctx context.Context, sourceID, sourceName, use
 		Timestamp:  time.Now(),
 	}
 
-	// Send in background to not block
-	go n.send(ctx, alert)
+	// Send in background to not block. Wrapped in a closure with
+	// recoverPanic to prevent a crash in send() from killing the daemon.
+	go func() {
+		defer recoverPanic("notify.SendStaleAlert")
+		n.send(ctx, alert)
+	}()
 	return true
 }
 
@@ -280,7 +284,10 @@ func (n *Notifier) SendRecoveryAlert(ctx context.Context, sourceID, sourceName, 
 		Timestamp:  time.Now(),
 	}
 
-	go n.send(ctx, alert)
+	go func() {
+		defer recoverPanic("notify.SendRecoveryAlert")
+		n.send(ctx, alert)
+	}()
 	return true
 }
 
@@ -574,14 +581,26 @@ func (n *Notifier) SendStaleAlertWithPrefs(ctx context.Context, sourceID, source
 	// Send in background so the scheduler tick isn't blocked by SMTP
 	// or webhook latency. The cooldown is recorded inside the goroutine
 	// only if sendWithPrefs reports that at least one channel delivered.
+	//
+	// Defer ordering matters: the cleanup defer is declared FIRST so it
+	// runs LAST (LIFO), and recoverPanic is declared SECOND so it runs
+	// FIRST. If sendWithPrefs panics, recoverPanic catches it (delivered
+	// stays false from its zero value), then the cleanup runs — which
+	// clears the in-flight guard but does NOT record a cooldown. Without
+	// this ordering a panic would propagate out of the cleanup defer
+	// and crash the daemon.
 	go func() {
-		delivered := n.sendWithPrefs(ctx, alert, userPrefs)
-		n.mu.Lock()
-		delete(n.inFlightAlerts, inFlightKey)
-		if delivered {
-			n.lastAlertTimes[sourceID] = time.Now()
-		}
-		n.mu.Unlock()
+		var delivered bool
+		defer func() {
+			n.mu.Lock()
+			delete(n.inFlightAlerts, inFlightKey)
+			if delivered {
+				n.lastAlertTimes[sourceID] = time.Now()
+			}
+			n.mu.Unlock()
+		}()
+		defer recoverPanic("notify.SendStaleAlertWithPrefs")
+		delivered = n.sendWithPrefs(ctx, alert, userPrefs)
 	}()
 	return true
 }
@@ -611,7 +630,12 @@ func (n *Notifier) SendRecoveryAlertWithPrefs(ctx context.Context, sourceID, sou
 		Timestamp:  time.Now(),
 	}
 
-	go n.sendWithPrefs(ctx, alert, userPrefs)
+	// Recovery alerts don't have in-flight state (they clear state
+	// synchronously above), so the goroutine only needs panic recovery.
+	go func() {
+		defer recoverPanic("notify.SendRecoveryAlertWithPrefs")
+		n.sendWithPrefs(ctx, alert, userPrefs)
+	}()
 	return true
 }
 
@@ -681,14 +705,25 @@ func (n *Notifier) SendSyncFailureAlertWithPrefs(
 
 	// Send in background. Cooldown is recorded inside the goroutine only
 	// if at least one channel delivered.
+	//
+	// Defer ordering (LIFO): cleanup declared first so it runs LAST,
+	// recoverPanic declared second so it runs FIRST. A panic in
+	// sendWithPrefs is caught, delivered stays false, cleanup still
+	// clears in-flight but does NOT record the cooldown — preserving
+	// the "failed send does not consume cooldown" contract from
+	// Issue #33 even across panics.
 	go func() {
-		delivered := n.sendWithPrefs(ctx, alert, userPrefs)
-		n.mu.Lock()
-		delete(n.inFlightAlerts, inFlightKey)
-		if delivered {
-			n.lastFailureAlertTimes[sourceID] = time.Now()
-		}
-		n.mu.Unlock()
+		var delivered bool
+		defer func() {
+			n.mu.Lock()
+			delete(n.inFlightAlerts, inFlightKey)
+			if delivered {
+				n.lastFailureAlertTimes[sourceID] = time.Now()
+			}
+			n.mu.Unlock()
+		}()
+		defer recoverPanic("notify.SendSyncFailureAlertWithPrefs")
+		delivered = n.sendWithPrefs(ctx, alert, userPrefs)
 	}()
 	return true
 }
