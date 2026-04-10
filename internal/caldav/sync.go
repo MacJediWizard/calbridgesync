@@ -976,11 +976,13 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		}
 	}
 
-	// Clean up duplicate events on destination
-	duplicatesRemoved := se.cleanupDuplicates(ctx, destClient, destCalendarPath, sourceEventMap)
-	result.DuplicatesRemoved = duplicatesRemoved
-	if duplicatesRemoved > 0 {
-		log.Printf("Removed %d duplicate events from destination", duplicatesRemoved)
+	// Clean up duplicate events on destination. cleanupDuplicates writes
+	// directly into result (DuplicatesRemoved count + any Warnings for
+	// failed deletes) so delete failures are visible to callers instead
+	// of being log-only swallowed.
+	se.cleanupDuplicates(ctx, destClient, destCalendarPath, sourceEventMap, result)
+	if result.DuplicatesRemoved > 0 {
+		log.Printf("Removed %d duplicate events from destination", result.DuplicatesRemoved)
 	}
 
 	// Update synced_events table with current state
@@ -1000,15 +1002,30 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 
 // cleanupDuplicates removes duplicate events from destination calendar.
 // It groups events by Summary+StartTime and keeps the one matching a source UID,
-// or the first one if no match. Returns the number of duplicates removed.
-func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client, destCalendarPath string, sourceEventMap map[string]Event) int {
+// or the first one if no match.
+//
+// Writes into result:
+//   - result.DuplicatesRemoved is incremented for each successful delete
+//   - result.Warnings is appended for each delete failure, each GetEvents
+//     failure (which causes the whole cleanup to abort), and each
+//     destination re-fetch failure
+//
+// Previously this function returned an int (removed count) and logged
+// delete failures without surfacing them to the caller. That meant the
+// dashboard reported "N duplicates removed" when the real number could
+// be lower, and individual failures were invisible to users. Issue #55
+// changed the signature to pass *SyncResult through so failures are
+// observable.
+func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client, destCalendarPath string, sourceEventMap map[string]Event, result *SyncResult) {
 	log.Printf("Starting duplicate cleanup for destination: %s", destCalendarPath)
 
 	// Re-fetch destination events to get current state
 	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
 	if err != nil {
 		log.Printf("Failed to get destination events for duplicate cleanup: %v", err)
-		return 0
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("duplicate cleanup aborted: failed to fetch destination events: %v", err))
+		return
 	}
 	log.Printf("Fetched %d destination events for duplicate check", len(destEvents))
 
@@ -1030,7 +1047,6 @@ func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client,
 	}
 
 	// Find and delete duplicates
-	duplicatesRemoved := 0
 	duplicateGroups := 0
 	for key, group := range groups {
 		if len(group.events) <= 1 {
@@ -1060,14 +1076,17 @@ func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client,
 			log.Printf("Deleting duplicate event: %s (UID: %s)", event.Path, event.UID)
 			if err := destClient.DeleteEvent(ctx, event.Path); err != nil {
 				log.Printf("Failed to delete duplicate event %s: %v", event.Path, err)
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("failed to delete duplicate event %s (UID: %s): %v",
+						event.Path, event.UID, err))
 			} else {
-				duplicatesRemoved++
+				result.DuplicatesRemoved++
 			}
 		}
 	}
 
-	log.Printf("Duplicate cleanup complete: found %d duplicate groups, removed %d events", duplicateGroups, duplicatesRemoved)
-	return duplicatesRemoved
+	log.Printf("Duplicate cleanup complete: found %d duplicate groups, removed %d events",
+		duplicateGroups, result.DuplicatesRemoved)
 }
 
 // syncICSSource syncs events from a read-only ICS feed to a CalDAV destination.
