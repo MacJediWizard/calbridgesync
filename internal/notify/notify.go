@@ -320,7 +320,15 @@ func (n *Notifier) sendWebhook(ctx context.Context, alert Alert) error {
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
-			return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+			statusErr := fmt.Errorf("webhook returned status %d", resp.StatusCode)
+			// On 429, honor the Retry-After header if present. Issue #66.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return &RetryAfterError{
+					Underlying: statusErr,
+					RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+				}
+			}
+			return statusErr
 		}
 
 		log.Printf("[Notify] Webhook sent: %s", alert.Message)
@@ -835,7 +843,15 @@ func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
-			return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+			statusErr := fmt.Errorf("webhook returned status %d", resp.StatusCode)
+			// On 429, honor Retry-After. Issue #66.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return &RetryAfterError{
+					Underlying: statusErr,
+					RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+				}
+			}
+			return statusErr
 		}
 
 		log.Printf("[Notify] User webhook sent: %s", alert.Message)
