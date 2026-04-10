@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -87,36 +89,44 @@ func (c *Checker) Check(ctx context.Context) *Report {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	// Database check
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		check := c.checkDatabase(ctx)
-		mu.Lock()
-		report.Checks["database"] = check
-		mu.Unlock()
-	}()
-
-	// OIDC check
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		check := c.checkOIDC(ctx)
-		mu.Lock()
-		report.Checks["oidc"] = check
-		mu.Unlock()
-	}()
-
-	// CalDAV check (optional)
-	if c.caldavURL != "" {
+	// runCheck launches a health check in a panic-safe goroutine. If the
+	// check function panics, the panic is recovered, logged with a stack
+	// trace, AND the report entry is populated with a synthetic
+	// "Unhealthy" check so the HTTP caller sees a degraded status for
+	// that component instead of a missing key (which downstream code
+	// might misinterpret as "not checked"). Without this recovery, a
+	// panic in one check would bypass wg.Done(), leaving wg.Wait()
+	// hung forever and eventually exhausting the HTTP server's
+	// goroutine pool — a single malformed /health request would
+	// become a DoS vector.
+	runCheck := func(name string, fn func(context.Context) Check) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			check := c.checkCalDAV(ctx)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[PANIC] health.check.%s: %v\n%s", name, r, debug.Stack())
+					mu.Lock()
+					report.Checks[name] = Check{
+						Name:    name,
+						Status:  StatusUnhealthy,
+						Message: fmt.Sprintf("check panicked: %v", r),
+					}
+					mu.Unlock()
+				}
+			}()
+
+			check := fn(ctx)
 			mu.Lock()
-			report.Checks["caldav"] = check
+			report.Checks[name] = check
 			mu.Unlock()
 		}()
+	}
+
+	runCheck("database", c.checkDatabase)
+	runCheck("oidc", c.checkOIDC)
+	if c.caldavURL != "" {
+		runCheck("caldav", c.checkCalDAV)
 	}
 
 	wg.Wait()
