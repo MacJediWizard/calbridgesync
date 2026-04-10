@@ -20,11 +20,11 @@ import (
 )
 
 var (
-	ErrConnectionFailed  = errors.New("connection failed")
-	ErrAuthFailed        = errors.New("authentication failed")
-	ErrNotFound          = errors.New("resource not found")
-	ErrInvalidResponse   = errors.New("invalid server response")
-	ErrMalformedContent  = errors.New("malformed calendar content")
+	ErrConnectionFailed = errors.New("connection failed")
+	ErrAuthFailed       = errors.New("authentication failed")
+	ErrNotFound         = errors.New("resource not found")
+	ErrInvalidResponse  = errors.New("invalid server response")
+	ErrMalformedContent = errors.New("malformed calendar content")
 )
 
 const (
@@ -333,28 +333,38 @@ func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths 
 			ETag: obj.ETag,
 		}
 
-		if obj.Data != nil {
-			event.Data = encodeCalendar(obj.Data)
-
-			for _, evt := range obj.Data.Events() {
-				if uid, err := evt.Props.Text(ical.PropUID); err == nil {
-					event.UID = uid
-				}
-				if summary, err := evt.Props.Text(ical.PropSummary); err == nil {
-					event.Summary = summary
-				}
-				if dtstart := evt.Props.Get(ical.PropDateTimeStart); dtstart != nil {
-					event.StartTime = normalizeStartTime(dtstart)
-				}
-			}
-		}
-
-		if event.Data == "" {
+		if obj.Data == nil {
 			if collector != nil {
-				collector.Add(obj.Path, "empty iCalendar data - event may be corrupted or deleted")
+				collector.Add(obj.Path, "nil iCalendar data - event may be corrupted or deleted")
 			}
 			skippedEmpty++
 			continue
+		}
+
+		data, encErr := encodeCalendar(obj.Data)
+		if encErr != nil {
+			// Encode failure is a form of malformed content — the go-ical
+			// encoder rejected calendar data that the library itself had
+			// just parsed. Track it distinctly from the "empty data" case
+			// so the dashboard can surface the real cause.
+			if collector != nil {
+				collector.Add(obj.Path, fmt.Sprintf("failed to encode event: %v", encErr))
+			}
+			skippedMalformed++
+			continue
+		}
+		event.Data = data
+
+		for _, evt := range obj.Data.Events() {
+			if uid, err := evt.Props.Text(ical.PropUID); err == nil {
+				event.UID = uid
+			}
+			if summary, err := evt.Props.Text(ical.PropSummary); err == nil {
+				event.Summary = summary
+			}
+			if dtstart := evt.Props.Get(ical.PropDateTimeStart); dtstart != nil {
+				event.StartTime = normalizeStartTime(dtstart)
+			}
 		}
 
 		events = append(events, event)
@@ -395,31 +405,42 @@ func (c *Client) getEventsIndividually(ctx context.Context, paths []string, coll
 	return events, skippedMalformed, skippedEmpty
 }
 
-// objectsToEvents converts CalDAV objects to Events.
+// objectsToEvents converts CalDAV objects to Events. Events that fail to
+// encode (or have nil data) are skipped and logged — the returned slice
+// may have fewer entries than the input. This is safer than the prior
+// behavior, which silently stored Event{Data: ""} values that then flowed
+// into the sync engine as if they were valid events.
 func (c *Client) objectsToEvents(objects []caldav.CalendarObject) []Event {
 	events := make([]Event, 0, len(objects))
 	for _, obj := range objects {
+		if obj.Data == nil {
+			log.Printf("objectsToEvents: skipping %s with nil data", obj.Path)
+			continue
+		}
+
+		data, encErr := encodeCalendar(obj.Data)
+		if encErr != nil {
+			log.Printf("objectsToEvents: skipping %s, encode failed: %v", obj.Path, encErr)
+			continue
+		}
+
 		event := Event{
 			Path: obj.Path,
 			ETag: obj.ETag,
+			Data: data,
 		}
 
-		if obj.Data != nil {
-			// Encode the calendar to string
-			event.Data = encodeCalendar(obj.Data)
-
-			// Extract UID, Summary, and StartTime from events
-			for _, evt := range obj.Data.Events() {
-				if uid, err := evt.Props.Text(ical.PropUID); err == nil {
-					event.UID = uid
-				}
-				if summary, err := evt.Props.Text(ical.PropSummary); err == nil {
-					event.Summary = summary
-				}
-				// Extract start time for deduplication (normalized to UTC)
-				if dtstart := evt.Props.Get(ical.PropDateTimeStart); dtstart != nil {
-					event.StartTime = normalizeStartTime(dtstart)
-				}
+		// Extract UID, Summary, and StartTime from events
+		for _, evt := range obj.Data.Events() {
+			if uid, err := evt.Props.Text(ical.PropUID); err == nil {
+				event.UID = uid
+			}
+			if summary, err := evt.Props.Text(ical.PropSummary); err == nil {
+				event.Summary = summary
+			}
+			// Extract start time for deduplication (normalized to UTC)
+			if dtstart := evt.Props.Get(ical.PropDateTimeStart); dtstart != nil {
+				event.StartTime = normalizeStartTime(dtstart)
 			}
 		}
 
@@ -550,7 +571,16 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	}
 
 	if obj.Data != nil {
-		event.Data = encodeCalendar(obj.Data)
+		data, encErr := encodeCalendar(obj.Data)
+		if encErr != nil {
+			// Encode failure is a form of malformed content. Return an
+			// error so getEventsIndividually's existing malformed-error
+			// detection classifies this correctly and records it in the
+			// MalformedEventCollector, rather than silently returning an
+			// Event{Data: ""} that downstream code would treat as valid.
+			return nil, encErr
+		}
+		event.Data = data
 
 		for _, evt := range obj.Data.Events() {
 			if uid, err := evt.Props.Text(ical.PropUID); err == nil {
@@ -635,14 +665,30 @@ func parseICalendar(data string) (*ical.Calendar, error) {
 	return cal, nil
 }
 
-// encodeCalendar encodes a calendar object to iCalendar string.
-func encodeCalendar(cal *ical.Calendar) string {
+// encodeCalendar encodes a calendar object to iCalendar string form.
+//
+// Returns an error wrapping ErrMalformedContent if the go-ical encoder
+// fails. Previously this function silently returned an empty string on
+// encode failure, which led to three distinct forms of data corruption:
+//
+//  1. getEventsBatch misclassified encode failures as "empty iCalendar
+//     data" in the MalformedEventCollector, hiding the real cause.
+//  2. objectsToEvents silently stored Event{Data: ""} in its returned
+//     slice and never checked, letting corrupt events flow into the
+//     sync engine as if they were normal.
+//  3. GetEvent returned a zero-Data Event with err == nil, so callers
+//     believed the fetch had succeeded.
+//
+// All callers now MUST handle the error explicitly. Encode failures
+// should be treated as malformed events — recorded in a collector where
+// one is available, logged where one is not, and the event skipped.
+func encodeCalendar(cal *ical.Calendar) (string, error) {
 	var buf bytes.Buffer
 	enc := ical.NewEncoder(&buf)
 	if err := enc.Encode(cal); err != nil {
-		return ""
+		return "", fmt.Errorf("%w: %w", ErrMalformedContent, err)
 	}
-	return buf.String()
+	return buf.String(), nil
 }
 
 // normalizeStartTime converts a DTSTART property to a normalized UTC string for comparison.

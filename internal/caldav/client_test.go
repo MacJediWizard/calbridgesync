@@ -16,9 +16,9 @@ import (
 
 func TestEventDedupeKey(t *testing.T) {
 	testCases := []struct {
-		name      string
-		event     Event
-		expected  string
+		name     string
+		event    Event
+		expected string
 	}{
 		{
 			name: "combines summary and start time",
@@ -962,7 +962,10 @@ func TestEncodeCalendar(t *testing.T) {
 			t.Fatalf("failed to parse: %v", err)
 		}
 
-		result := encodeCalendar(cal)
+		result, err := encodeCalendar(cal)
+		if err != nil {
+			t.Fatalf("unexpected encode error: %v", err)
+		}
 		if result == "" {
 			t.Error("expected non-empty result")
 		}
@@ -979,18 +982,27 @@ func TestEncodeCalendar(t *testing.T) {
 		}
 	})
 
-	t.Run("returns empty string when encoding fails", func(t *testing.T) {
-		// Create a calendar missing required DTSTAMP - encoding should fail
+	t.Run("returns ErrMalformedContent when encoding fails", func(t *testing.T) {
+		// Create a calendar missing required DTSTAMP - encoding should fail.
+		// Previously the function silently returned an empty string; now
+		// it must return a wrapped ErrMalformedContent so callers can
+		// classify this as a malformed event.
 		data := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//Test//EN\r\nBEGIN:VEVENT\r\nUID:test-uid@example.com\r\nDTSTART:20240115T140000Z\r\nSUMMARY:Test Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 
-		cal, err := parseICalendar(data)
-		if err != nil {
-			t.Fatalf("failed to parse: %v", err)
+		cal, parseErr := parseICalendar(data)
+		if parseErr != nil {
+			t.Fatalf("failed to parse: %v", parseErr)
 		}
 
-		result := encodeCalendar(cal)
+		result, err := encodeCalendar(cal)
+		if err == nil {
+			t.Fatal("expected an error when encoding a calendar missing required DTSTAMP, got nil")
+		}
+		if !errors.Is(err, ErrMalformedContent) {
+			t.Errorf("expected wrapped ErrMalformedContent, got %v", err)
+		}
 		if result != "" {
-			t.Error("expected empty string when encoding fails due to missing DTSTAMP")
+			t.Errorf("expected empty string on error, got %q", result)
 		}
 	})
 }
@@ -1558,7 +1570,14 @@ func TestObjectsToEvents(t *testing.T) {
 		}
 	})
 
-	t.Run("converts object without data", func(t *testing.T) {
+	t.Run("skips object with nil data", func(t *testing.T) {
+		// Issue #29 fix: objects with nil Data are silent-corruption
+		// sources and must NOT be returned to the sync engine as
+		// Event{Data: ""}. The previous behavior returned them with
+		// empty Data, which then flowed into PutEvent at call sites
+		// that didn't bother to check event.Data first. Now they
+		// are logged and skipped so the returned slice only contains
+		// events with valid content.
 		objects := []caldav.CalendarObject{
 			{
 				Path: "/calendars/user/default/event1.ics",
@@ -1567,18 +1586,8 @@ func TestObjectsToEvents(t *testing.T) {
 		}
 
 		events := client.objectsToEvents(objects)
-		if len(events) != 1 {
-			t.Fatalf("expected 1 event, got %d", len(events))
-		}
-
-		if events[0].Path != "/calendars/user/default/event1.ics" {
-			t.Errorf("expected path, got %q", events[0].Path)
-		}
-		if events[0].ETag != "etag123" {
-			t.Errorf("expected etag, got %q", events[0].ETag)
-		}
-		if events[0].Data != "" {
-			t.Errorf("expected empty data, got %q", events[0].Data)
+		if len(events) != 0 {
+			t.Fatalf("expected nil-data object to be skipped, got %d events", len(events))
 		}
 	})
 
