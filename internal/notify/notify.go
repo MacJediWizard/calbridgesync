@@ -75,7 +75,11 @@ type Notifier struct {
 	cfg        *Config
 	httpClient *http.Client
 
-	// Track last alert time per source to implement cooldown
+	// Track last SUCCESSFUL alert time per source to implement cooldown.
+	// Previously this was set BEFORE the background send fired, so a
+	// failed send still consumed the cooldown window. Since Issue #33,
+	// the timestamp is recorded only after sendWithPrefs confirms at
+	// least one channel delivered.
 	mu             sync.RWMutex
 	lastAlertTimes map[string]time.Time
 	staleState     map[string]bool // Track if source is currently in stale state
@@ -84,6 +88,14 @@ type Notifier struct {
 	// source that is both stale and failing doesn't lose one signal because
 	// the other already consumed the cooldown window.
 	lastFailureAlertTimes map[string]time.Time
+
+	// inFlightAlerts tracks sends that have been queued but not yet
+	// completed, keyed by sourceID. Prevents duplicate alerts when
+	// concurrent callers both see "no cooldown set" and both try to
+	// fire. The flag is set synchronously in the Send* method and
+	// cleared inside the background goroutine after sendWithPrefs
+	// returns, regardless of delivery success.
+	inFlightAlerts map[string]bool
 }
 
 // New creates a new Notifier.
@@ -96,6 +108,7 @@ func New(cfg *Config) *Notifier {
 		lastAlertTimes:        make(map[string]time.Time),
 		staleState:            make(map[string]bool),
 		lastFailureAlertTimes: make(map[string]time.Time),
+		inFlightAlerts:        make(map[string]bool),
 	}
 }
 
@@ -462,11 +475,14 @@ func (n *Notifier) sendEmailTLS(addr string, auth smtp.Auth, from string, to []s
 }
 
 // ClearStaleState clears the stale state for a source (used on source deletion).
+// Also clears any in-flight stale alert guard so a new source reusing the
+// same ID starts with a clean slate.
 func (n *Notifier) ClearStaleState(sourceID string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	delete(n.staleState, sourceID)
 	delete(n.lastAlertTimes, sourceID)
+	delete(n.inFlightAlerts, "stale:"+sourceID)
 }
 
 // GetStaleSourceIDs returns a list of currently stale source IDs.
@@ -485,23 +501,46 @@ func (n *Notifier) GetStaleSourceIDs() []string {
 
 // SendStaleAlertWithPrefs sends an alert for a stale source using per-user preferences.
 // userPrefs can be nil to use global defaults only.
+//
+// Since Issue #33, the cooldown timestamp is recorded only AFTER the
+// background send reports successful delivery. Previously it was set
+// synchronously before the goroutine fired, which meant a failed send
+// consumed the cooldown and the user got zero alerts for the entire
+// cooldown period on a broken alert endpoint.
+//
+// To prevent concurrent duplicate sends (two callers both seeing no
+// cooldown and both firing), an inFlightAlerts guard suppresses overlap
+// while a previous send is still in-flight.
 func (n *Notifier) SendStaleAlertWithPrefs(ctx context.Context, sourceID, sourceName, userEmail string, timeSinceSync, threshold time.Duration, userPrefs *UserPreferences) bool {
 	cooldown := n.getCooldownPeriod(userPrefs)
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	// inFlightAlerts is keyed by "{type}:{sourceID}" so stale and failure
+	// alerts have independent in-flight slots and can fire concurrently
+	// for the same source.
+	inFlightKey := "stale:" + sourceID
 
-	// Check if already in stale state and in cooldown
+	n.mu.Lock()
+
+	// Check if already in stale state and in cooldown. lastAlertTimes
+	// now reflects the last SUCCESSFUL delivery, so a failed prior send
+	// won't block this one.
 	if n.staleState[sourceID] {
-		lastAlert, exists := n.lastAlertTimes[sourceID]
-		if exists && time.Since(lastAlert) < cooldown {
+		if lastAlert, exists := n.lastAlertTimes[sourceID]; exists && time.Since(lastAlert) < cooldown {
+			n.mu.Unlock()
 			return false // Still in cooldown
 		}
 	}
 
-	// Mark as stale and update alert time
+	// Deduplication: if a stale alert for this source is already in
+	// flight, suppress this one to avoid two concurrent sends.
+	if n.inFlightAlerts[inFlightKey] {
+		n.mu.Unlock()
+		return false
+	}
+	n.inFlightAlerts[inFlightKey] = true
 	n.staleState[sourceID] = true
-	n.lastAlertTimes[sourceID] = time.Now()
+
+	n.mu.Unlock()
 
 	alert := Alert{
 		Type:       AlertTypeStale,
@@ -513,8 +552,18 @@ func (n *Notifier) SendStaleAlertWithPrefs(ctx context.Context, sourceID, source
 		Timestamp:  time.Now(),
 	}
 
-	// Send in background to not block
-	go n.sendWithPrefs(ctx, alert, userPrefs)
+	// Send in background so the scheduler tick isn't blocked by SMTP
+	// or webhook latency. The cooldown is recorded inside the goroutine
+	// only if sendWithPrefs reports that at least one channel delivered.
+	go func() {
+		delivered := n.sendWithPrefs(ctx, alert, userPrefs)
+		n.mu.Lock()
+		delete(n.inFlightAlerts, inFlightKey)
+		if delivered {
+			n.lastAlertTimes[sourceID] = time.Now()
+		}
+		n.mu.Unlock()
+	}()
 	return true
 }
 
@@ -563,28 +612,43 @@ func (n *Notifier) getCooldownPeriod(userPrefs *UserPreferences) time.Duration {
 // a source that is both stale AND failing will not lose one signal because
 // the other already consumed the cooldown.
 //
+// Since Issue #33, the cooldown timestamp is recorded only AFTER the
+// background send reports successful delivery. Previously it was set
+// synchronously before the goroutine fired, which meant a failed send
+// consumed the cooldown for the full window.
+//
 // errorMessage is a short human-readable summary shown in the alert subject.
 // details is the full error/warning text shown in the alert body.
 //
-// Returns true if the alert was queued for send, false if still in cooldown.
+// Returns true if the alert was queued for send, false if still in cooldown
+// or a prior send is still in flight.
 func (n *Notifier) SendSyncFailureAlertWithPrefs(
 	ctx context.Context,
 	sourceID, sourceName, userEmail, errorMessage, details string,
 	userPrefs *UserPreferences,
 ) bool {
 	cooldown := n.getCooldownPeriod(userPrefs)
+	inFlightKey := "failure:" + sourceID
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	// Cooldown check — failure alerts use their own map, independent of
-	// the stale-alert cooldown.
-	if lastAlert, exists := n.lastFailureAlertTimes[sourceID]; exists {
-		if time.Since(lastAlert) < cooldown {
-			return false
-		}
+	// the stale-alert cooldown. lastFailureAlertTimes now reflects the
+	// last SUCCESSFUL delivery.
+	if lastAlert, exists := n.lastFailureAlertTimes[sourceID]; exists && time.Since(lastAlert) < cooldown {
+		n.mu.Unlock()
+		return false
 	}
-	n.lastFailureAlertTimes[sourceID] = time.Now()
+
+	// Deduplication: if a failure alert for this source is already in
+	// flight, suppress this one.
+	if n.inFlightAlerts[inFlightKey] {
+		n.mu.Unlock()
+		return false
+	}
+	n.inFlightAlerts[inFlightKey] = true
+
+	n.mu.Unlock()
 
 	alert := Alert{
 		Type:       AlertTypeError,
@@ -596,18 +660,29 @@ func (n *Notifier) SendSyncFailureAlertWithPrefs(
 		Timestamp:  time.Now(),
 	}
 
-	// Send in background to not block the scheduler.
-	go n.sendWithPrefs(ctx, alert, userPrefs)
+	// Send in background. Cooldown is recorded inside the goroutine only
+	// if at least one channel delivered.
+	go func() {
+		delivered := n.sendWithPrefs(ctx, alert, userPrefs)
+		n.mu.Lock()
+		delete(n.inFlightAlerts, inFlightKey)
+		if delivered {
+			n.lastFailureAlertTimes[sourceID] = time.Now()
+		}
+		n.mu.Unlock()
+	}()
 	return true
 }
 
 // ClearFailureAlertState clears the failure-alert cooldown for a source
 // (used on source deletion). Safe to call for sources that have never
-// triggered a failure alert.
+// triggered a failure alert. Also clears any in-flight failure alert
+// guard so a new source reusing the same ID starts with a clean slate.
 func (n *Notifier) ClearFailureAlertState(sourceID string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	delete(n.lastFailureAlertTimes, sourceID)
+	delete(n.inFlightAlerts, "failure:"+sourceID)
 }
 
 // IsDangerousWarning returns true if a sync warning indicates a data-loss
@@ -630,8 +705,20 @@ func IsDangerousWarning(w string) bool {
 		strings.Contains(w, "exceeds safety threshold")
 }
 
-// sendWithPrefs sends the alert via configured channels, respecting per-user preferences.
-func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *UserPreferences) {
+// sendWithPrefs sends the alert via configured channels, respecting per-user
+// preferences. Returns true if at least one configured channel delivered
+// successfully — meaning the user actually received a notification.
+// Returns false if all configured channels failed, in which case the caller
+// must NOT record the cooldown timestamp (so the next retry can fire
+// immediately instead of being silenced for the full cooldown window).
+//
+// Since Issue #33, this return value is what distinguishes
+// "alert delivered, start the cooldown" from "alert attempted but bounced,
+// please retry on the next tick".
+func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *UserPreferences) bool {
+	anyAttempted := false
+	anyDelivered := false
+
 	// Determine if webhook is enabled (user pref overrides global)
 	webhookEnabled := n.cfg.WebhookEnabled
 	if userPrefs != nil && userPrefs.WebhookEnabled != nil {
@@ -640,8 +727,11 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 
 	// Send to global webhook if enabled
 	if webhookEnabled && n.cfg.WebhookURL != "" {
+		anyAttempted = true
 		if err := n.sendWebhook(ctx, alert); err != nil {
 			log.Printf("[Notify] Webhook error: %v", err)
+		} else {
+			anyDelivered = true
 		}
 	}
 
@@ -652,8 +742,11 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 			userWebhookEnabled = *userPrefs.WebhookEnabled
 		}
 		if userWebhookEnabled {
+			anyAttempted = true
 			if err := n.sendWebhookToURL(ctx, alert, userPrefs.WebhookURL); err != nil {
 				log.Printf("[Notify] User webhook error: %v", err)
+			} else {
+				anyDelivered = true
 			}
 		}
 	}
@@ -685,11 +778,23 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 		}
 
 		if len(recipients) > 0 {
+			anyAttempted = true
 			if err := n.sendEmail(alert, recipients); err != nil {
 				log.Printf("[Notify] Email error: %v", err)
+			} else {
+				anyDelivered = true
 			}
 		}
 	}
+
+	// If no channel was even configured/attempted, treat as "delivered" so
+	// the cooldown still applies — otherwise a notifier with no channels
+	// would busy-loop the scheduler. This matches the prior fire-and-forget
+	// behavior for the no-channel case.
+	if !anyAttempted {
+		return true
+	}
+	return anyDelivered
 }
 
 // sendWebhookToURL sends a webhook to a specific URL (for user webhooks).
