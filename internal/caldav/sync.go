@@ -44,6 +44,75 @@ func getSyncDirectionForCalendar(source *db.Source, calendarPath string) db.Sync
 	return source.SyncDirection
 }
 
+// defaultOrphanDeleteRatioThreshold is the maximum fraction of previously-synced
+// events that can be deleted in a single one-way sync cycle before safety aborts.
+// Exceeding this threshold usually indicates an auth failure, broken source URL,
+// or filter misconfiguration rather than a legitimate bulk cleanup.
+const defaultOrphanDeleteRatioThreshold = 0.5
+
+// planOrphanDeletion determines which destination events should be deleted as
+// "orphans" during a one-way + source_wins sync.
+//
+// Three safety rules are enforced to prevent data loss:
+//
+//  1. Ownership: only events that this source previously synced are candidates
+//     for deletion. This prevents a multi-source setup (multiple source
+//     calendars writing to a single destination) from having sources wipe each
+//     other's events on every sync. It also preserves events created manually
+//     on the destination.
+//
+//  2. Empty-source guard: if the source returned zero events but we have prior
+//     sync records, the sync is assumed to be unhealthy (auth failure, broken
+//     URL, filter wipeout) and the entire orphan-delete pass is skipped.
+//     This mirrors the two-way guard introduced in commit b772c56.
+//
+//  3. Mass-delete threshold: if the planned deletion would remove more than
+//     maxDeleteRatio of previously-synced events in a single cycle, the entire
+//     orphan-delete pass is aborted. Normal day-to-day operation deletes a
+//     handful of events per sync; wiping more than half is almost always a bug.
+//
+// Returns the events to delete and a non-empty warning string if any safety
+// rule was triggered. When a warning is returned, toDelete is nil — the caller
+// must not perform any deletions in that case.
+func planOrphanDeletion(
+	destEventMap map[string]Event,
+	sourceEventCount int,
+	previouslySyncedMap map[string]*db.SyncedEvent,
+	maxDeleteRatio float64,
+) (toDelete []Event, warning string) {
+	// Rule 2: empty source with prior records → refuse to delete anything.
+	if sourceEventCount == 0 && len(previouslySyncedMap) > 0 {
+		return nil, fmt.Sprintf(
+			"source returned 0 events but %d previously-synced records exist - "+
+				"skipping one-way orphan deletion for safety (possible auth failure or broken source)",
+			len(previouslySyncedMap),
+		)
+	}
+
+	// Rule 1: ownership filter. Only consider events THIS source synced.
+	candidates := make([]Event, 0)
+	for uid, event := range destEventMap {
+		if _, ours := previouslySyncedMap[uid]; ours {
+			candidates = append(candidates, event)
+		}
+	}
+
+	// Rule 3: mass-delete threshold. Only applied when there is prior state
+	// to measure against and a threshold is configured.
+	if len(previouslySyncedMap) > 0 && maxDeleteRatio > 0 {
+		ratio := float64(len(candidates)) / float64(len(previouslySyncedMap))
+		if ratio > maxDeleteRatio {
+			return nil, fmt.Sprintf(
+				"one-way orphan deletion would remove %d of %d previously-synced events (%.0f%%), "+
+					"exceeds safety threshold %.0f%% - skipping deletion",
+				len(candidates), len(previouslySyncedMap), ratio*100, maxDeleteRatio*100,
+			)
+		}
+	}
+
+	return candidates, ""
+}
+
 // SyncResult represents the result of a sync operation.
 type SyncResult struct {
 	Success           bool          `json:"success"`
@@ -728,9 +797,24 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		}
 	}
 
-	// One-way sync: delete orphan events on destination
+	// One-way sync: delete orphan events on destination (with safety checks).
+	// See planOrphanDeletion for the full rationale. The bug this fixes:
+	// without these guards, a one-way source_wins sync would delete EVERY
+	// destination event whenever the source returned 0 events (auth failure,
+	// broken URL, filter wipeout) or whenever multiple sources shared a
+	// destination (each source would delete the others' events on every cycle).
 	if syncDirection == db.SyncDirectionOneWay && source.ConflictStrategy == db.ConflictSourceWins {
-		for _, event := range destEventMap {
+		toDelete, warning := planOrphanDeletion(
+			destEventMap,
+			len(sourceEvents),
+			previouslySyncedMap,
+			defaultOrphanDeleteRatioThreshold,
+		)
+		if warning != "" {
+			log.Printf("WARNING: %s", warning)
+			result.Warnings = append(result.Warnings, warning)
+		}
+		for _, event := range toDelete {
 			if err := destClient.DeleteEvent(ctx, event.Path); err != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete orphan event: %v", err))
 			} else {
