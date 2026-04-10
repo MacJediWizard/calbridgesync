@@ -1489,6 +1489,140 @@ func TestIsMalformedErrorEdgeCases(t *testing.T) {
 	}
 }
 
+// TestNormalizeMultiGetPath verifies that request and response paths
+// compare equal despite differences in URL encoding and trailing
+// slashes. Without this normalization, findDroppedMultiGetPaths would
+// produce false positives whenever the server returned a response path
+// in a slightly different form from the request.
+func TestNormalizeMultiGetPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "no changes for a plain path",
+			in:   "/cal/event123.ics",
+			want: "/cal/event123.ics",
+		},
+		{
+			name: "trailing slash stripped",
+			in:   "/cal/event123.ics/",
+			want: "/cal/event123.ics",
+		},
+		{
+			name: "URL-encoded space decoded",
+			in:   "/cal/event%20with%20space.ics",
+			want: "/cal/event with space.ics",
+		},
+		{
+			name: "URL-encoded special chars decoded",
+			in:   "/cal/%5Bbracket%5D.ics",
+			want: "/cal/[bracket].ics",
+		},
+		{
+			name: "empty string",
+			in:   "",
+			want: "",
+		},
+		{
+			name: "only slash",
+			in:   "/",
+			want: "",
+		},
+		{
+			name: "mixed encoding and trailing slash",
+			in:   "/cal/a%20b.ics/",
+			want: "/cal/a b.ics",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeMultiGetPath(tt.in)
+			if got != tt.want {
+				t.Errorf("normalizeMultiGetPath(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFindDroppedMultiGetPaths verifies the detection logic for MULTIGET
+// responses that are missing requested entries. This is the core of
+// Issue #35 — catching silent data loss that was previously invisible.
+func TestFindDroppedMultiGetPaths(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested []string
+		returned  []string
+		want      []string
+	}{
+		{
+			name:      "all paths returned, nothing dropped",
+			requested: []string{"/cal/a.ics", "/cal/b.ics", "/cal/c.ics"},
+			returned:  []string{"/cal/a.ics", "/cal/b.ics", "/cal/c.ics"},
+			want:      nil,
+		},
+		{
+			name:      "one path dropped",
+			requested: []string{"/cal/a.ics", "/cal/b.ics", "/cal/c.ics"},
+			returned:  []string{"/cal/a.ics", "/cal/c.ics"},
+			want:      []string{"/cal/b.ics"},
+		},
+		{
+			name:      "multiple paths dropped",
+			requested: []string{"/cal/a.ics", "/cal/b.ics", "/cal/c.ics", "/cal/d.ics"},
+			returned:  []string{"/cal/a.ics", "/cal/d.ics"},
+			want:      []string{"/cal/b.ics", "/cal/c.ics"},
+		},
+		{
+			name:      "all dropped (empty response)",
+			requested: []string{"/cal/a.ics", "/cal/b.ics"},
+			returned:  []string{},
+			want:      []string{"/cal/a.ics", "/cal/b.ics"},
+		},
+		{
+			name:      "empty request returns empty result",
+			requested: nil,
+			returned:  []string{"/unexpected.ics"},
+			want:      nil,
+		},
+		{
+			name:      "URL-encoding differences are not false positives",
+			requested: []string{"/cal/event with space.ics", "/cal/plain.ics"},
+			returned:  []string{"/cal/event%20with%20space.ics", "/cal/plain.ics"},
+			want:      nil,
+		},
+		{
+			name:      "trailing-slash differences are not false positives",
+			requested: []string{"/cal/a.ics", "/cal/b.ics"},
+			returned:  []string{"/cal/a.ics/", "/cal/b.ics"},
+			want:      nil,
+		},
+		{
+			name:      "response has extra paths (shouldn't happen but shouldn't panic)",
+			requested: []string{"/cal/a.ics"},
+			returned:  []string{"/cal/a.ics", "/cal/unexpected.ics"},
+			want:      nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findDroppedMultiGetPaths(tt.requested, tt.returned)
+			if len(got) != len(tt.want) {
+				t.Fatalf("findDroppedMultiGetPaths() returned %d paths, want %d\n got = %v\nwant = %v",
+					len(got), len(tt.want), got, tt.want)
+			}
+			// Order-sensitive comparison: findDroppedMultiGetPaths iterates
+			// requested in order, so the result preserves that order.
+			for i, g := range got {
+				if g != tt.want[i] {
+					t.Errorf("findDroppedMultiGetPaths()[%d] = %q, want %q", i, g, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestMalformedEventCollectorMultipleOperations(t *testing.T) {
 	t.Run("handles large number of events", func(t *testing.T) {
 		collector := NewMalformedEventCollector()
