@@ -313,7 +313,62 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, coll
 	return events, nil
 }
 
+// normalizeMultiGetPath returns a canonical form of a CalDAV object path
+// suitable for equality comparison between a request path (which may be
+// URL-decoded by parseEventPaths) and a response path (which may be
+// URL-encoded, or have a trailing slash added by some servers).
+//
+// The comparison is intentionally loose: percent-escapes are decoded,
+// trailing slashes are trimmed. Case is preserved since CalDAV paths
+// can be case-sensitive depending on the server.
+func normalizeMultiGetPath(p string) string {
+	if decoded, err := url.PathUnescape(p); err == nil {
+		p = decoded
+	}
+	return strings.TrimRight(p, "/")
+}
+
+// findDroppedMultiGetPaths returns the subset of requestedPaths that do
+// not appear in returnedPaths, using normalized comparison. Used to
+// detect paths that the go-webdav library silently dropped during a
+// MultiGetCalendar call — typically because the library could not parse
+// that entry's response and discarded it without reporting.
+//
+// Exposed (unexported but free function) so it can be unit-tested
+// without touching the real CalDAV client.
+func findDroppedMultiGetPaths(requestedPaths, returnedPaths []string) []string {
+	if len(requestedPaths) == 0 {
+		return nil
+	}
+	returned := make(map[string]bool, len(returnedPaths))
+	for _, p := range returnedPaths {
+		returned[normalizeMultiGetPath(p)] = true
+	}
+	var dropped []string
+	for _, p := range requestedPaths {
+		if !returned[normalizeMultiGetPath(p)] {
+			dropped = append(dropped, p)
+		}
+	}
+	return dropped
+}
+
 // getEventsBatch fetches a batch of events using MULTIGET.
+//
+// Beyond the obvious "fetch these paths", this function also detects and
+// reports paths that the go-webdav library silently drops from the
+// response. The library occasionally discards entries it cannot parse,
+// and those paths vanish without any error or log — they're simply
+// missing from the returned objects slice. Before this function detected
+// that, malformed events at the protocol level were completely invisible
+// to users: the dashboard's "Corrupted Events" card stayed empty while
+// real corruption was silently losing data.
+//
+// For each dropped path, we fall back to an individual GetEvent call,
+// which returns a concrete error that we can record in the
+// MalformedEventCollector. That's one extra HTTP round-trip per dropped
+// path, but only for paths that are genuinely problematic — in normal
+// operation the fallback loop doesn't execute at all.
 func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths []string, collector *MalformedEventCollector) ([]Event, int, int, error) {
 	multiGet := &caldav.CalendarMultiGet{
 		Paths: paths,
@@ -375,6 +430,37 @@ func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths 
 		}
 
 		events = append(events, event)
+	}
+
+	// Detect paths that MULTIGET silently dropped and probe them
+	// individually. See the function doc comment for the full rationale.
+	returnedPaths := make([]string, 0, len(objects))
+	for _, obj := range objects {
+		returnedPaths = append(returnedPaths, obj.Path)
+	}
+	dropped := findDroppedMultiGetPaths(paths, returnedPaths)
+	if len(dropped) > 0 {
+		log.Printf("MULTIGET response missing %d of %d requested paths; probing individually to classify", len(dropped), len(paths))
+	}
+	for _, missingPath := range dropped {
+		_, probeErr := c.GetEvent(ctx, missingPath)
+		if probeErr != nil {
+			// Got a concrete error from the individual fetch. Record it
+			// in the collector so the user sees it on the dashboard.
+			if collector != nil {
+				collector.Add(missingPath, fmt.Sprintf("MULTIGET silently dropped this event; individual fetch returned: %v", probeErr))
+			}
+			skippedMalformed++
+			continue
+		}
+		// Individual fetch succeeded where MULTIGET didn't. This is
+		// weird but not data loss — log it so the next sync cycle's
+		// MULTIGET can try again. Don't add the recovered event to
+		// the return slice because the existing processing loop
+		// already ran without it; mixing in a late addition would
+		// require re-running all the extract logic here and we'd
+		// rather keep the happy path simple.
+		log.Printf("MULTIGET dropped %s but individual GetEvent succeeded; will retry on next sync", missingPath)
 	}
 
 	return events, skippedMalformed, skippedEmpty, nil
