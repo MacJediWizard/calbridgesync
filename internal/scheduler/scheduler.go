@@ -255,6 +255,7 @@ func (s *Scheduler) TriggerSync(sourceID string) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer recoverPanic("scheduler.TriggerSync")
 		s.executeSync(sourceID)
 	}()
 }
@@ -269,6 +270,7 @@ func (s *Scheduler) GetJobCount() int {
 // runJob runs the sync job loop.
 func (s *Scheduler) runJob(job *Job) {
 	defer s.wg.Done()
+	defer recoverPanic("scheduler.runJob")
 
 	// Run immediately on start
 	s.executeSync(job.sourceID)
@@ -291,6 +293,7 @@ func (s *Scheduler) runJob(job *Job) {
 // Used when updating interval - does NOT run immediately.
 func (s *Scheduler) runJobFromTicker(job *Job) {
 	defer s.wg.Done()
+	defer recoverPanic("scheduler.runJobFromTicker")
 
 	for {
 		select {
@@ -308,6 +311,7 @@ func (s *Scheduler) runJobFromTicker(job *Job) {
 // runJobWithDelay runs the sync job loop with an initial delay.
 func (s *Scheduler) runJobWithDelay(job *Job, initialDelay time.Duration) {
 	defer s.wg.Done()
+	defer recoverPanic("scheduler.runJobWithDelay")
 
 	// Wait for initial delay before first sync
 	if initialDelay > 0 {
@@ -493,6 +497,7 @@ func (s *Scheduler) maybeSendFailureAlert(sourceID string, source *db.Source, re
 // cleanupRoutine runs periodic cleanup of old sync logs.
 func (s *Scheduler) cleanupRoutine() {
 	defer s.wg.Done()
+	defer recoverPanic("scheduler.cleanupRoutine")
 
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
@@ -523,6 +528,7 @@ func (s *Scheduler) cleanupOldLogs() {
 // healthLogRoutine periodically logs scheduler health information.
 func (s *Scheduler) healthLogRoutine() {
 	defer s.wg.Done()
+	defer recoverPanic("scheduler.healthLogRoutine")
 
 	ticker := time.NewTicker(healthLogInterval)
 	defer ticker.Stop()
@@ -549,6 +555,7 @@ func (s *Scheduler) logHealth() {
 // staleDetectionRoutine periodically checks for stale sources and logs warnings.
 func (s *Scheduler) staleDetectionRoutine() {
 	defer s.wg.Done()
+	defer recoverPanic("scheduler.staleDetectionRoutine")
 
 	// Check every minute for stale sources
 	ticker := time.NewTicker(1 * time.Minute)
