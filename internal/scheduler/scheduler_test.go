@@ -4,6 +4,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/macjediwizard/calbridgesync/internal/caldav"
+	"github.com/macjediwizard/calbridgesync/internal/db"
+	"github.com/macjediwizard/calbridgesync/internal/notify"
 )
 
 func TestNew(t *testing.T) {
@@ -563,4 +567,153 @@ func TestContextCancellation(t *testing.T) {
 		// Cancel should not panic
 		sched.cancel()
 	})
+}
+
+// newTestSchedulerWithNotifier returns a Scheduler wired to a real Notifier
+// with webhook/email disabled (no network I/O) and a nil DB. This exercises
+// the full scheduler → notifier pipeline without standing up mock
+// infrastructure. The disabled channels mean the background send goroutine
+// exits immediately, leaving only the cooldown-map side effects — which is
+// exactly what the tests need to observe.
+func newTestSchedulerWithNotifier(t *testing.T) (*Scheduler, *notify.Notifier) {
+	t.Helper()
+	n := notify.New(&notify.Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	})
+	// Notifier must be "enabled" for the scheduler to call it. With both
+	// channels disabled, IsEnabled() returns false — so to exercise the
+	// path we enable webhook but do not set a URL. sendWithPrefs then
+	// no-ops on the empty URL branch.
+	n = notify.New(&notify.Config{
+		WebhookEnabled: true,
+		WebhookURL:     "", // empty URL — send is a no-op
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	})
+	sched := New(nil, nil, n)
+	return sched, n
+}
+
+// TestMaybeSendFailureAlert_HardFailureFiresAlert verifies that a sync
+// result with Success=false triggers a failure alert via the notifier.
+func TestMaybeSendFailureAlert_HardFailureFiresAlert(t *testing.T) {
+	sched, n := newTestSchedulerWithNotifier(t)
+	defer sched.cancel()
+
+	source := &db.Source{ID: "src-1", Name: "Test Source", UserID: "u1"}
+	result := &caldav.SyncResult{
+		Success: false,
+		Message: "sync failed",
+		Errors:  []string{"connection refused"},
+	}
+
+	sched.maybeSendFailureAlert(source.ID, source, result)
+
+	// Verify by probing the notifier's cooldown: a direct call with the
+	// same source should now be blocked, proving the scheduler populated
+	// the failure-alert cooldown map.
+	fired := n.SendSyncFailureAlertWithPrefs(
+		nil, source.ID, source.Name, "",
+		"probe", "probe", nil,
+	)
+	if fired {
+		t.Error("expected scheduler to have populated the failure cooldown (probe should return false)")
+	}
+}
+
+// TestMaybeSendFailureAlert_DangerousWarningFiresAlert verifies that a
+// successful sync with a data-loss-protection warning still triggers a
+// failure alert. This is the scenario that explains why the user's
+// calendar data disappeared without any alert reaching them: after PR #22,
+// the safety guards will emit these warnings, and the scheduler must
+// surface them as alerts.
+func TestMaybeSendFailureAlert_DangerousWarningFiresAlert(t *testing.T) {
+	sched, n := newTestSchedulerWithNotifier(t)
+	defer sched.cancel()
+
+	source := &db.Source{ID: "src-2", Name: "Test Source 2", UserID: "u1"}
+	result := &caldav.SyncResult{
+		Success: true,
+		Warnings: []string{
+			"source returned 0 events but 42 previously-synced records exist - skipping one-way orphan deletion for safety (possible auth failure or broken source)",
+		},
+	}
+
+	sched.maybeSendFailureAlert(source.ID, source, result)
+
+	fired := n.SendSyncFailureAlertWithPrefs(
+		nil, source.ID, source.Name, "",
+		"probe", "probe", nil,
+	)
+	if fired {
+		t.Error("expected scheduler to alert on dangerous warning even on success (probe should return false)")
+	}
+}
+
+// TestMaybeSendFailureAlert_HarmlessWarningDoesNotFire verifies that a
+// successful sync with only routine warnings (e.g. individual event delete
+// failures, 403 skips) does NOT trigger a failure alert. This prevents
+// alert noise from day-to-day sync operations.
+func TestMaybeSendFailureAlert_HarmlessWarningDoesNotFire(t *testing.T) {
+	sched, n := newTestSchedulerWithNotifier(t)
+	defer sched.cancel()
+
+	source := &db.Source{ID: "src-3", Name: "Test Source 3", UserID: "u1"}
+	result := &caldav.SyncResult{
+		Success: true,
+		Warnings: []string{
+			"Failed to delete orphan event: 404 not found",
+			"Two-way sync: 2 events skipped (source calendar read-only)",
+		},
+	}
+
+	sched.maybeSendFailureAlert(source.ID, source, result)
+
+	// Direct call should still fire — cooldown was never populated.
+	fired := n.SendSyncFailureAlertWithPrefs(
+		nil, source.ID, source.Name, "",
+		"probe", "probe", nil,
+	)
+	if !fired {
+		t.Error("expected direct call to fire (scheduler must not have populated cooldown on harmless warnings)")
+	}
+}
+
+// TestMaybeSendFailureAlert_SuccessWithNoWarningsDoesNotFire verifies the
+// happy path: a clean successful sync with no warnings triggers zero alerts.
+func TestMaybeSendFailureAlert_SuccessWithNoWarningsDoesNotFire(t *testing.T) {
+	sched, n := newTestSchedulerWithNotifier(t)
+	defer sched.cancel()
+
+	source := &db.Source{ID: "src-4", Name: "Test Source 4", UserID: "u1"}
+	result := &caldav.SyncResult{
+		Success:  true,
+		Warnings: nil,
+	}
+
+	sched.maybeSendFailureAlert(source.ID, source, result)
+
+	fired := n.SendSyncFailureAlertWithPrefs(
+		nil, source.ID, source.Name, "",
+		"probe", "probe", nil,
+	)
+	if !fired {
+		t.Error("expected direct call to fire (scheduler must not have populated cooldown on clean success)")
+	}
+}
+
+// TestMaybeSendFailureAlert_NilNotifierSafe verifies the nil-notifier
+// guard. A scheduler without a notifier (tests, stripped-down deploys)
+// must not panic.
+func TestMaybeSendFailureAlert_NilNotifierSafe(t *testing.T) {
+	sched := New(nil, nil, nil)
+	defer sched.cancel()
+
+	source := &db.Source{ID: "src-5", Name: "Test Source 5", UserID: "u1"}
+	result := &caldav.SyncResult{Success: false, Message: "sync failed"}
+
+	// Must not panic.
+	sched.maybeSendFailureAlert(source.ID, source, result)
 }

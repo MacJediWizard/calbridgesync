@@ -341,6 +341,198 @@ func TestClearStaleState(t *testing.T) {
 	}
 }
 
+// TestSendSyncFailureAlertCooldown verifies that a second failure alert for
+// the same source inside the cooldown window is rejected, preventing alert
+// storms on a persistently broken source.
+func TestSendSyncFailureAlertCooldown(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	sent := n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "connection refused", nil,
+	)
+	if !sent {
+		t.Error("first failure alert should be sent")
+	}
+
+	// Second alert within cooldown should be suppressed.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "connection refused", nil,
+	)
+	if sent {
+		t.Error("second failure alert within cooldown should be suppressed")
+	}
+
+	// Different source should still work.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		nil, "source2", "Test Source 2", "user@example.com",
+		"Sync failed", "auth expired", nil,
+	)
+	if !sent {
+		t.Error("failure alert for a different source should be sent")
+	}
+}
+
+// TestSendSyncFailureAlertIndependentFromStale verifies that the failure
+// cooldown and the stale cooldown are tracked separately. A source that is
+// both stale AND failing should be able to fire BOTH alert types without
+// one consuming the other's cooldown.
+func TestSendSyncFailureAlertIndependentFromStale(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	// Fire a stale alert first.
+	sent := n.SendStaleAlert(nil, "source1", "Test Source", "user@example.com", 2*time.Hour, time.Hour)
+	if !sent {
+		t.Fatal("stale alert should fire")
+	}
+
+	// A failure alert for the same source should NOT be blocked by the
+	// stale cooldown — they use independent maps.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "some error", nil,
+	)
+	if !sent {
+		t.Error("failure alert should not be blocked by stale cooldown")
+	}
+}
+
+// TestClearFailureAlertState verifies that clearing the failure-alert state
+// lets the next failure fire immediately instead of waiting for cooldown.
+func TestClearFailureAlertState(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	sent := n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "connection refused", nil,
+	)
+	if !sent {
+		t.Fatal("first failure alert should fire")
+	}
+
+	// Before clear, second alert is blocked.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "connection refused", nil,
+	)
+	if sent {
+		t.Fatal("second failure alert should be blocked before clear")
+	}
+
+	n.ClearFailureAlertState("source1")
+
+	// After clear, next alert fires.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "connection refused", nil,
+	)
+	if !sent {
+		t.Error("failure alert should fire after ClearFailureAlertState")
+	}
+
+	// ClearFailureAlertState must be safe for unknown source IDs.
+	n.ClearFailureAlertState("never-alerted-source")
+}
+
+// TestSendSyncFailureAlertUserCooldownOverride verifies that user preferences
+// can shorten or lengthen the failure cooldown independently of the global
+// cooldown setting.
+func TestSendSyncFailureAlertUserCooldownOverride(t *testing.T) {
+	cfg := &Config{
+		WebhookEnabled: false,
+		EmailEnabled:   false,
+		CooldownPeriod: time.Hour,
+	}
+	n := New(cfg)
+
+	// Zero-minute cooldown via user pref — second alert should fire immediately.
+	zero := 0
+	prefs := &UserPreferences{CooldownMinutes: &zero}
+
+	sent := n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "first", prefs,
+	)
+	if !sent {
+		t.Fatal("first failure alert should fire")
+	}
+
+	// With zero cooldown the second alert fires immediately.
+	sent = n.SendSyncFailureAlertWithPrefs(
+		nil, "source1", "Test Source", "user@example.com",
+		"Sync failed", "second", prefs,
+	)
+	if !sent {
+		t.Error("second alert should fire with zero-minute user cooldown")
+	}
+}
+
+// TestIsDangerousWarning verifies the pattern match for data-loss protection
+// warnings. The scheduler uses this to decide whether a "successful" sync
+// with warnings should still fire an alert.
+func TestIsDangerousWarning(t *testing.T) {
+	tests := []struct {
+		name    string
+		warning string
+		want    bool
+	}{
+		{
+			name:    "empty-source guard warning from planOrphanDeletion",
+			warning: "source returned 0 events but 42 previously-synced records exist - skipping one-way orphan deletion for safety (possible auth failure or broken source)",
+			want:    true,
+		},
+		{
+			name:    "mass-delete threshold warning from planOrphanDeletion",
+			warning: "one-way orphan deletion would remove 80 of 100 previously-synced events (80%), exceeds safety threshold 50% - skipping deletion",
+			want:    true,
+		},
+		{
+			name:    "harmless individual delete failure",
+			warning: "Failed to delete orphan event: 404 not found",
+			want:    false,
+		},
+		{
+			name:    "harmless 403 skip",
+			warning: "Two-way sync: 3 events skipped (source calendar read-only)",
+			want:    false,
+		},
+		{
+			name:    "empty string",
+			warning: "",
+			want:    false,
+		},
+		{
+			name:    "unrelated warning containing none of the patterns",
+			warning: "Failed to update sync log",
+			want:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsDangerousWarning(tt.warning)
+			if got != tt.want {
+				t.Errorf("IsDangerousWarning(%q) = %v, want %v", tt.warning, got, tt.want)
+			}
+		})
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
