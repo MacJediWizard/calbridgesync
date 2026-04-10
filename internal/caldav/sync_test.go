@@ -260,3 +260,120 @@ func TestPlanOrphanDeletion_ManualDestEventsPreserved(t *testing.T) {
 		}
 	}
 }
+
+// TestRewriteDeletePathForDestination verifies the WebDAV-Sync delete-path
+// rewrite logic. When a source supports sync-collection (RFC 6578), the
+// deleted-paths list returned by SyncCollection is in the SOURCE server's
+// URL namespace and cannot be used directly against the destination. This
+// helper extracts the event filename (UID.ics by PutEvent convention) and
+// reattaches it to the destination calendar path.
+//
+// Before this helper existed, every WebDAV-Sync delete silently 404'd on
+// the destination and stale events accumulated forever.
+func TestRewriteDeletePathForDestination(t *testing.T) {
+	tests := []struct {
+		name             string
+		sourcePath       string
+		destCalendarPath string
+		want             string
+	}{
+		{
+			name:             "normal case — deep source path, clean destination",
+			sourcePath:       "/calendar/work-acct/abc123.ics",
+			destCalendarPath: "/SOGo/dav/user@host/Calendar/personal",
+			want:             "/SOGo/dav/user@host/Calendar/personal/abc123.ics",
+		},
+		{
+			name:             "destination has trailing slash — no double slash",
+			sourcePath:       "/calendar/work-acct/abc123.ics",
+			destCalendarPath: "/SOGo/dav/user@host/Calendar/personal/",
+			want:             "/SOGo/dav/user@host/Calendar/personal/abc123.ics",
+		},
+		{
+			name:             "source has trailing slash — still extracts filename",
+			sourcePath:       "/calendar/work-acct/abc123.ics/",
+			destCalendarPath: "/dest/cal",
+			want:             "/dest/cal/abc123.ics",
+		},
+		{
+			name:             "URL-encoded filename preserved as-is",
+			sourcePath:       "/cal/event%20with%20spaces.ics",
+			destCalendarPath: "/dest/cal",
+			want:             "/dest/cal/event%20with%20spaces.ics",
+		},
+		{
+			name:             "root-level source path",
+			sourcePath:       "/abc.ics",
+			destCalendarPath: "/dest/cal",
+			want:             "/dest/cal/abc.ics",
+		},
+		{
+			name:             "filename only, no leading slash",
+			sourcePath:       "abc.ics",
+			destCalendarPath: "/dest/cal",
+			want:             "/dest/cal/abc.ics",
+		},
+		{
+			name:             "empty source path returns empty (skip-signal)",
+			sourcePath:       "",
+			destCalendarPath: "/dest/cal",
+			want:             "",
+		},
+		{
+			name:             "source path is a single slash returns empty (skip-signal)",
+			sourcePath:       "/",
+			destCalendarPath: "/dest/cal",
+			want:             "",
+		},
+		{
+			name:             "UID with dots and hyphens",
+			sourcePath:       "/cal/user/20260101T120000Z-event-uid-1234.ics",
+			destCalendarPath: "/dest/cal",
+			want:             "/dest/cal/20260101T120000Z-event-uid-1234.ics",
+		},
+		{
+			name:             "destination is root /",
+			sourcePath:       "/cal/abc.ics",
+			destCalendarPath: "/",
+			want:             "/abc.ics",
+		},
+		{
+			name:             "destination is empty string",
+			sourcePath:       "/cal/abc.ics",
+			destCalendarPath: "",
+			want:             "/abc.ics",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rewriteDeletePathForDestination(tt.sourcePath, tt.destCalendarPath)
+			if got != tt.want {
+				t.Errorf("rewriteDeletePathForDestination(%q, %q) = %q, want %q",
+					tt.sourcePath, tt.destCalendarPath, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRewriteDeletePathForDestination_FilenameMatchesPutEventConvention
+// documents the contract between this helper and client.go:PutEvent.
+// PutEvent writes events as "{calendarPath}/{UID}.ics" (see client.go:602).
+// rewriteDeletePathForDestination must produce a path in the same shape
+// so that a delete issued after a put finds the same file.
+func TestRewriteDeletePathForDestination_FilenameMatchesPutEventConvention(t *testing.T) {
+	// Simulate what PutEvent would have written.
+	destCalendarPath := "/SOGo/dav/user@host/Calendar/personal"
+	uid := "event-uid-12345"
+	putPath := strings.TrimSuffix(destCalendarPath, "/") + "/" + uid + ".ics"
+
+	// Simulate what WebDAV-Sync returns from the source for the same UID.
+	// Source server uses a different URL layout.
+	sourcePath := "/caldav/different-layout/" + uid + ".ics"
+
+	// The rewritten delete path must match the put path.
+	deletePath := rewriteDeletePathForDestination(sourcePath, destCalendarPath)
+	if deletePath != putPath {
+		t.Errorf("rewrite produced %q, but PutEvent would have written %q — delete will 404",
+			deletePath, putPath)
+	}
+}

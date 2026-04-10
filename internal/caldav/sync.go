@@ -50,6 +50,42 @@ func getSyncDirectionForCalendar(source *db.Source, calendarPath string) db.Sync
 // or filter misconfiguration rather than a legitimate bulk cleanup.
 const defaultOrphanDeleteRatioThreshold = 0.5
 
+// rewriteDeletePathForDestination translates a CalDAV object path from the
+// source server's URL namespace into the destination server's URL namespace.
+//
+// This is needed for the WebDAV-Sync (RFC 6578) incremental sync path.
+// When a source supports sync-collection, `SyncCollection` returns a list
+// of deleted paths in the SOURCE server's URL space — e.g.
+// "/calendar/work-acct/abc123.ics". Passing those paths directly to
+// `destClient.DeleteEvent` results in a 404 on the destination, because
+// the destination has no concept of the source's URL layout.
+//
+// The destination path is reconstructed from the last URL segment of the
+// source path (the event filename, which by convention in PutEvent is
+// "{UID}.ics") prepended with the destination calendar path. This mirrors
+// how PutEvent writes events in the first place, so delete paths match
+// write paths.
+//
+// Returns an empty string if the source path has no extractable filename
+// (empty input, trailing-slash-only, etc). Callers MUST check for the
+// empty return and skip the delete rather than issuing a request with
+// a malformed URL.
+func rewriteDeletePathForDestination(sourcePath, destCalendarPath string) string {
+	trimmed := strings.TrimSuffix(sourcePath, "/")
+	if trimmed == "" {
+		return ""
+	}
+	// Extract the last path segment (the event filename).
+	filename := trimmed
+	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 {
+		filename = trimmed[idx+1:]
+	}
+	if filename == "" {
+		return ""
+	}
+	return strings.TrimSuffix(destCalendarPath, "/") + "/" + filename
+}
+
 // planOrphanDeletion determines which destination events should be deleted as
 // "orphans" during a one-way + source_wins sync.
 //
@@ -361,8 +397,22 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 		syncToken = syncState.SyncToken
 	}
 
-	// Get the destination calendar path from the destination client's base URL
-	destCalendarPath := destClient.GetCalendarPath()
+	// Discover destination calendar path using the same logic as fullSync
+	// to ensure both code paths target the same calendar.
+	destCalendarPath := ""
+	destCalendars, discoverErr := destClient.FindCalendars(ctx)
+	if discoverErr != nil {
+		log.Printf("Failed to discover destination calendars, falling back to URL path: %v", discoverErr)
+		destCalendarPath = destClient.GetCalendarPath()
+	} else if len(destCalendars) == 0 {
+		log.Printf("No calendars found on destination, using URL path as fallback")
+		destCalendarPath = destClient.GetCalendarPath()
+	} else {
+		destCalendarPath = destCalendars[0].Path
+		if len(destCalendars) > 1 {
+			log.Printf("WARNING: Multiple destination calendars found, using first one: %s", destCalendarPath)
+		}
+	}
 
 	// Try WebDAV-Sync if supported
 	if sourceClient.SupportsWebDAVSync(ctx, calendar.Path) {
@@ -384,10 +434,20 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 				}
 			}
 
-			for _, path := range syncResult.Deleted {
-				if err := destClient.DeleteEvent(ctx, path); err != nil {
+			// Delete events from destination. Source paths are in the source
+			// server's URL namespace and cannot be used directly against the
+			// destination, so we rewrite each path through
+			// rewriteDeletePathForDestination. See that helper's doc comment
+			// for the full rationale.
+			for _, sourcePath := range syncResult.Deleted {
+				destEventPath := rewriteDeletePathForDestination(sourcePath, destCalendarPath)
+				if destEventPath == "" {
+					log.Printf("Skipping delete for unrewriteable source path: %q", sourcePath)
+					continue
+				}
+				if err := destClient.DeleteEvent(ctx, destEventPath); err != nil {
 					// Don't count as error if event doesn't exist on destination
-					log.Printf("Failed to delete event %s: %v", path, err)
+					log.Printf("Failed to delete event (source: %s, dest: %s): %v", sourcePath, destEventPath, err)
 				} else {
 					result.Deleted++
 				}
