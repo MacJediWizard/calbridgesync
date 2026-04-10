@@ -183,10 +183,10 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 			singleCal.Children = append(singleCal.Children, vevent)
 		}
 
-		data := encodeCalendar(singleCal)
-		if data == "" {
+		data, encErr := encodeCalendar(singleCal)
+		if encErr != nil {
 			if collector != nil {
-				collector.Add(uid, "failed to encode event")
+				collector.Add(uid, fmt.Sprintf("failed to encode event: %v", encErr))
 			}
 			continue
 		}
