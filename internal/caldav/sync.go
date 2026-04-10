@@ -1089,6 +1089,13 @@ func (se *SyncEngine) TestICSConnection(ctx context.Context, url, username, pass
 	return client.TestConnection(ctx)
 }
 
+// finishSyncPersistenceWarningPrefix is the constant prefix used for
+// warnings that finishSync appends when a DB write fails after all
+// retries. A dedicated prefix lets callers and future alert-classifier
+// extensions detect these persistence failures specifically, without
+// having to parse the full warning text.
+const finishSyncPersistenceWarningPrefix = "sync persistence failure: "
+
 func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 	// Determine status: error > partial > success
 	var status db.SyncStatus
@@ -1100,11 +1107,19 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		status = db.SyncStatusSuccess
 	}
 
-	// Update status with retry for concurrent access
+	// Update status with retry for concurrent access. If the write
+	// fails after all retries, append a warning to the result so the
+	// failure is visible to callers (who inspect result.Warnings),
+	// gets recorded in the sync log details below, and surfaces on
+	// the dashboard instead of being silently swallowed as a log
+	// line nobody reads.
 	if err := retryDBOperation(func() error {
 		return se.db.UpdateSourceSyncStatus(sourceID, status, result.Message)
 	}, 5); err != nil {
-		log.Printf("Failed to update sync status after retries: %v", err)
+		msg := fmt.Sprintf("%sfailed to update sync status after retries: %v",
+			finishSyncPersistenceWarningPrefix, err)
+		log.Printf("%s", msg)
+		result.Warnings = append(result.Warnings, msg)
 	}
 
 	// Create sync log with detailed stats
@@ -1121,7 +1136,9 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		EventsProcessed: result.EventsProcessed,
 	}
 
-	// Include both errors and warnings in details (sanitized to remove sensitive info)
+	// Include both errors and warnings in details (sanitized to remove sensitive info).
+	// If the UpdateSourceSyncStatus call above failed, its warning was
+	// just appended to result.Warnings and will be captured here.
 	var details []string
 	if len(result.Errors) > 0 {
 		details = append(details, fmt.Sprintf("Errors: %v", result.Errors))
@@ -1133,11 +1150,18 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		syncLog.Details = sanitizeLogDetails(strings.Join(details, "\n"))
 	}
 
-	// Create sync log with retry for concurrent access
+	// Create sync log with retry for concurrent access. A failure here
+	// is inherently unrecordable (the sync log is what failed to write),
+	// so we can only append to result.Warnings and log inline. Callers
+	// that inspect the returned SyncResult will still see the warning,
+	// even though it won't appear in the sync_logs table for this run.
 	if err := retryDBOperation(func() error {
 		return se.db.CreateSyncLog(syncLog)
 	}, 5); err != nil {
-		log.Printf("Failed to create sync log after retries: %v", err)
+		msg := fmt.Sprintf("%sfailed to create sync log after retries: %v",
+			finishSyncPersistenceWarningPrefix, err)
+		log.Printf("%s", msg)
+		result.Warnings = append(result.Warnings, msg)
 	}
 
 	// Finish activity tracking
