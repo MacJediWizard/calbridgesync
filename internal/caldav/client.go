@@ -25,6 +25,13 @@ var (
 	ErrNotFound         = errors.New("resource not found")
 	ErrInvalidResponse  = errors.New("invalid server response")
 	ErrMalformedContent = errors.New("malformed calendar content")
+	// ErrEventSkipped indicates that PutEvent intentionally did NOT write
+	// the event to the destination (empty data, missing UID, etc.). This
+	// is distinct from a connection/auth/write failure. Callers that
+	// treat all non-nil errors as failures will show these events in
+	// warnings, which is wrong — they are skips, not errors. Use
+	// errors.Is(err, ErrEventSkipped) to distinguish.
+	ErrEventSkipped = errors.New("event skipped")
 )
 
 const (
@@ -599,12 +606,25 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	return event, nil
 }
 
-// PutEvent creates or updates an event.
+// PutEvent creates or updates an event on the destination calendar.
+//
+// Return values:
+//   - nil: the event was successfully written.
+//   - wrapped ErrEventSkipped: the event was intentionally NOT written
+//     because it had empty data or no extractable UID. Callers should
+//     count these as "skipped" in the sync result, NOT as "created" or
+//     "updated". Use errors.Is(err, ErrEventSkipped) to detect.
+//   - any other non-nil error: a real failure (parse, connection, auth,
+//     write). Callers should surface these in result.Warnings or
+//     result.Errors as appropriate.
 func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event) error {
-	// Skip events with empty data
+	// Skip events with empty data. This is NOT a success — we did not
+	// write anything. Previously this returned nil, which made the
+	// caller's `result.Created++` bookkeeping lie.
 	if event.Data == "" {
 		log.Printf("PutEvent: skipping event with empty data (UID: %s, summary: %s)", event.UID, event.Summary)
-		return nil
+		return fmt.Errorf("%w: empty iCalendar data (UID: %s, summary: %s)",
+			ErrEventSkipped, event.UID, event.Summary)
 	}
 
 	// Parse the iCalendar data
@@ -631,9 +651,12 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 		if event.UID != "" {
 			path = strings.TrimSuffix(calendarPath, "/") + "/" + event.UID + ".ics"
 		} else {
-			// Skip events without UID - can't create a valid path
+			// Skip events without UID — can't construct a valid path. Same
+			// honesty contract as the empty-data case above: return a
+			// wrapped sentinel so the caller counts this as a skip.
 			log.Printf("PutEvent: skipping event without UID (summary: %s)", event.Summary)
-			return nil
+			return fmt.Errorf("%w: no UID extractable from event data (summary: %s)",
+				ErrEventSkipped, event.Summary)
 		}
 	}
 
