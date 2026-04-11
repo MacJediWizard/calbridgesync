@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/macjediwizard/calbridgesync/internal/auth"
+	"github.com/macjediwizard/calbridgesync/internal/config"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 	"github.com/macjediwizard/calbridgesync/internal/scheduler"
 )
@@ -1571,6 +1572,150 @@ func TestValidateSourceInputUsernameLength(t *testing.T) {
 
 		if result == "" || !strings.Contains(result, "Destination username") {
 			t.Error("expected error about destination username length")
+		}
+	})
+}
+
+// TestAPIUpdateAlertPreferences_EmailEnableRejectedWhenNoSMTP covers the
+// regression for #103: the handler must reject a request that tries to
+// flip email_enabled to true when the operator hasn't configured SMTP,
+// because accepting it would save a DB row that results in silent
+// delivery failures for an hour (cooldown) on the first send attempt.
+func TestAPIUpdateAlertPreferences_EmailEnableRejectedWhenNoSMTP(t *testing.T) {
+	t.Run("prod with SMTP unset rejects email_enabled=true", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		// Explicitly wire a Config with empty SMTPHost. The default
+		// setupTestHandlers doesn't populate cfg; we set it here
+		// for this one test.
+		th.handlers.cfg = &config.Config{
+			Alerts: config.AlertConfig{
+				SMTPHost: "",
+			},
+		}
+
+		user, err := th.db.GetOrCreateUser("alerts-test@example.com", "Alerts Tester")
+		if err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		enable := true
+		reqBody := APIAlertPreferences{EmailEnabled: &enable}
+		body, _ := json.Marshal(reqBody)
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/settings/alerts", strings.NewReader(string(body)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		setAuthContext(c, user.ID, user.Email)
+
+		th.handlers.APIUpdateAlertPreferences(c)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("want status 400, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "SMTP") {
+			t.Errorf("error body must mention SMTP for operator discoverability, got: %s", w.Body.String())
+		}
+
+		// The DB row must NOT have been written.
+		prefs, err := th.db.GetUserAlertPreferences(user.ID)
+		if err != nil {
+			t.Fatalf("unexpected DB error: %v", err)
+		}
+		if prefs != nil {
+			t.Errorf("prefs row should not have been saved on validation error, got %+v", prefs)
+		}
+	})
+
+	t.Run("prod with SMTP configured accepts email_enabled=true", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		th.handlers.cfg = &config.Config{
+			Alerts: config.AlertConfig{
+				SMTPHost: "smtp.example.com",
+				SMTPPort: 587,
+			},
+		}
+
+		user, err := th.db.GetOrCreateUser("alerts-ok@example.com", "Alerts OK")
+		if err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		enable := true
+		reqBody := APIAlertPreferences{EmailEnabled: &enable}
+		body, _ := json.Marshal(reqBody)
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/settings/alerts", strings.NewReader(string(body)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		setAuthContext(c, user.ID, user.Email)
+
+		th.handlers.APIUpdateAlertPreferences(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("want status 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("email_enabled=false never blocked (user can disable even with no SMTP)", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+
+		th.handlers.cfg = &config.Config{
+			Alerts: config.AlertConfig{SMTPHost: ""},
+		}
+
+		user, err := th.db.GetOrCreateUser("alerts-disable@example.com", "Alerts Disable")
+		if err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		disable := false
+		reqBody := APIAlertPreferences{EmailEnabled: &disable}
+		body, _ := json.Marshal(reqBody)
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/settings/alerts", strings.NewReader(string(body)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		setAuthContext(c, user.ID, user.Email)
+
+		th.handlers.APIUpdateAlertPreferences(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("disabling email should be allowed even without SMTP; want 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("nil cfg allows the request (test-harness compatibility)", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+		// Explicitly leave th.handlers.cfg as its default (nil)
+
+		user, err := th.db.GetOrCreateUser("alerts-nilcfg@example.com", "Alerts NilCfg")
+		if err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		enable := true
+		reqBody := APIAlertPreferences{EmailEnabled: &enable}
+		body, _ := json.Marshal(reqBody)
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPut, "/api/settings/alerts", strings.NewReader(string(body)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		setAuthContext(c, user.ID, user.Email)
+
+		th.handlers.APIUpdateAlertPreferences(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("nil cfg should permit the request (existing test harness compatibility); want 200, got %d: %s", w.Code, w.Body.String())
 		}
 	})
 }

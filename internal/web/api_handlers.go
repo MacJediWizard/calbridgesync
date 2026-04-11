@@ -1135,6 +1135,35 @@ func (h *Handlers) APIUpdateAlertPreferences(c *gin.Context) {
 		return
 	}
 
+	// Reject email_enabled=true when the instance has no SMTP
+	// configured (#103). Without this check, the Settings page
+	// happily accepts the toggle, the DB row is persisted, and
+	// the first alert send fails silently at notify.go:362 with
+	// `addr := ":587"` — then the 60-minute cooldown prevents
+	// any retry for an hour and the user thinks alerts are
+	// working until they aren't. Better to refuse at save time
+	// with a clear error pointing at the missing env var so the
+	// operator (or the user, via the operator) knows what to fix.
+	//
+	// We only fire this check when the request is TURNING ON
+	// email. If req.EmailEnabled is nil (unchanged), false
+	// (turning off), or the operator has configured SMTP, no
+	// error. We also don't check when disabling email on an
+	// instance with no SMTP — disabling something that was
+	// never going to work is harmless and the user shouldn't
+	// be blocked from cleaning up their own state.
+	//
+	// The h.cfg nil-check defends against test harnesses that
+	// construct a Handlers with a zero-value cfg — the existing
+	// setupTestHandlers helper does exactly this. Production
+	// code always passes a real Config via NewHandlers.
+	if req.EmailEnabled != nil && *req.EmailEnabled && h.cfg != nil && h.cfg.Alerts.SMTPHost == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Cannot enable email alerts: this instance has no SMTP configured. Ask your operator to set ALERT_SMTP_HOST / ALERT_SMTP_PORT / ALERT_SMTP_FROM (and ALERT_SMTP_USERNAME / ALERT_SMTP_PASSWORD if the server requires auth).",
+		})
+		return
+	}
+
 	prefs := &db.UserAlertPreferences{
 		UserID:          session.UserID,
 		EmailEnabled:    req.EmailEnabled,
