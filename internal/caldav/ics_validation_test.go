@@ -5,6 +5,90 @@ import (
 	"testing"
 )
 
+// TestIsStrictICSHTTPS covers the env var parsing for the
+// STRICT_ICS_HTTPS flag. Uses t.Setenv so each case starts from
+// a clean environment regardless of what the host has set. (#131)
+func TestIsStrictICSHTTPS(t *testing.T) {
+	cases := []struct {
+		env  string
+		want bool
+	}{
+		{"", false},
+		{"false", false},
+		{"no", false},
+		{"0", false},
+		{"off", false},     // not recognized as truthy
+		{"garbage", false}, // not recognized
+		{"true", true},
+		{"TRUE", true},
+		{"True", true},
+		{"1", true},
+		{"yes", true},
+		{"YES", true},
+		{" true ", true}, // whitespace tolerated via TrimSpace
+	}
+	for _, tc := range cases {
+		name := tc.env
+		if name == "" {
+			name = "(unset)"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("STRICT_ICS_HTTPS", tc.env)
+			if got := isStrictICSHTTPS(); got != tc.want {
+				t.Errorf("STRICT_ICS_HTTPS=%q → isStrictICSHTTPS() = %v, want %v", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateICSFeedURL_StrictHTTPS covers the end-to-end
+// behavior of the #131 strict mode: when STRICT_ICS_HTTPS is
+// truthy, http:// URLs are rejected; when unset/false, http://
+// passes the scheme check.
+func TestValidateICSFeedURL_StrictHTTPS(t *testing.T) {
+	t.Run("http allowed by default (LAN compatibility)", func(t *testing.T) {
+		t.Setenv("STRICT_ICS_HTTPS", "")
+		if err := validateICSFeedURL("http://sports.example.com/team.ics"); err != nil {
+			t.Errorf("http:// must be allowed by default: %v", err)
+		}
+	})
+
+	t.Run("http rejected when strict mode is on", func(t *testing.T) {
+		t.Setenv("STRICT_ICS_HTTPS", "true")
+		err := validateICSFeedURL("http://sports.example.com/team.ics")
+		if err == nil {
+			t.Fatal("http:// must be rejected when STRICT_ICS_HTTPS=true")
+		}
+		if !strings.Contains(err.Error(), "STRICT_ICS_HTTPS") {
+			t.Errorf("error should mention STRICT_ICS_HTTPS for operator discoverability, got: %v", err)
+		}
+	})
+
+	t.Run("https always allowed", func(t *testing.T) {
+		t.Setenv("STRICT_ICS_HTTPS", "true")
+		if err := validateICSFeedURL("https://calendar.google.com/ical/example.ics"); err != nil {
+			t.Errorf("https:// must always pass: %v", err)
+		}
+	})
+
+	t.Run("other rejection rules still fire under strict mode", func(t *testing.T) {
+		// Even with strict mode on, the other checks (localhost,
+		// .local, file://) should still produce their own errors.
+		t.Setenv("STRICT_ICS_HTTPS", "true")
+
+		cases := []string{
+			"https://localhost/cal.ics",    // still rejected as localhost
+			"https://server.local/cal.ics", // still rejected as .local
+			"file:///etc/passwd",           // still rejected as non-http scheme
+		}
+		for _, u := range cases {
+			if err := validateICSFeedURL(u); err == nil {
+				t.Errorf("%q must still be rejected under strict mode", u)
+			}
+		}
+	})
+}
+
 // TestValidateICSFeedURL covers the scheme + host block rules from
 // #127. The validator is intentionally narrower than the webhook
 // validator (private IPs are still allowed for LAN calendar
