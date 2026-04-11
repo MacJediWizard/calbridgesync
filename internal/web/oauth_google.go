@@ -56,16 +56,24 @@ type googleUserinfo struct {
 	Name          string `json:"name"`
 }
 
-// googleOAuthConfig builds the oauth2.Config from handler config.
-// Returns nil if the feature is disabled on this instance (no client
-// id or secret set).
-func (h *Handlers) googleOAuthConfig() *oauth2.Config {
-	if !h.cfg.GoogleOAuth.Enabled() {
+// buildGoogleOAuthConfig assembles an oauth2.Config from per-request
+// credentials plus the instance-level redirect URL. As of #79 the
+// client ID and client secret are NOT stored in the global config —
+// each user provides their own when adding a Google source — so the
+// helper takes them as explicit parameters and the caller is
+// responsible for sourcing them (from the form during prepare, from
+// the pending session cookie during callback, or from the source row
+// during sync).
+//
+// Returns nil if the redirect URL is unset (the feature is fully
+// disabled on this instance) or if either credential is empty.
+func (h *Handlers) buildGoogleOAuthConfig(clientID, clientSecret string) *oauth2.Config {
+	if !h.cfg.GoogleOAuth.Enabled() || clientID == "" || clientSecret == "" {
 		return nil
 	}
 	return &oauth2.Config{
-		ClientID:     h.cfg.GoogleOAuth.ClientID,
-		ClientSecret: h.cfg.GoogleOAuth.ClientSecret,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
 		RedirectURL:  h.cfg.GoogleOAuth.RedirectURL,
 		Endpoint:     google.Endpoint,
 		Scopes: []string{
@@ -78,16 +86,20 @@ func (h *Handlers) googleOAuthConfig() *oauth2.Config {
 // APIPrepareGoogleSourceRequest is the payload the React SPA sends to
 // kick off a Google OAuth source. It contains only the fields the user
 // sets in the form — source_url/username/password are intentionally
-// omitted because they're filled in after OAuth completes.
+// omitted because they're filled in after OAuth completes. As of #79
+// the user must also provide their own google_client_id and
+// google_client_secret from their personal Google Cloud project.
 type APIPrepareGoogleSourceRequest struct {
-	Name             string `json:"name"`
-	SyncInterval     int    `json:"sync_interval"`
-	SyncDaysPast     int    `json:"sync_days_past"`
-	SyncDirection    string `json:"sync_direction"`
-	ConflictStrategy string `json:"conflict_strategy"`
-	DestURL          string `json:"dest_url"`
-	DestUsername     string `json:"dest_username"`
-	DestPassword     string `json:"dest_password"`
+	Name               string `json:"name"`
+	SyncInterval       int    `json:"sync_interval"`
+	SyncDaysPast       int    `json:"sync_days_past"`
+	SyncDirection      string `json:"sync_direction"`
+	ConflictStrategy   string `json:"conflict_strategy"`
+	DestURL            string `json:"dest_url"`
+	DestUsername       string `json:"dest_username"`
+	DestPassword       string `json:"dest_password"`
+	GoogleClientID     string `json:"google_client_id"`
+	GoogleClientSecret string `json:"google_client_secret"`
 }
 
 // APIPrepareGoogleSourceResponse tells the SPA where to send the user
@@ -115,10 +127,9 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 		return
 	}
 
-	cfg := h.googleOAuthConfig()
-	if cfg == nil {
+	if !h.cfg.GoogleOAuth.Enabled() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "Google OAuth is not configured on this server. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET.",
+			"error": "Google OAuth is not configured on this server (BASE_URL / GOOGLE_OAUTH_REDIRECT_URL must be set).",
 		})
 		return
 	}
@@ -134,6 +145,24 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 	if req.Name == "" || req.DestURL == "" || req.DestUsername == "" || req.DestPassword == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Name and destination URL/username/password are required",
+		})
+		return
+	}
+
+	// Per-source Google OAuth credentials are required as of #79.
+	// Each user provides their own Google Cloud project credentials.
+	if req.GoogleClientID == "" || req.GoogleClientSecret == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Google OAuth client ID and client secret are required (from your Google Cloud project)",
+		})
+		return
+	}
+
+	// Build the per-request oauth2.Config from the form credentials.
+	cfg := h.buildGoogleOAuthConfig(req.GoogleClientID, req.GoogleClientSecret)
+	if cfg == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid Google OAuth credentials in request",
 		})
 		return
 	}
@@ -170,6 +199,16 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 		return
 	}
 
+	// Encrypt the per-source Google client secret before stashing it
+	// in the session cookie. The cookie itself is signed (gorilla
+	// sessions) but we still encrypt at the application layer so a
+	// stolen cookie does not expose the plaintext secret. (#79)
+	encGoogleClientSecret, err := h.encryptor.Encrypt(req.GoogleClientSecret)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encrypt Google client secret"})
+		return
+	}
+
 	state, err := auth.GenerateState()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate state"})
@@ -185,15 +224,17 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 	}
 
 	pending := &auth.PendingGoogleSource{
-		State:            state,
-		Name:             req.Name,
-		SyncInterval:     req.SyncInterval,
-		SyncDaysPast:     req.SyncDaysPast,
-		SyncDirection:    req.SyncDirection,
-		ConflictStrategy: req.ConflictStrategy,
-		DestURL:          req.DestURL,
-		DestUsername:     req.DestUsername,
-		DestPasswordEnc:  encDestPwd,
+		State:                 state,
+		Name:                  req.Name,
+		SyncInterval:          req.SyncInterval,
+		SyncDaysPast:          req.SyncDaysPast,
+		SyncDirection:         req.SyncDirection,
+		ConflictStrategy:      req.ConflictStrategy,
+		DestURL:               req.DestURL,
+		DestUsername:          req.DestUsername,
+		DestPasswordEnc:       encDestPwd,
+		GoogleClientID:        req.GoogleClientID,
+		GoogleClientSecretEnc: encGoogleClientSecret,
 	}
 	if err := h.session.SetPendingGoogleSource(c.Writer, c.Request, pending); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending source"})
@@ -225,8 +266,7 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 // prepare endpoint first, they'll be bounced back to /sources/add
 // with an error.
 func (h *Handlers) GoogleOAuthStart(c *gin.Context) {
-	cfg := h.googleOAuthConfig()
-	if cfg == nil {
+	if !h.cfg.GoogleOAuth.Enabled() {
 		c.Redirect(http.StatusFound, "/sources/add?error=google_not_configured")
 		return
 	}
@@ -245,8 +285,7 @@ func (h *Handlers) GoogleOAuthStart(c *gin.Context) {
 // reads the pending form data from the session, creates the real
 // Source row, and redirects back to /sources.
 func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
-	cfg := h.googleOAuthConfig()
-	if cfg == nil {
+	if !h.cfg.GoogleOAuth.Enabled() {
 		c.Redirect(http.StatusFound, "/sources/add?error=google_not_configured")
 		return
 	}
@@ -278,13 +317,42 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		return
 	}
 
+	// Read back the pending form data BEFORE exchanging the code, so
+	// we have the per-source client_id and client_secret to build the
+	// oauth2.Config that the exchange call needs. As of #79 these
+	// credentials live on each source, not in global env vars, so the
+	// pending session cookie is the only place they exist between the
+	// prepare step and this callback. GetPendingGoogleSource also
+	// clears the cookie.
+	pending, err := h.session.GetPendingGoogleSource(c.Writer, c.Request)
+	if err != nil {
+		log.Printf("Google OAuth callback: no pending source in session: %v", err)
+		c.Redirect(http.StatusFound, "/sources/add?error=pending_expired")
+		return
+	}
+
+	// Decrypt the client secret just long enough to build the
+	// oauth2.Config. We re-encrypt it later for storage on the
+	// Source row using h.encryptor.Encrypt.
+	googleClientSecret, err := h.encryptor.Decrypt(pending.GoogleClientSecretEnc)
+	if err != nil {
+		log.Printf("Google OAuth callback: failed to decrypt pending Google client secret: %v", err)
+		c.Redirect(http.StatusFound, "/sources/add?error=encrypt_failed")
+		return
+	}
+	cfg := h.buildGoogleOAuthConfig(pending.GoogleClientID, googleClientSecret)
+	if cfg == nil {
+		log.Printf("Google OAuth callback: pending source had invalid Google credentials")
+		c.Redirect(http.StatusFound, "/sources/add?error=google_not_configured")
+		return
+	}
+
 	// Exchange the authorization code for an access + refresh token.
 	// This hits https://oauth2.googleapis.com/token with the client
 	// secret; it MUST happen server-side, never in the browser.
 	token, err := cfg.Exchange(c.Request.Context(), code)
 	if err != nil {
 		log.Printf("Google OAuth callback: code exchange failed: %v", err)
-		_, _ = h.session.GetPendingGoogleSource(c.Writer, c.Request)
 		c.Redirect(http.StatusFound, "/sources/add?error=exchange_failed")
 		return
 	}
@@ -296,7 +364,6 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		// can't proceed — a source without a refresh token can't
 		// sync past the first access token expiry.
 		log.Printf("Google OAuth callback: Google did not return a refresh token")
-		_, _ = h.session.GetPendingGoogleSource(c.Writer, c.Request)
 		c.Redirect(http.StatusFound, "/sources/add?error=no_refresh_token")
 		return
 	}
@@ -307,17 +374,7 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 	email, err := fetchGoogleUserEmail(c.Request.Context(), cfg, token)
 	if err != nil {
 		log.Printf("Google OAuth callback: failed to fetch user email: %v", err)
-		_, _ = h.session.GetPendingGoogleSource(c.Writer, c.Request)
 		c.Redirect(http.StatusFound, "/sources/add?error=userinfo_failed")
-		return
-	}
-
-	// Read back the pending form data. GetPendingGoogleSource also
-	// clears the cookie.
-	pending, err := h.session.GetPendingGoogleSource(c.Writer, c.Request)
-	if err != nil {
-		log.Printf("Google OAuth callback: no pending source in session: %v", err)
-		c.Redirect(http.StatusFound, "/sources/add?error=pending_expired")
 		return
 	}
 
@@ -369,22 +426,35 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		conflictStrategy = db.ConflictSourceWins
 	}
 
+	// Re-encrypt the Google client secret for storage on the Source
+	// row. We held it in plaintext only for the duration of the
+	// cfg.Exchange call above; the value-at-rest in synced_events
+	// must always be encrypted.
+	encGoogleClientSecret, err := h.encryptor.Encrypt(googleClientSecret)
+	if err != nil {
+		log.Printf("Google OAuth callback: failed to encrypt Google client secret for storage: %v", err)
+		c.Redirect(http.StatusFound, "/sources/add?error=encrypt_failed")
+		return
+	}
+
 	source := &db.Source{
-		UserID:            session.UserID,
-		Name:              pending.Name,
-		SourceType:        db.SourceTypeGoogle,
-		SourceURL:         sourceURL,
-		SourceUsername:    email, // Informational only; OAuth doesn't use it
-		SourcePassword:    "",    // Intentionally empty for OAuth sources
-		OAuthRefreshToken: encRefreshToken,
-		DestURL:           pending.DestURL,
-		DestUsername:      pending.DestUsername,
-		DestPassword:      pending.DestPasswordEnc,
-		SyncInterval:      syncInterval,
-		SyncDaysPast:      syncDaysPast,
-		SyncDirection:     syncDirection,
-		ConflictStrategy:  conflictStrategy,
-		Enabled:           true,
+		UserID:             session.UserID,
+		Name:               pending.Name,
+		SourceType:         db.SourceTypeGoogle,
+		SourceURL:          sourceURL,
+		SourceUsername:     email, // Informational only; OAuth doesn't use it
+		SourcePassword:     "",    // Intentionally empty for OAuth sources
+		OAuthRefreshToken:  encRefreshToken,
+		GoogleClientID:     pending.GoogleClientID,
+		GoogleClientSecret: encGoogleClientSecret,
+		DestURL:            pending.DestURL,
+		DestUsername:       pending.DestUsername,
+		DestPassword:       pending.DestPasswordEnc,
+		SyncInterval:       syncInterval,
+		SyncDaysPast:       syncDaysPast,
+		SyncDirection:      syncDirection,
+		ConflictStrategy:   conflictStrategy,
+		Enabled:            true,
 	}
 
 	if err := h.db.CreateSource(source); err != nil {

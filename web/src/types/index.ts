@@ -75,6 +75,10 @@ export interface SourceFormData {
   sync_direction: 'one_way' | 'two_way';
   conflict_strategy: string;
   selected_calendars: CalendarConfig[];
+  // Per-source Google OAuth credentials (#79). Only populated when
+  // source_type === 'google'. Empty for all other source types.
+  google_client_id?: string;
+  google_client_secret?: string;
 }
 
 export interface ApiResponse<T> {

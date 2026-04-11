@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 
 	"github.com/macjediwizard/calbridgesync/internal/activity"
 	"github.com/macjediwizard/calbridgesync/internal/crypto"
@@ -826,24 +827,58 @@ type SyncEngine struct {
 	db        *db.DB
 	encryptor *crypto.Encryptor
 	tracker   *activity.Tracker
-	// googleOAuth is the OAuth2 configuration used when syncing
-	// source_type == google. Nil if the feature is not configured on
-	// this instance; SyncSource will then surface a clear error
-	// instead of silently falling back to Basic Auth (which Google
-	// would reject anyway). (#70)
-	googleOAuth *oauth2.Config
 }
 
-// NewSyncEngine creates a new sync engine. googleOAuth is optional
-// and should be nil unless Google OAuth2 credentials have been
-// configured via GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET.
-func NewSyncEngine(database *db.DB, encryptor *crypto.Encryptor, googleOAuth *oauth2.Config) *SyncEngine {
+// NewSyncEngine creates a new sync engine. As of #79 the engine no
+// longer holds a global Google OAuth config — Google sources carry
+// their own client_id and client_secret on the source row, and the
+// sync code builds an oauth2.Config per request from those columns.
+func NewSyncEngine(database *db.DB, encryptor *crypto.Encryptor) *SyncEngine {
 	return &SyncEngine{
-		db:          database,
-		encryptor:   encryptor,
-		tracker:     activity.NewTracker(),
-		googleOAuth: googleOAuth,
+		db:        database,
+		encryptor: encryptor,
+		tracker:   activity.NewTracker(),
 	}
+}
+
+// googleScopes are the OAuth scopes every Google CalDAV sync needs.
+// Hardcoded because they are the same for every source — different
+// scopes would require a separate consent flow per source, which is
+// not a feature we expose. (#79)
+var googleScopes = []string{
+	// Full calendar scope is required for CalDAV access. The narrower
+	// .events scope is NOT sufficient because CalDAV requires
+	// PROPFIND on calendar-home-set.
+	"https://www.googleapis.com/auth/calendar",
+	// Needed to fetch the user's primary email during the OAuth
+	// callback so we can build the per-calendar URL.
+	"https://www.googleapis.com/auth/userinfo.email",
+}
+
+// buildPerSourceGoogleOAuthConfig assembles a fresh *oauth2.Config
+// from the credentials stored on a single source row plus the
+// instance-level redirect URL. Returns an error if either the client
+// ID or the (decrypted) client secret is missing — Google sources
+// without their own credentials are a hard configuration failure
+// rather than a silent Basic-Auth fallback. (#79)
+func (se *SyncEngine) buildPerSourceGoogleOAuthConfig(source *db.Source, redirectURL string) (*oauth2.Config, error) {
+	if source.GoogleClientID == "" {
+		return nil, fmt.Errorf("source %q has no Google OAuth client_id — re-add the source via the web UI", source.Name)
+	}
+	if source.GoogleClientSecret == "" {
+		return nil, fmt.Errorf("source %q has no Google OAuth client_secret — re-add the source via the web UI", source.Name)
+	}
+	clientSecret, err := se.encryptor.Decrypt(source.GoogleClientSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt Google client_secret for source %q: %w", source.Name, err)
+	}
+	return &oauth2.Config{
+		ClientID:     source.GoogleClientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  redirectURL,
+		Endpoint:     google.Endpoint,
+		Scopes:       googleScopes,
+	}, nil
 }
 
 // GetActivityTracker returns the activity tracker for external use.
@@ -899,25 +934,32 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		return result
 	}
 
-	// Create source client — branch on source type (#70).
+	// Create source client — branch on source type (#70 + #79).
 	// Google sources use OAuth2 Bearer auth; everything else uses
-	// Basic Auth. A Google source without an OAuth config on the
-	// server or without a stored refresh token is a hard failure —
-	// we must not silently fall back to Basic Auth because Google
-	// will reject it with 401, which would look like bad credentials
-	// even though the real fix is to finish configuring OAuth.
+	// Basic Auth. A Google source without per-source client_id /
+	// client_secret / refresh_token is a hard failure — we must not
+	// silently fall back to Basic Auth because Google will reject it
+	// with 401, which would look like bad credentials even though the
+	// real fix is to re-add the source via the web UI.
+	//
+	// As of #79 the OAuth client config is built per-source from the
+	// credentials stored on the source row (not from a global env-var
+	// config). The redirect URL is irrelevant for token refresh —
+	// only the consent-screen flow uses it, and that runs in the web
+	// handlers, not here — so we pass an empty string.
 	var sourceClient *Client
 	if source.SourceType == db.SourceTypeGoogle {
-		if se.googleOAuth == nil {
-			result.Message = "Google OAuth is not configured on this server (GOOGLE_OAUTH_CLIENT_ID missing)"
+		if source.OAuthRefreshToken == "" {
+			result.Message = "Google source is missing its OAuth refresh token — reconnect via the web UI"
 			result.Errors = append(result.Errors, result.Message)
 			result.Duration = time.Since(start)
 			se.finishSync(source.ID, result)
 			return result
 		}
-		if source.OAuthRefreshToken == "" {
-			result.Message = "Google source is missing its OAuth refresh token — reconnect via the web UI"
-			result.Errors = append(result.Errors, result.Message)
+		perSourceOAuthConfig, cfgErr := se.buildPerSourceGoogleOAuthConfig(source, "")
+		if cfgErr != nil {
+			result.Message = cfgErr.Error()
+			result.Errors = append(result.Errors, cfgErr.Error())
 			result.Duration = time.Since(start)
 			se.finishSync(source.ID, result)
 			return result
@@ -931,7 +973,7 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 			return result
 		}
 		token := &oauth2.Token{RefreshToken: refreshToken}
-		sourceClient, err = NewOAuthClient(ctx, source.SourceURL, se.googleOAuth, token)
+		sourceClient, err = NewOAuthClient(ctx, source.SourceURL, perSourceOAuthConfig, token)
 	} else {
 		sourceClient, err = NewClient(source.SourceURL, source.SourceUsername, sourcePassword)
 	}

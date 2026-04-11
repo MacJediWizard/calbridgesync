@@ -230,6 +230,19 @@ func (db *DB) migrate() error {
 		// AES-256-GCM Encryptor, same as source_password. Nullable
 		// because non-Google sources never populate it.
 		`ALTER TABLE sources ADD COLUMN oauth_refresh_token TEXT`,
+
+		// Migration (#79): Add per-source Google OAuth client
+		// credentials. Previously the OAuth client_id and client_secret
+		// were global env vars (GOOGLE_OAUTH_CLIENT_ID /
+		// GOOGLE_OAUTH_CLIENT_SECRET) shared across every Google source
+		// on the instance. That blocked multi-tenant use cases where
+		// each user has their own Google Cloud project. Now each
+		// Google source carries its own client_id (plain text — public
+		// identifier) and client_secret (encrypted, same as
+		// oauth_refresh_token and source_password). NULL for non-Google
+		// sources.
+		`ALTER TABLE sources ADD COLUMN google_client_id TEXT`,
+		`ALTER TABLE sources ADD COLUMN google_client_secret TEXT`,
 	}
 
 	for _, migration := range migrations {

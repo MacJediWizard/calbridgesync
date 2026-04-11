@@ -61,6 +61,11 @@ export interface PrepareGoogleSourceRequest {
   dest_url: string;
   dest_username: string;
   dest_password: string;
+  // Per-source Google OAuth credentials (#79). The user provides
+  // their own Google Cloud project client_id + client_secret instead
+  // of relying on a global env-var configured value.
+  google_client_id: string;
+  google_client_secret: string;
 }
 
 export interface PrepareGoogleSourceResponse {

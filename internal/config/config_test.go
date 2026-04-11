@@ -788,9 +788,11 @@ func TestConfigStructs(t *testing.T) {
 }
 
 // TestGoogleOAuthConfig_Enabled verifies the feature-gate helper. (#70)
-// Enabled() must return true only when BOTH client id and secret are
-// set; a half-configured state must be reported as disabled so we
-// don't start a flow that would fail at the token exchange step.
+// Enabled() reports whether the Google OAuth feature is usable on
+// this instance. As of #79 the per-source client_id / client_secret
+// live in the database (not in env vars), so the only instance-level
+// requirement is the redirect URL. Per-source credential validation
+// happens in the web handlers when each source is created.
 func TestGoogleOAuthConfig_Enabled(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -798,29 +800,14 @@ func TestGoogleOAuthConfig_Enabled(t *testing.T) {
 		wantOk bool
 	}{
 		{
-			name:   "both unset",
+			name:   "empty config is disabled",
 			cfg:    GoogleOAuthConfig{},
 			wantOk: false,
 		},
 		{
-			name:   "only client id",
-			cfg:    GoogleOAuthConfig{ClientID: "x"},
-			wantOk: false,
-		},
-		{
-			name:   "only client secret",
-			cfg:    GoogleOAuthConfig{ClientSecret: "y"},
-			wantOk: false,
-		},
-		{
-			name:   "both set",
-			cfg:    GoogleOAuthConfig{ClientID: "x", ClientSecret: "y"},
+			name:   "redirect url set is enabled",
+			cfg:    GoogleOAuthConfig{RedirectURL: "https://example.com/auth/oauth/google/callback"},
 			wantOk: true,
-		},
-		{
-			name:   "redirect url alone is not enough",
-			cfg:    GoogleOAuthConfig{RedirectURL: "https://example.com/cb"},
-			wantOk: false,
 		},
 	}
 	for _, tt := range tests {
