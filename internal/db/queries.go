@@ -800,7 +800,17 @@ func (db *DB) DeleteAllMalformedEventsForUser(userID string) (int64, error) {
 		return 0, fmt.Errorf("failed to delete all malformed events: %w", err)
 	}
 
-	deleted, _ := result.RowsAffected()
+	// Previously this call discarded the RowsAffected error with
+	// `deleted, _ :=`. Every other RowsAffected call in this file
+	// checks the error; this one did not, which meant a driver-side
+	// RowsAffected failure would silently return deleted=0 and make
+	// the UI show "0 events deleted" even if the DELETE itself
+	// succeeded. Matches the pattern used at line ~254/275/297/314/
+	// 361/446/619/768/889. (#91)
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected for delete all malformed events: %w", err)
+	}
 	return deleted, nil
 }
 
