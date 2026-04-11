@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -166,6 +167,16 @@ type ICSClient struct {
 // The second-pass audit flagged this gap after it observed that
 // PR #116 hardened the webhook path but left ICS completely
 // unvalidated. (#127)
+//
+// STRICT_ICS_HTTPS (#131): operators who want to enforce
+// HTTPS-only ICS feeds in production can set the env var
+// STRICT_ICS_HTTPS=true. When enabled, `http://` feed URLs are
+// rejected at save time. Default is OFF because LAN calendar
+// servers (Radicale, DavMail exports) often don't run TLS, and
+// flipping to strict-by-default would break existing
+// configurations on upgrade. The env var is read lazily inside
+// the validator so tests can toggle it via t.Setenv without
+// needing to reconstruct the ICSClient.
 func validateICSFeedURL(feedURL string) error {
 	if feedURL == "" {
 		return fmt.Errorf("ICS feed URL is required")
@@ -178,6 +189,13 @@ func validateICSFeedURL(feedURL string) error {
 	if scheme != "http" && scheme != "https" {
 		return fmt.Errorf("ICS feed URL scheme must be http or https, got %q", scheme)
 	}
+	// Optional strict-HTTPS mode (#131). Reads env var lazily at
+	// validation time so operators can flip the flag without
+	// restarting existing sync jobs — the next save-or-reload
+	// picks up the new value. Default off.
+	if scheme == "http" && isStrictICSHTTPS() {
+		return fmt.Errorf("ICS feed URL must use HTTPS when STRICT_ICS_HTTPS=true is set in the instance environment")
+	}
 	host := strings.ToLower(parsed.Hostname())
 	if host == "" {
 		return fmt.Errorf("ICS feed URL is missing a host")
@@ -189,6 +207,16 @@ func validateICSFeedURL(feedURL string) error {
 		return fmt.Errorf("ICS feed URL cannot point to .local or .internal hosts")
 	}
 	return nil
+}
+
+// isStrictICSHTTPS returns true if the operator has opted into
+// strict HTTPS enforcement for ICS feed URLs via the
+// STRICT_ICS_HTTPS environment variable. Accepts "true", "1",
+// "yes" (case-insensitive). Anything else, including unset, is
+// treated as false (the LAN-friendly default). (#131)
+func isStrictICSHTTPS() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("STRICT_ICS_HTTPS")))
+	return v == "true" || v == "1" || v == "yes"
 }
 
 // NewICSClient creates a new ICS feed client.
