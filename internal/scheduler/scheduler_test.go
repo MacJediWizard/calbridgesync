@@ -110,6 +110,90 @@ func TestSchedulerStartStop(t *testing.T) {
 		sched.Stop()
 		sched.Stop() // Should be safe to call multiple times
 	})
+
+	// TestSchedulerStop_DrainTimeout is the regression test for
+	// #133. It adds a goroutine to the scheduler's waitgroup that
+	// intentionally never returns, then calls Stop() with a very
+	// short stopDrainTimeout and verifies the call returns within
+	// the timeout window instead of hanging forever.
+	//
+	// Without the timeout added in #133, Stop() would block on
+	// wg.Wait() indefinitely because the dummy goroutine never
+	// calls wg.Done(). With the fix, Stop() logs a warning and
+	// returns when the drain timer fires.
+	t.Run("drain timeout forces return on stuck goroutine", func(t *testing.T) {
+		// Shrink the timeout so the test completes in reasonable
+		// wall-clock time. Restore at the end.
+		origTimeout := stopDrainTimeout
+		stopDrainTimeout = 50 * time.Millisecond
+		defer func() { stopDrainTimeout = origTimeout }()
+
+		sched := New(nil, nil, nil)
+
+		// Flip started = true so Stop() actually runs the drain
+		// logic (otherwise it short-circuits on !started).
+		sched.mu.Lock()
+		sched.started = true
+		sched.mu.Unlock()
+
+		// Add a goroutine to the waitgroup that blocks forever,
+		// simulating an in-flight sync that refuses to honor
+		// context cancellation. block channel ensures the
+		// goroutine is alive when Stop() is called.
+		block := make(chan struct{})
+		defer close(block) // let the goroutine exit after the test
+		sched.wg.Add(1)
+		go func() {
+			defer sched.wg.Done()
+			<-block
+		}()
+
+		start := time.Now()
+		sched.Stop()
+		elapsed := time.Since(start)
+
+		// Stop() must have returned within (timeout + scheduling
+		// jitter). Allow up to 5x the timeout as a generous upper
+		// bound to avoid CI flakiness.
+		if elapsed > 5*stopDrainTimeout {
+			t.Errorf("Stop() took %v, want < %v — drain timeout not enforced", elapsed, 5*stopDrainTimeout)
+		}
+		// And it must have taken at least the timeout (sanity
+		// check — we shouldn't be returning before the timer
+		// fires).
+		if elapsed < stopDrainTimeout/2 {
+			t.Errorf("Stop() returned in %v before drain timeout %v — the drain path didn't actually wait", elapsed, stopDrainTimeout)
+		}
+	})
+
+	t.Run("drain completes fast when goroutines exit promptly", func(t *testing.T) {
+		origTimeout := stopDrainTimeout
+		stopDrainTimeout = 5 * time.Second
+		defer func() { stopDrainTimeout = origTimeout }()
+
+		sched := New(nil, nil, nil)
+		sched.mu.Lock()
+		sched.started = true
+		sched.mu.Unlock()
+
+		// Add a goroutine that exits immediately when ctx is
+		// canceled. This models a well-behaved sync.
+		sched.wg.Add(1)
+		go func() {
+			defer sched.wg.Done()
+			<-sched.ctx.Done()
+		}()
+
+		start := time.Now()
+		sched.Stop()
+		elapsed := time.Since(start)
+
+		// Well-behaved goroutines should let Stop() return in
+		// milliseconds, well under the drain timeout.
+		if elapsed > stopDrainTimeout/2 {
+			t.Errorf("Stop() took %v with a well-behaved goroutine — should have drained in milliseconds", elapsed)
+		}
+	})
 }
 
 func TestGetSyncLock(t *testing.T) {

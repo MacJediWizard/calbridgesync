@@ -329,7 +329,42 @@ func (s *Scheduler) checkLiveness() {
 	}
 }
 
-// Stop gracefully shuts down all jobs.
+// stopDrainTimeout is the maximum time Stop will wait for in-flight
+// sync goroutines to drain after context cancellation. Exceeding it
+// logs a warning and returns anyway so the caller (typically main's
+// signal handler) is not blocked indefinitely on a stuck sync.
+//
+// Chosen smaller than the main.go shutdownTimeout (30s) so the
+// scheduler drain completes before the HTTP server's graceful
+// shutdown timer starts. 20s gives in-flight CalDAV operations
+// one or two more seconds of grace after s.cancel() propagates,
+// then surrenders — the alternative (no timeout) could block
+// main for up to syncTimeout = 2 hours if a sync ignores
+// context cancellation. (#133)
+//
+// Declared as var (not const) so tests can override with a very
+// short duration to exercise the timeout path in reasonable wall-
+// clock time. Production code never writes this value.
+var stopDrainTimeout = 20 * time.Second
+
+// Stop gracefully shuts down all jobs. Bounded by stopDrainTimeout
+// so the caller is not blocked indefinitely if an in-flight sync
+// fails to honor context cancellation.
+//
+// The process: cancel the scheduler's root context (which cascades
+// into every in-flight SyncSource via derived contexts), close job
+// stop channels, then wait for goroutines to return. Any goroutine
+// still running after stopDrainTimeout is left to its own devices
+// — the process is about to exit anyway, and the OS will reclaim
+// its resources.
+//
+// Before #133 this function called s.wg.Wait() with no timeout.
+// With syncTimeout = 2 hours, a single stuck sync could block
+// Stop() for that entire window, causing Kubernetes / Docker to
+// SIGKILL the pod (typical grace periods are 30s) and losing any
+// in-flight state that a proper drain would have preserved.
+// Bounding the wait is the operational fix: log loudly, surrender,
+// let the process exit cleanly within the orchestrator's budget.
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	if !s.started {
@@ -339,7 +374,11 @@ func (s *Scheduler) Stop() {
 	s.started = false
 	s.mu.Unlock()
 
-	// Cancel context to stop all jobs
+	// Cancel context to stop all jobs. This cascades into every
+	// in-flight SyncSource via the context chain in executeSync
+	// (ctx, cancel := context.WithTimeout(s.ctx, syncTimeout))
+	// so HTTP operations in flight should unblock within their
+	// current request's remaining timeout.
 	s.cancel()
 
 	// Stop all job tickers
@@ -351,9 +390,21 @@ func (s *Scheduler) Stop() {
 	s.jobs = make(map[string]*Job)
 	s.mu.Unlock()
 
-	// Wait for all goroutines to finish
-	s.wg.Wait()
-	log.Println("Scheduler stopped")
+	// Wait for all goroutines to finish, bounded by
+	// stopDrainTimeout so we can never block the caller longer
+	// than the outer shutdown grace period. (#133)
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("Scheduler stopped")
+	case <-time.After(stopDrainTimeout):
+		log.Printf("WARNING: scheduler Stop() drain timeout (%v) exceeded — forcing shutdown with in-flight goroutines still running. Check sync_timeout settings or investigate stuck CalDAV operations.", stopDrainTimeout)
+	}
 }
 
 // AddJob adds or replaces a sync job for a source.
