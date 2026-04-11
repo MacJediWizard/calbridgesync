@@ -1619,9 +1619,14 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			_, existsOnSource := sourceEventMap[uid]
 			_, existsOnDest := destEventMap[uid]
 			if !existsOnSource && !existsOnDest {
-				// Event deleted from both - just clean up the record
+				// Event deleted from both - just clean up the record.
+				// Silent-log was the original pattern; surface to
+				// Warnings so operators see tracking-row leaks in the
+				// sync result instead of only in raw logs. (#108)
 				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, syncedEvent.EventUID); err != nil {
-					log.Printf("Failed to delete synced event record: %v", err)
+					msg := fmt.Sprintf("Failed to delete orphaned synced event record for %s: %v", syncedEvent.EventUID, err)
+					log.Printf("%s", msg)
+					result.Warnings = append(result.Warnings, msg)
 				}
 			}
 		}
@@ -1944,6 +1949,15 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// sourceETag and destETag are what the next cycle will compare
 	// against to decide whether either side has changed — that is
 	// the fix for the infinite re-PUT loop in #79.
+	//
+	// We batch errors into a counter + first-error rather than
+	// appending one Warning per failing UID. A pathological DB
+	// outage could cause N failures where N == len(currentUIDs),
+	// which for a 1000-event calendar would flood SyncResult
+	// with 1000 near-identical warning strings. One aggregated
+	// warning is easier to read and still actionable. (#108)
+	upsertFailures := 0
+	var firstUpsertErr error
 	for uid, etags := range currentUIDs {
 		syncedEvent := &db.SyncedEvent{
 			SourceID:     source.ID,
@@ -1953,8 +1967,18 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			DestETag:     etags.destETag,
 		}
 		if err := se.db.UpsertSyncedEvent(syncedEvent); err != nil {
-			log.Printf("Failed to upsert synced event: %v", err)
+			log.Printf("Failed to upsert synced event for %s: %v", uid, err)
+			upsertFailures++
+			if firstUpsertErr == nil {
+				firstUpsertErr = err
+			}
 		}
+	}
+	if upsertFailures > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"Failed to upsert %d synced_events tracking rows at end of sync pass (first error: %v) - next cycle may retry unchanged events as if they were new",
+			upsertFailures, firstUpsertErr,
+		))
 	}
 
 	return result
