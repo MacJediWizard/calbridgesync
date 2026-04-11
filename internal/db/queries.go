@@ -97,11 +97,20 @@ func (db *DB) CreateSource(source *Source) error {
 		selectedCalendarsJSON = &s
 	}
 
+	// OAuth refresh token is stored in its own column; callers populate
+	// it directly on the Source struct before calling CreateSource
+	// (encrypted upstream by the API handler, same as passwords).
+	var oauthRefreshToken *string
+	if source.OAuthRefreshToken != "" {
+		t := source.OAuthRefreshToken
+		oauthRefreshToken = &t
+	}
+
 	query := `INSERT INTO sources (
 		id, user_id, name, source_type, source_url, source_username, source_password,
 		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-		selected_calendars, enabled, last_sync_status, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		selected_calendars, enabled, last_sync_status, oauth_refresh_token, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := db.conn.Exec(query,
 		source.ID, source.UserID, source.Name, source.SourceType,
@@ -109,7 +118,7 @@ func (db *DB) CreateSource(source *Source) error {
 		source.DestURL, source.DestUsername, source.DestPassword,
 		source.SyncInterval, source.SyncDaysPast, source.SyncDirection, source.ConflictStrategy,
 		selectedCalendarsJSON, source.Enabled,
-		source.LastSyncStatus, source.CreatedAt, source.UpdatedAt,
+		source.LastSyncStatus, oauthRefreshToken, source.CreatedAt, source.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create source: %w", err)
@@ -118,12 +127,17 @@ func (db *DB) CreateSource(source *Source) error {
 	return nil
 }
 
+// sourceSelectColumns is the canonical SELECT column list for sources,
+// kept in one place so every query + scan function stays in lockstep.
+// (#70) added oauth_refresh_token at the end so the positional scans
+// only needed a single new field.
+const sourceSelectColumns = `id, user_id, name, source_type, source_url, source_username, source_password,
+	dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
+	selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at, oauth_refresh_token`
+
 // GetSourceByID returns a source by its ID.
 func (db *DB) GetSourceByID(id string) (*Source, error) {
-	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
-		FROM sources WHERE id = ?`
+	query := `SELECT ` + sourceSelectColumns + ` FROM sources WHERE id = ?`
 
 	row := db.conn.QueryRow(query, id)
 	return scanSource(row)
@@ -132,10 +146,7 @@ func (db *DB) GetSourceByID(id string) (*Source, error) {
 // GetSourceByIDForUser returns a source by its ID only if it belongs to the user.
 // This prevents timing attacks by combining auth check with the query.
 func (db *DB) GetSourceByIDForUser(id, userID string) (*Source, error) {
-	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
-		FROM sources WHERE id = ? AND user_id = ?`
+	query := `SELECT ` + sourceSelectColumns + ` FROM sources WHERE id = ? AND user_id = ?`
 
 	row := db.conn.QueryRow(query, id, userID)
 	return scanSource(row)
@@ -143,10 +154,7 @@ func (db *DB) GetSourceByIDForUser(id, userID string) (*Source, error) {
 
 // GetSourcesByUserID returns all sources for a user.
 func (db *DB) GetSourcesByUserID(userID string) ([]*Source, error) {
-	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
-		FROM sources WHERE user_id = ? ORDER BY name`
+	query := `SELECT ` + sourceSelectColumns + ` FROM sources WHERE user_id = ? ORDER BY name`
 
 	rows, err := db.conn.Query(query, userID)
 	if err != nil {
@@ -172,10 +180,7 @@ func (db *DB) GetSourcesByUserID(userID string) ([]*Source, error) {
 
 // GetEnabledSources returns all enabled sources.
 func (db *DB) GetEnabledSources() ([]*Source, error) {
-	query := `SELECT id, user_id, name, source_type, source_url, source_username, source_password,
-		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-		selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at
-		FROM sources WHERE enabled = 1`
+	query := `SELECT ` + sourceSelectColumns + ` FROM sources WHERE enabled = 1`
 
 	rows, err := db.conn.Query(query)
 	if err != nil {
@@ -219,16 +224,28 @@ func (db *DB) UpdateSource(source *Source) error {
 		selectedCalendarsJSON = &s
 	}
 
+	// Only write oauth_refresh_token if the caller populated it.
+	// An empty string on UpdateSource must NOT clobber an existing
+	// refresh token — that would silently break a working Google
+	// source. Use UpdateSourceOAuthRefreshToken to change it explicitly.
+	var oauthRefreshToken *string
+	if source.OAuthRefreshToken != "" {
+		t := source.OAuthRefreshToken
+		oauthRefreshToken = &t
+	}
+
 	query := `UPDATE sources SET
 		name = ?, source_type = ?, source_url = ?, source_username = ?, source_password = ?,
 		dest_url = ?, dest_username = ?, dest_password = ?, sync_interval = ?, sync_days_past = ?,
-		sync_direction = ?, conflict_strategy = ?, selected_calendars = ?, enabled = ?, updated_at = ?
+		sync_direction = ?, conflict_strategy = ?, selected_calendars = ?, enabled = ?,
+		oauth_refresh_token = COALESCE(?, oauth_refresh_token), updated_at = ?
 		WHERE id = ?`
 
 	result, err := db.conn.Exec(query,
 		source.Name, source.SourceType, source.SourceURL, source.SourceUsername, source.SourcePassword,
 		source.DestURL, source.DestUsername, source.DestPassword, source.SyncInterval, source.SyncDaysPast,
-		source.SyncDirection, source.ConflictStrategy, selectedCalendarsJSON, source.Enabled, source.UpdatedAt, source.ID,
+		source.SyncDirection, source.ConflictStrategy, selectedCalendarsJSON, source.Enabled,
+		oauthRefreshToken, source.UpdatedAt, source.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update source: %w", err)
@@ -473,6 +490,7 @@ func scanSource(row *sql.Row) (*Source, error) {
 	var lastSyncMessage sql.NullString
 	var syncDirection sql.NullString
 	var selectedCalendarsJSON sql.NullString
+	var oauthRefreshToken sql.NullString
 
 	err := row.Scan(
 		&source.ID, &source.UserID, &source.Name, &source.SourceType,
@@ -481,7 +499,7 @@ func scanSource(row *sql.Row) (*Source, error) {
 		&source.SyncInterval, &source.SyncDaysPast, &syncDirection, &source.ConflictStrategy,
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
-		&source.CreatedAt, &source.UpdatedAt,
+		&source.CreatedAt, &source.UpdatedAt, &oauthRefreshToken,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -497,6 +515,9 @@ func scanSource(row *sql.Row) (*Source, error) {
 	source.SyncDirection = SyncDirection(syncDirection.String)
 	if source.SyncDirection == "" {
 		source.SyncDirection = SyncDirectionOneWay
+	}
+	if oauthRefreshToken.Valid {
+		source.OAuthRefreshToken = oauthRefreshToken.String
 	}
 
 	// Decode selected_calendars from JSON (backward compatible)
@@ -514,6 +535,7 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 	var lastSyncMessage sql.NullString
 	var syncDirection sql.NullString
 	var selectedCalendarsJSON sql.NullString
+	var oauthRefreshToken sql.NullString
 
 	err := rows.Scan(
 		&source.ID, &source.UserID, &source.Name, &source.SourceType,
@@ -522,7 +544,7 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 		&source.SyncInterval, &source.SyncDaysPast, &syncDirection, &source.ConflictStrategy,
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
-		&source.CreatedAt, &source.UpdatedAt,
+		&source.CreatedAt, &source.UpdatedAt, &oauthRefreshToken,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan source: %w", err)
@@ -535,6 +557,9 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 	source.SyncDirection = SyncDirection(syncDirection.String)
 	if source.SyncDirection == "" {
 		source.SyncDirection = SyncDirectionOneWay
+	}
+	if oauthRefreshToken.Valid {
+		source.OAuthRefreshToken = oauthRefreshToken.String
 	}
 
 	// Decode selected_calendars from JSON (backward compatible)

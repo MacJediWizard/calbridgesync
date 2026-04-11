@@ -170,13 +170,17 @@ type UserAlertPreferences struct {
 
 // Source represents a calendar source configuration.
 type Source struct {
-	ID                string           `json:"id"`
-	UserID            string           `json:"user_id"`
-	Name              string           `json:"name"`
-	SourceType        SourceType       `json:"source_type"`
-	SourceURL         string           `json:"source_url"`
-	SourceUsername    string           `json:"source_username"`
-	SourcePassword    string           `json:"-"` // Never include in JSON
+	ID             string     `json:"id"`
+	UserID         string     `json:"user_id"`
+	Name           string     `json:"name"`
+	SourceType     SourceType `json:"source_type"`
+	SourceURL      string     `json:"source_url"`
+	SourceUsername string     `json:"source_username"`
+	SourcePassword string     `json:"-"` // Never include in JSON
+	// OAuthRefreshToken holds the encrypted Google OAuth2 refresh
+	// token for source_type == google. Empty for all other source
+	// types. Never exposed via JSON. (#70)
+	OAuthRefreshToken string           `json:"-"`
 	DestURL           string           `json:"dest_url"`
 	DestUsername      string           `json:"dest_username"`
 	DestPassword      string           `json:"-"` // Never include in JSON

@@ -785,3 +785,48 @@ func TestConfigStructs(t *testing.T) {
 		}
 	})
 }
+
+// TestGoogleOAuthConfig_Enabled verifies the feature-gate helper. (#70)
+// Enabled() must return true only when BOTH client id and secret are
+// set; a half-configured state must be reported as disabled so we
+// don't start a flow that would fail at the token exchange step.
+func TestGoogleOAuthConfig_Enabled(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    GoogleOAuthConfig
+		wantOk bool
+	}{
+		{
+			name:   "both unset",
+			cfg:    GoogleOAuthConfig{},
+			wantOk: false,
+		},
+		{
+			name:   "only client id",
+			cfg:    GoogleOAuthConfig{ClientID: "x"},
+			wantOk: false,
+		},
+		{
+			name:   "only client secret",
+			cfg:    GoogleOAuthConfig{ClientSecret: "y"},
+			wantOk: false,
+		},
+		{
+			name:   "both set",
+			cfg:    GoogleOAuthConfig{ClientID: "x", ClientSecret: "y"},
+			wantOk: true,
+		},
+		{
+			name:   "redirect url alone is not enough",
+			cfg:    GoogleOAuthConfig{RedirectURL: "https://example.com/cb"},
+			wantOk: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.Enabled(); got != tt.wantOk {
+				t.Errorf("Enabled() = %v, want %v", got, tt.wantOk)
+			}
+		})
+	}
+}

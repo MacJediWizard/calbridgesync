@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -10,10 +11,35 @@ import (
 )
 
 const (
-	sessionName     = "calbridgesync_session"
-	oauthStateName  = "calbridgesync_oauth_state"
-	csrfTokenLength = 32
+	sessionName             = "calbridgesync_session"
+	oauthStateName          = "calbridgesync_oauth_state"
+	googlePendingSourceName = "calbridgesync_google_pending" // #70
+	csrfTokenLength         = 32
+	// pendingSourceMaxAge is how long a pending Google source can sit
+	// in its cookie between form submit and OAuth callback. Long
+	// enough for the user to go through Google's consent screen,
+	// short enough that a stale cookie doesn't pile up. (#70)
+	pendingSourceMaxAge = 900 // 15 minutes
 )
+
+// PendingGoogleSource holds the form data for a Google source that is
+// mid-OAuth. It's stashed in a short-lived session cookie between the
+// "prepare" API call and the OAuth callback, then read and cleared by
+// the callback when it creates the real Source row. DestPassword is
+// already encrypted via the application's AES-256-GCM Encryptor
+// before it lands in this struct — the session cookie does NOT carry
+// a plaintext password. (#70)
+type PendingGoogleSource struct {
+	State            string `json:"state"`
+	Name             string `json:"name"`
+	SyncInterval     int    `json:"sync_interval"`
+	SyncDaysPast     int    `json:"sync_days_past"`
+	SyncDirection    string `json:"sync_direction"`
+	ConflictStrategy string `json:"conflict_strategy"`
+	DestURL          string `json:"dest_url"`
+	DestUsername     string `json:"dest_username"`
+	DestPasswordEnc  string `json:"dest_password_enc"` // already encrypted
+}
 
 var (
 	ErrSessionNotFound = errors.New("session not found")
@@ -31,9 +57,9 @@ type SessionData struct {
 
 // SessionManager manages user sessions.
 type SessionManager struct {
-	store             *sessions.CookieStore
-	secure            bool
-	oauthStateMaxAge  int // OAuth state timeout in seconds
+	store            *sessions.CookieStore
+	secure           bool
+	oauthStateMaxAge int // OAuth state timeout in seconds
 }
 
 // NewSessionManager creates a new session manager.
@@ -171,6 +197,59 @@ func (sm *SessionManager) GetOAuthState(w http.ResponseWriter, r *http.Request) 
 	}
 
 	return state, nil
+}
+
+// SetPendingGoogleSource stores a pending Google source form in a
+// short-lived session cookie. Used between the "prepare" API call
+// (which validates the form) and the OAuth callback (which reads it
+// back and creates the real Source row after Google returns the
+// refresh token). (#70)
+func (sm *SessionManager) SetPendingGoogleSource(w http.ResponseWriter, r *http.Request, data *PendingGoogleSource) error {
+	session, err := sm.store.Get(r, googlePendingSourceName)
+	if err != nil {
+		session, err = sm.store.New(r, googlePendingSourceName)
+		if err != nil {
+			return err
+		}
+	}
+
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	session.Values["pending"] = string(encoded)
+	session.Options.MaxAge = pendingSourceMaxAge
+
+	return session.Save(r, w)
+}
+
+// GetPendingGoogleSource retrieves and clears the pending Google
+// source. The clear-on-read semantics mean a pending source can only
+// be consumed once — replaying the OAuth callback will fail. (#70)
+func (sm *SessionManager) GetPendingGoogleSource(w http.ResponseWriter, r *http.Request) (*PendingGoogleSource, error) {
+	session, err := sm.store.Get(r, googlePendingSourceName)
+	if err != nil {
+		return nil, err
+	}
+
+	encoded, ok := session.Values["pending"].(string)
+	if !ok || encoded == "" {
+		return nil, ErrInvalidSession
+	}
+
+	var data PendingGoogleSource
+	if err := json.Unmarshal([]byte(encoded), &data); err != nil {
+		return nil, err
+	}
+
+	// Clear the cookie after reading
+	session.Options.MaxAge = -1
+	if err := session.Save(r, w); err != nil {
+		return nil, err
+	}
+
+	return &data, nil
 }
 
 // GenerateState generates a random state string for OAuth.

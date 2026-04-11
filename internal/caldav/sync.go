@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/oauth2"
+
 	"github.com/macjediwizard/calbridgesync/internal/activity"
 	"github.com/macjediwizard/calbridgesync/internal/crypto"
 	"github.com/macjediwizard/calbridgesync/internal/db"
@@ -294,14 +296,23 @@ type SyncEngine struct {
 	db        *db.DB
 	encryptor *crypto.Encryptor
 	tracker   *activity.Tracker
+	// googleOAuth is the OAuth2 configuration used when syncing
+	// source_type == google. Nil if the feature is not configured on
+	// this instance; SyncSource will then surface a clear error
+	// instead of silently falling back to Basic Auth (which Google
+	// would reject anyway). (#70)
+	googleOAuth *oauth2.Config
 }
 
-// NewSyncEngine creates a new sync engine.
-func NewSyncEngine(database *db.DB, encryptor *crypto.Encryptor) *SyncEngine {
+// NewSyncEngine creates a new sync engine. googleOAuth is optional
+// and should be nil unless Google OAuth2 credentials have been
+// configured via GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET.
+func NewSyncEngine(database *db.DB, encryptor *crypto.Encryptor, googleOAuth *oauth2.Config) *SyncEngine {
 	return &SyncEngine{
-		db:        database,
-		encryptor: encryptor,
-		tracker:   activity.NewTracker(),
+		db:          database,
+		encryptor:   encryptor,
+		tracker:     activity.NewTracker(),
+		googleOAuth: googleOAuth,
 	}
 }
 
@@ -331,13 +342,22 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	}
 
 	// Decrypt credentials - NEVER log these
-	sourcePassword, err := se.encryptor.Decrypt(source.SourcePassword)
-	if err != nil {
-		result.Message = "Failed to decrypt source credentials"
-		result.Errors = append(result.Errors, err.Error())
-		result.Duration = time.Since(start)
-		se.finishSync(source.ID, result)
-		return result
+	// For Google OAuth sources, SourcePassword is empty and we decrypt
+	// the refresh token instead. For all other source types, we use
+	// the standard Basic Auth path.
+	isGoogleOAuth := source.SourceType == db.SourceTypeGoogle && source.OAuthRefreshToken != ""
+
+	var sourcePassword string
+	if !isGoogleOAuth {
+		decPassword, decErr := se.encryptor.Decrypt(source.SourcePassword)
+		if decErr != nil {
+			result.Message = "Failed to decrypt source credentials"
+			result.Errors = append(result.Errors, decErr.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+		sourcePassword = decPassword
 	}
 
 	destPassword, err := se.encryptor.Decrypt(source.DestPassword)
@@ -349,8 +369,42 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		return result
 	}
 
-	// Create source client
-	sourceClient, err := NewClient(source.SourceURL, source.SourceUsername, sourcePassword)
+	// Create source client — branch on source type (#70).
+	// Google sources use OAuth2 Bearer auth; everything else uses
+	// Basic Auth. A Google source without an OAuth config on the
+	// server or without a stored refresh token is a hard failure —
+	// we must not silently fall back to Basic Auth because Google
+	// will reject it with 401, which would look like bad credentials
+	// even though the real fix is to finish configuring OAuth.
+	var sourceClient *Client
+	if source.SourceType == db.SourceTypeGoogle {
+		if se.googleOAuth == nil {
+			result.Message = "Google OAuth is not configured on this server (GOOGLE_OAUTH_CLIENT_ID missing)"
+			result.Errors = append(result.Errors, result.Message)
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+		if source.OAuthRefreshToken == "" {
+			result.Message = "Google source is missing its OAuth refresh token — reconnect via the web UI"
+			result.Errors = append(result.Errors, result.Message)
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+		refreshToken, decErr := se.encryptor.Decrypt(source.OAuthRefreshToken)
+		if decErr != nil {
+			result.Message = "Failed to decrypt Google OAuth refresh token"
+			result.Errors = append(result.Errors, decErr.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+		token := &oauth2.Token{RefreshToken: refreshToken}
+		sourceClient, err = NewOAuthClient(ctx, source.SourceURL, se.googleOAuth, token)
+	} else {
+		sourceClient, err = NewClient(source.SourceURL, source.SourceUsername, sourcePassword)
+	}
 	if err != nil {
 		result.Message = "Failed to connect to source"
 		result.Errors = append(result.Errors, err.Error())

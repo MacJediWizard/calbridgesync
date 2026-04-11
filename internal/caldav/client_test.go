@@ -802,7 +802,7 @@ func TestSanitizeLogDetails(t *testing.T) {
 
 func TestNewSyncEngine(t *testing.T) {
 	t.Run("creates sync engine with nil dependencies", func(t *testing.T) {
-		engine := NewSyncEngine(nil, nil)
+		engine := NewSyncEngine(nil, nil, nil)
 
 		if engine == nil {
 			t.Fatal("expected non-nil engine")
@@ -1347,7 +1347,7 @@ func TestSanitizeLogDetailsEdgeCases(t *testing.T) {
 
 func TestSyncEngineTestConnection(t *testing.T) {
 	t.Run("returns error for invalid URL", func(t *testing.T) {
-		engine := NewSyncEngine(nil, nil)
+		engine := NewSyncEngine(nil, nil, nil)
 
 		err := engine.TestConnection(context.Background(), "", "user", "pass")
 		if err == nil {

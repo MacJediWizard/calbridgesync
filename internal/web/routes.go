@@ -33,6 +33,14 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		authGroup.POST("/login", h.Login)
 		authGroup.GET("/callback", h.Callback)
 		authGroup.POST("/logout", h.Logout)
+
+		// Google Calendar OAuth2 source flow (#70). /start is a
+		// debugging entry point; the real path is the SPA calling
+		// POST /api/sources/google/prepare and then navigating
+		// directly to the returned URL. /callback is the redirect
+		// URI registered in Google Cloud Console.
+		authGroup.GET("/oauth/google/start", h.GoogleOAuthStart)
+		authGroup.GET("/oauth/google/callback", h.GoogleOAuthCallback)
 	}
 
 	// General API routes - 30 req/s handles typical SPA usage (page loads fetch multiple endpoints)
@@ -78,9 +86,10 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	expensiveAPI.Use(ValidateOrigin())
 	expensiveAPI.Use(RequireJSONContentType())
 	{
-		expensiveAPI.POST("/sources", h.APICreateSource)                      // Tests connections to CalDAV servers
-		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars)      // Discovers calendars via network
-		expensiveAPI.POST("/settings/alerts/test-webhook", h.APITestWebhook)  // Tests webhook via network
+		expensiveAPI.POST("/sources", h.APICreateSource)                       // Tests connections to CalDAV servers
+		expensiveAPI.POST("/sources/google/prepare", h.APIPrepareGoogleSource) // Tests dest + stashes pending Google source (#70)
+		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars)       // Discovers calendars via network
+		expensiveAPI.POST("/settings/alerts/test-webhook", h.APITestWebhook)   // Tests webhook via network
 	}
 
 	// Serve React app static files

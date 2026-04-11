@@ -1,10 +1,29 @@
-import { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { createSource, discoverCalendars } from '../services/api';
+import { useEffect, useState } from 'react';
+import { useNavigate, Link, useSearchParams } from 'react-router-dom';
+import { createSource, discoverCalendars, prepareGoogleSource } from '../services/api';
 import type { SourceFormData, Calendar } from '../types';
+
+// Human-readable mapping for the error query params the backend
+// Google OAuth callback redirects back with when something goes
+// wrong. Keep this in sync with internal/web/oauth_google.go. (#70)
+const GOOGLE_OAUTH_ERRORS: Record<string, string> = {
+  google_not_configured: 'Google OAuth is not configured on this server. Ask your admin to set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET.',
+  invalid_state: 'OAuth state mismatch. Please start the flow again.',
+  google_denied: 'You denied the Google consent request.',
+  missing_code: 'Google did not return an authorization code.',
+  exchange_failed: 'Failed to exchange the authorization code with Google.',
+  no_refresh_token: 'Google did not return a refresh token. Revoke access at https://myaccount.google.com/permissions and try again.',
+  userinfo_failed: 'Could not fetch your Google account info.',
+  pending_expired: 'The OAuth flow timed out. Please start again.',
+  state_mismatch: 'OAuth state mismatch (pending). Please start again.',
+  encrypt_failed: 'Internal error encrypting the refresh token.',
+  create_failed: 'Failed to create the source after successful OAuth.',
+  start_via_prepare: 'Start the Google OAuth flow by submitting the form first.',
+};
 
 export default function SourceAdd() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
@@ -25,6 +44,18 @@ export default function SourceAdd() {
     conflict_strategy: 'source_wins',
     selected_calendars: [],
   });
+
+  // Surface Google OAuth errors returned by the backend callback as a
+  // query param. The callback uses ?error=<code> because it's doing a
+  // full-page redirect, not an API response. (#70)
+  useEffect(() => {
+    const errCode = searchParams.get('error');
+    if (errCode && GOOGLE_OAUTH_ERRORS[errCode]) {
+      setError(GOOGLE_OAUTH_ERRORS[errCode]);
+      // Pre-select Google so the user lands back on the right form state
+      setForm(prev => ({ ...prev, source_type: 'google' }));
+    }
+  }, [searchParams]);
 
   const handleDiscoverCalendars = async () => {
     if (!form.source_url || !form.source_username || !form.source_password) {
@@ -80,6 +111,10 @@ export default function SourceAdd() {
   };
 
   const isICS = form.source_type === 'ics';
+  // Google sources authenticate via OAuth2 (#70). Source URL/username/
+  // password fields are hidden because they come from Google after
+  // the user approves consent, not from the form.
+  const isGoogleOAuth = form.source_type === 'google';
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
@@ -104,6 +139,23 @@ export default function SourceAdd() {
     setError(null);
 
     try {
+      if (isGoogleOAuth) {
+        // Google sources take a different path: hand the form to the
+        // prepare endpoint, then redirect to Google's consent screen.
+        // The backend callback creates the source and redirects back. (#70)
+        const { redirect_url } = await prepareGoogleSource({
+          name: form.name,
+          sync_interval: form.sync_interval,
+          sync_days_past: form.sync_days_past,
+          sync_direction: form.sync_direction,
+          conflict_strategy: form.conflict_strategy,
+          dest_url: form.dest_url,
+          dest_username: form.dest_username,
+          dest_password: form.dest_password,
+        });
+        window.location.href = redirect_url;
+        return;
+      }
       await createSource(form);
       navigate('/sources');
     } catch (err: unknown) {
@@ -226,57 +278,75 @@ export default function SourceAdd() {
               {/* Source Server */}
               <div className="space-y-4">
                 <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide border-b border-zinc-800 pb-2">
-                  {isICS ? 'ICS Feed' : 'Source Server'}
+                  {isICS ? 'ICS Feed' : isGoogleOAuth ? 'Google Account' : 'Source Server'}
                 </h3>
-                <div>
-                  <label htmlFor="source_url" className="block text-sm font-medium text-gray-300 mb-1">
-                    {isICS ? 'ICS Feed URL' : 'CalDAV URL'}
-                  </label>
-                  <input
-                    type="url"
-                    name="source_url"
-                    id="source_url"
-                    value={form.source_url}
-                    onChange={handleChange}
-                    required
-                    placeholder={isICS ? 'https://example.com/calendar.ics' : 'https://caldav.example.com/calendars/user/'}
-                    className="w-full"
-                  />
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label htmlFor="source_username" className="block text-sm font-medium text-gray-300 mb-1">
-                      Username {isICS && <span className="text-gray-500">(optional)</span>}
-                    </label>
-                    <input
-                      type="text"
-                      name="source_username"
-                      id="source_username"
-                      value={form.source_username}
-                      onChange={handleChange}
-                      required={!isICS}
-                      placeholder="user@example.com"
-                      className="w-full"
-                    />
-                  </div>
-                  <div>
-                    <label htmlFor="source_password" className="block text-sm font-medium text-gray-300 mb-1">
-                      Password {isICS && <span className="text-gray-500">(optional)</span>}
-                    </label>
-                    <input
-                      type="password"
-                      name="source_password"
-                      id="source_password"
-                      value={form.source_password}
-                      onChange={handleChange}
-                      required={!isICS}
-                      className="w-full"
-                    />
-                  </div>
-                </div>
 
-                {/* Calendar Discovery (not for ICS) */}
-                {!isICS && <div className="pt-2">
+                {isGoogleOAuth ? (
+                  /* Google sources use OAuth2 — no URL/username/password fields. (#70) */
+                  <div className="p-4 rounded border border-zinc-700 bg-black/30 space-y-3">
+                    <p className="text-sm text-white">
+                      Google Calendar requires OAuth2. When you click <span className="font-semibold">Connect Google Account & Save</span>, you'll be redirected to Google to sign in and approve calendar access.
+                    </p>
+                    <p className="text-xs text-gray-400">
+                      calbridgesync will store a refresh token so it can sync on your behalf. You can revoke access at any time at <a href="https://myaccount.google.com/permissions" className="text-red-400 underline" target="_blank" rel="noreferrer">myaccount.google.com/permissions</a>.
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Your admin must have configured <code className="text-red-400">GOOGLE_OAUTH_CLIENT_ID</code> and <code className="text-red-400">GOOGLE_OAUTH_CLIENT_SECRET</code> on this server for this to work.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <label htmlFor="source_url" className="block text-sm font-medium text-gray-300 mb-1">
+                        {isICS ? 'ICS Feed URL' : 'CalDAV URL'}
+                      </label>
+                      <input
+                        type="url"
+                        name="source_url"
+                        id="source_url"
+                        value={form.source_url}
+                        onChange={handleChange}
+                        required
+                        placeholder={isICS ? 'https://example.com/calendar.ics' : 'https://caldav.example.com/calendars/user/'}
+                        className="w-full"
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label htmlFor="source_username" className="block text-sm font-medium text-gray-300 mb-1">
+                          Username {isICS && <span className="text-gray-500">(optional)</span>}
+                        </label>
+                        <input
+                          type="text"
+                          name="source_username"
+                          id="source_username"
+                          value={form.source_username}
+                          onChange={handleChange}
+                          required={!isICS}
+                          placeholder="user@example.com"
+                          className="w-full"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="source_password" className="block text-sm font-medium text-gray-300 mb-1">
+                          Password {isICS && <span className="text-gray-500">(optional)</span>}
+                        </label>
+                        <input
+                          type="password"
+                          name="source_password"
+                          id="source_password"
+                          value={form.source_password}
+                          onChange={handleChange}
+                          required={!isICS}
+                          className="w-full"
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {/* Calendar Discovery (not for ICS or Google OAuth) */}
+                {!isICS && !isGoogleOAuth && <div className="pt-2">
                   <button
                     type="button"
                     onClick={handleDiscoverCalendars}
@@ -395,7 +465,13 @@ export default function SourceAdd() {
                   disabled={loading}
                   className="px-4 py-2 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition-colors disabled:opacity-50"
                 >
-                  {loading ? 'Adding...' : 'Add Source'}
+                  {loading
+                    ? isGoogleOAuth
+                      ? 'Redirecting to Google...'
+                      : 'Adding...'
+                    : isGoogleOAuth
+                    ? 'Connect Google Account & Save'
+                    : 'Add Source'}
                 </button>
               </div>
             </form>

@@ -45,6 +45,33 @@ export const createSource = async (data: SourceFormData): Promise<Source> => {
   return response.data;
 };
 
+// Google OAuth2 source preparation (#70).
+// Called when the user picks source_type=google in the add-source
+// form. The backend validates the form, tests the destination,
+// stashes the encrypted form in a session cookie, and returns a URL
+// to redirect to Google's consent screen. After the user approves at
+// Google, the backend callback creates the real source and
+// redirects back to /sources.
+export interface PrepareGoogleSourceRequest {
+  name: string;
+  sync_interval: number;
+  sync_days_past: number;
+  sync_direction: string;
+  conflict_strategy: string;
+  dest_url: string;
+  dest_username: string;
+  dest_password: string;
+}
+
+export interface PrepareGoogleSourceResponse {
+  redirect_url: string;
+}
+
+export const prepareGoogleSource = async (data: PrepareGoogleSourceRequest): Promise<PrepareGoogleSourceResponse> => {
+  const response = await api.post('/sources/google/prepare', data);
+  return response.data;
+};
+
 export const updateSource = async (id: string, data: Partial<SourceFormData>): Promise<Source> => {
   const response = await api.put(`/sources/${id}`, data);
   return response.data;
