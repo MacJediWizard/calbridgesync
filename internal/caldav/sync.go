@@ -104,6 +104,64 @@ func shouldSkipTwoWayCreate(direction db.SyncDirection, sourceEventCount, previo
 		previouslySyncedCount > 0
 }
 
+// syncETagEntry tracks the last-observed source and destination ETags
+// for a single event UID during a sync pass. Collected as the sync
+// iterates through events, then written to the synced_events table in
+// the final upsert loop so the NEXT cycle can detect whether either
+// side has actually changed since this sync.
+//
+// The ETags are opaque, server-generated strings — a CalDAV ETag from
+// iCloud and a CalDAV ETag from SOGo for the SAME underlying event
+// will never match each other. They are only meaningful when compared
+// against a previously-stored value from the SAME server. That is why
+// we store both sides independently. (#79)
+type syncETagEntry struct {
+	sourceETag string
+	destETag   string
+}
+
+// shouldUpdateDestFromSource decides whether to PUT a source event onto
+// the destination during the forward update branch of the sync loop.
+//
+// Correctness depends on comparing against the LAST-KNOWN source ETag
+// from previouslySyncedMap, not against the destination's current ETag
+// — cross-server ETag comparison is meaningless (every server mints
+// its own opaque string), which is the bug that produced the infinite
+// re-PUT loop in #79.
+//
+// Three cases:
+//
+//   - prev == nil: the caller already handled "no prior record" via
+//     the create branch. Defensive default — allow the update.
+//   - prev.SourceETag == "": legacy record from before ETag tracking
+//     was wired in. Don't re-PUT the whole calendar on first deploy;
+//     skip and let this cycle's upsert start tracking ETags from the
+//     current source state. If the source genuinely changed in the
+//     meantime, we accept a one-cycle propagation delay in exchange
+//     for not thundering-herd the destination on rollout.
+//   - prev.SourceETag != "": a real ETag we can compare. PUT iff the
+//     current source ETag differs from the stored one.
+func shouldUpdateDestFromSource(sourceETag string, prev *db.SyncedEvent) bool {
+	if prev == nil {
+		return true
+	}
+	if prev.SourceETag == "" {
+		return false
+	}
+	return prev.SourceETag != sourceETag
+}
+
+// shouldUpdateSourceFromDest is the symmetric helper for the reverse
+// dest_wins update pass. See shouldUpdateDestFromSource for the full
+// rationale — the only difference is we compare destETag against the
+// last-known DEST ETag from prev. (#79)
+func shouldUpdateSourceFromDest(destETag string, prev *db.SyncedEvent) bool {
+	if prev == nil || prev.DestETag == "" {
+		return false
+	}
+	return prev.DestETag != destETag
+}
+
 // planReverseCreate determines which destination events should be uploaded
 // to source as new creates during a two-way sync. It is the mirror of
 // planOrphanDeletion for the reverse direction.
@@ -760,11 +818,17 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 						// successfully parses the calendar data; if the
 						// event had no UID it cannot reach this branch
 						// (PutEvent returns nil early without writing).
+						//
+						// Populate SourceETag from the source item we
+						// just read (stored in item.ETag) so the next
+						// cycle of the main sync path can skip the PUT
+						// when the source has not changed. (#79)
 						if event.UID != "" {
 							syncedEvent := &db.SyncedEvent{
 								SourceID:     source.ID,
 								CalendarHref: calendar.Path,
 								EventUID:     event.UID,
+								SourceETag:   item.ETag,
 							}
 							if err := se.db.UpsertSyncedEvent(syncedEvent); err != nil {
 								log.Printf("Failed to upsert synced event record for %s: %v", event.UID, err)
@@ -1034,8 +1098,12 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 
 	skippedDupes := 0
 
-	// Track UIDs that exist in current sync (for updating synced_events table)
-	currentUIDs := make(map[string]bool)
+	// Track UIDs that exist in current sync (for updating synced_events
+	// table). Values hold the observed source and destination ETags so
+	// the next cycle can detect whether either side has changed without
+	// doing the cross-server ETag comparison that caused the re-PUT
+	// loop in #79.
+	currentUIDs := make(map[string]syncETagEntry)
 
 	// Update status to show processing phase
 	updateStatus(fmt.Sprintf("processing %d events", len(sourceEvents)))
@@ -1161,12 +1229,22 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				if dedupeKey != "|" {
 					destDedupeMap[dedupeKey] = true
 				}
-				currentUIDs[sourceEvent.UID] = true
+				// Record the source ETag so the next cycle can skip
+				// the PUT if the source has not changed. No dest ETag
+				// yet — PutEvent does not return one on create; the
+				// next cycle will read it from PROPFIND and populate
+				// the dest side at that point. (#79)
+				currentUIDs[sourceEvent.UID] = syncETagEntry{sourceETag: sourceEvent.ETag}
 			}
 			result.EventsProcessed++
 			updateProgress()
-		} else if sourceEvent.ETag != destEvent.ETag {
-			// Update existing event
+		} else if shouldUpdateDestFromSource(sourceEvent.ETag, previouslySyncedMap[sourceEvent.UID]) {
+			// Source ETag has changed since the last recorded sync
+			// (or this is a first-time update with tracked ETags).
+			// Only then do we actually PUT. Comparing sourceEvent.ETag
+			// against destEvent.ETag directly is WRONG — they come
+			// from different servers and will never match, which was
+			// the cause of the infinite re-PUT loop fixed in #79.
 			sourceEvent.Path = destEvent.Path
 			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
 				if errors.Is(err, ErrEventSkipped) {
@@ -1180,13 +1258,32 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				}
 			} else {
 				result.Updated++
-				currentUIDs[sourceEvent.UID] = true
+				// Record both ETags: source from the server we just
+				// read, dest from the server we just wrote. Note the
+				// dest ETag here is the OLD one — we don't have the
+				// new one from PutEvent's response. The next read
+				// cycle will refresh it. That is fine: the forward
+				// path compares against the SOURCE ETag, and the
+				// reverse dest_wins path that reads DestETag will
+				// either see this stale value (correctly triggering
+				// an update back to source on the first cycle where
+				// it runs) or the refreshed value. (#79)
+				currentUIDs[sourceEvent.UID] = syncETagEntry{
+					sourceETag: sourceEvent.ETag,
+					destETag:   destEvent.ETag,
+				}
 			}
 			result.EventsProcessed++
 			updateProgress()
 		} else {
-			// Event unchanged, still track it
-			currentUIDs[sourceEvent.UID] = true
+			// Event unchanged (source ETag matches stored prior ETag),
+			// still track it so the synced_events upsert at end of
+			// pass keeps it alive. Record both ETags from this cycle
+			// so the next cycle has fresh reference points. (#79)
+			currentUIDs[sourceEvent.UID] = syncETagEntry{
+				sourceETag: sourceEvent.ETag,
+				destETag:   destEvent.ETag,
+			}
 			result.EventsProcessed++
 			updateProgress()
 		}
@@ -1242,8 +1339,14 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		// in planReverseCreate skips this dest event instead of
 		// proposing another upload. This stops the infinite-retry
 		// loop for content duplicates. (#78)
+		//
+		// Only destETag is meaningful here: the source side is a
+		// different UID, so we cannot store a source ETag against
+		// this UID. (#79)
 		for i := range contentDupes {
-			currentUIDs[contentDupes[i].UID] = true
+			currentUIDs[contentDupes[i].UID] = syncETagEntry{
+				destETag: contentDupes[i].ETag,
+			}
 		}
 		if len(contentDupes) > 0 {
 			log.Printf("Two-way sync: %d destination events already exist on source by content (Summary+StartTime) under different UIDs - recorded as synced to prevent retry", len(contentDupes))
@@ -1273,8 +1376,15 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					// pass stops us from retrying the upload on every
 					// subsequent cycle (which would otherwise produce
 					// the same 409/412 warning indefinitely). (#74)
+					//
+					// Only destETag is known here (the dest event we
+					// read before attempting the upload). The source
+					// side exists but we do not know its current ETag
+					// on the source server. (#79)
 					skippedAlreadyExists++
-					currentUIDs[destEvent.UID] = true
+					currentUIDs[destEvent.UID] = syncETagEntry{
+						destETag: destEvent.ETag,
+					}
 				case isForbiddenError(err):
 					// Source calendar is read-only (iCloud subscribed
 					// calendars, shared read-only, etc). Count as a
@@ -1289,17 +1399,28 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				// upsert at the end of this calendar's pass records
 				// it. Without this, the next cycle would see the
 				// same event as "not in previouslySyncedMap" and
-				// try to re-upload it.
-				currentUIDs[destEvent.UID] = true
+				// try to re-upload it. Record the dest ETag we read
+				// from before the upload; the source ETag we just
+				// wrote is not returned by PutEvent and will be
+				// populated from a read on the next cycle. (#79)
+				currentUIDs[destEvent.UID] = syncETagEntry{
+					destETag: destEvent.ETag,
+				}
 			}
 			updateProgress()
 		}
 
-		// Case 3: dest_wins update pass. Unchanged from pre-#72 behavior.
-		// Walks destEvents (not just candidates) because the update
-		// branch fires on UID match with ETag mismatch — that's a
-		// different filter than "dest-only" and can't reuse the
-		// candidate list.
+		// Case 3: dest_wins update pass. Walks destEvents (not just
+		// candidates) because the update branch fires on "dest ETag
+		// changed since last sync" — that's a different filter than
+		// "dest-only" and can't reuse the candidate list.
+		//
+		// The old code compared destEvent.ETag against sourceEvent.ETag
+		// directly, which was the same cross-server ETag bug fixed in
+		// the forward path by #79. We now compare destEvent.ETag
+		// against the last-known dest ETag in previouslySyncedMap via
+		// shouldUpdateSourceFromDest — the symmetric twin of the
+		// forward helper.
 		if source.ConflictStrategy == db.ConflictDestWins {
 			for _, destEvent := range destEvents {
 				if destEvent.UID == "" {
@@ -1310,7 +1431,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					// Case 1 already handled this.
 					continue
 				}
-				if destEvent.ETag == sourceEvent.ETag {
+				if !shouldUpdateSourceFromDest(destEvent.ETag, previouslySyncedMap[destEvent.UID]) {
 					continue
 				}
 				destEvent.Path = sourceEvent.Path
@@ -1327,6 +1448,14 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					}
 				} else {
 					result.Updated++
+					// Record the dest ETag we just propagated back
+					// to source so the next cycle can detect another
+					// dest-side change. We don't know the new source
+					// ETag PutEvent just created — next read cycle
+					// will populate it. (#79)
+					currentUIDs[destEvent.UID] = syncETagEntry{
+						destETag: destEvent.ETag,
+					}
 				}
 				updateProgress()
 			}
@@ -1376,12 +1505,17 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		log.Printf("Removed %d duplicate events from destination", result.DuplicatesRemoved)
 	}
 
-	// Update synced_events table with current state
-	for uid := range currentUIDs {
+	// Update synced_events table with current state. Each entry's
+	// sourceETag and destETag are what the next cycle will compare
+	// against to decide whether either side has changed — that is
+	// the fix for the infinite re-PUT loop in #79.
+	for uid, etags := range currentUIDs {
 		syncedEvent := &db.SyncedEvent{
 			SourceID:     source.ID,
 			CalendarHref: calendar.Path,
 			EventUID:     uid,
+			SourceETag:   etags.sourceETag,
+			DestETag:     etags.destETag,
 		}
 		if err := se.db.UpsertSyncedEvent(syncedEvent); err != nil {
 			log.Printf("Failed to upsert synced event: %v", err)
