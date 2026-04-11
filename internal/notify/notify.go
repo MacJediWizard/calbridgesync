@@ -903,17 +903,37 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 	}
 
 	if emailEnabled {
-		// Build recipient list: user email + admin emails (deduplicated)
+		// Build recipient list: user email + admin emails (deduplicated).
+		//
+		// Every address goes through isValidEmail before being added
+		// to the set. User email was already validated; admin emails
+		// from ALERT_SMTP_TO are validated here too as a defense-in-
+		// depth measure. Rationale: sendEmail joins the recipient
+		// slice into a single "To: a, b, c" header string via
+		// strings.Join. If an operator typo or a manipulated env
+		// value contained a CRLF, the joined header would inject
+		// an additional SMTP header (Bcc:, Cc:, From:, etc.). The
+		// isValidEmail regex definitively excludes CRLF, so any
+		// entry that passes is safe to concatenate into a header.
+		// Also skip empty strings which strings.Split of a
+		// comma-separated env var can produce. (#125)
 		recipientSet := make(map[string]struct{})
 
-		// Add user email if provided and valid
-		if alert.UserEmail != "" && isValidEmail(alert.UserEmail) {
-			recipientSet[strings.ToLower(alert.UserEmail)] = struct{}{}
+		addIfValid := func(email string) {
+			email = strings.TrimSpace(email)
+			if email == "" {
+				return
+			}
+			if !isValidEmail(email) {
+				log.Printf("[Notify] rejecting malformed email recipient %q (failed isValidEmail check)", email)
+				return
+			}
+			recipientSet[strings.ToLower(email)] = struct{}{}
 		}
 
-		// Add admin emails
+		addIfValid(alert.UserEmail)
 		for _, email := range n.cfg.SMTPTo {
-			recipientSet[strings.ToLower(email)] = struct{}{}
+			addIfValid(email)
 		}
 
 		// Convert to slice
