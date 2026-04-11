@@ -106,11 +106,27 @@ func (db *DB) CreateSource(source *Source) error {
 		oauthRefreshToken = &t
 	}
 
+	// Per-source Google OAuth credentials (#79). Stored as nullable
+	// text columns; non-Google sources leave both empty. ClientID is
+	// plain text (a public identifier), ClientSecret is encrypted
+	// upstream by the API handler.
+	var googleClientID *string
+	if source.GoogleClientID != "" {
+		t := source.GoogleClientID
+		googleClientID = &t
+	}
+	var googleClientSecret *string
+	if source.GoogleClientSecret != "" {
+		t := source.GoogleClientSecret
+		googleClientSecret = &t
+	}
+
 	query := `INSERT INTO sources (
 		id, user_id, name, source_type, source_url, source_username, source_password,
 		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-		selected_calendars, enabled, last_sync_status, oauth_refresh_token, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		selected_calendars, enabled, last_sync_status, oauth_refresh_token,
+		google_client_id, google_client_secret, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := db.conn.Exec(query,
 		source.ID, source.UserID, source.Name, source.SourceType,
@@ -118,7 +134,9 @@ func (db *DB) CreateSource(source *Source) error {
 		source.DestURL, source.DestUsername, source.DestPassword,
 		source.SyncInterval, source.SyncDaysPast, source.SyncDirection, source.ConflictStrategy,
 		selectedCalendarsJSON, source.Enabled,
-		source.LastSyncStatus, oauthRefreshToken, source.CreatedAt, source.UpdatedAt,
+		source.LastSyncStatus, oauthRefreshToken,
+		googleClientID, googleClientSecret,
+		source.CreatedAt, source.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create source: %w", err)
@@ -129,11 +147,13 @@ func (db *DB) CreateSource(source *Source) error {
 
 // sourceSelectColumns is the canonical SELECT column list for sources,
 // kept in one place so every query + scan function stays in lockstep.
-// (#70) added oauth_refresh_token at the end so the positional scans
-// only needed a single new field.
+// (#70) added oauth_refresh_token at the end. (#79) appended
+// google_client_id and google_client_secret so per-source Google
+// credentials follow the same scan-positional contract.
 const sourceSelectColumns = `id, user_id, name, source_type, source_url, source_username, source_password,
 	dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
-	selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at, oauth_refresh_token`
+	selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at,
+	oauth_refresh_token, google_client_id, google_client_secret`
 
 // GetSourceByID returns a source by its ID.
 func (db *DB) GetSourceByID(id string) (*Source, error) {
@@ -234,18 +254,37 @@ func (db *DB) UpdateSource(source *Source) error {
 		oauthRefreshToken = &t
 	}
 
+	// Same COALESCE-on-empty rule for the per-source Google OAuth
+	// credentials (#79). A normal source-edit form does not re-collect
+	// the client secret from the user, so an empty value here means
+	// "no change" and must preserve the existing stored value.
+	var googleClientID *string
+	if source.GoogleClientID != "" {
+		t := source.GoogleClientID
+		googleClientID = &t
+	}
+	var googleClientSecret *string
+	if source.GoogleClientSecret != "" {
+		t := source.GoogleClientSecret
+		googleClientSecret = &t
+	}
+
 	query := `UPDATE sources SET
 		name = ?, source_type = ?, source_url = ?, source_username = ?, source_password = ?,
 		dest_url = ?, dest_username = ?, dest_password = ?, sync_interval = ?, sync_days_past = ?,
 		sync_direction = ?, conflict_strategy = ?, selected_calendars = ?, enabled = ?,
-		oauth_refresh_token = COALESCE(?, oauth_refresh_token), updated_at = ?
+		oauth_refresh_token = COALESCE(?, oauth_refresh_token),
+		google_client_id = COALESCE(?, google_client_id),
+		google_client_secret = COALESCE(?, google_client_secret),
+		updated_at = ?
 		WHERE id = ?`
 
 	result, err := db.conn.Exec(query,
 		source.Name, source.SourceType, source.SourceURL, source.SourceUsername, source.SourcePassword,
 		source.DestURL, source.DestUsername, source.DestPassword, source.SyncInterval, source.SyncDaysPast,
 		source.SyncDirection, source.ConflictStrategy, selectedCalendarsJSON, source.Enabled,
-		oauthRefreshToken, source.UpdatedAt, source.ID,
+		oauthRefreshToken, googleClientID, googleClientSecret,
+		source.UpdatedAt, source.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update source: %w", err)
@@ -491,6 +530,8 @@ func scanSource(row *sql.Row) (*Source, error) {
 	var syncDirection sql.NullString
 	var selectedCalendarsJSON sql.NullString
 	var oauthRefreshToken sql.NullString
+	var googleClientID sql.NullString
+	var googleClientSecret sql.NullString
 
 	err := row.Scan(
 		&source.ID, &source.UserID, &source.Name, &source.SourceType,
@@ -499,7 +540,8 @@ func scanSource(row *sql.Row) (*Source, error) {
 		&source.SyncInterval, &source.SyncDaysPast, &syncDirection, &source.ConflictStrategy,
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
-		&source.CreatedAt, &source.UpdatedAt, &oauthRefreshToken,
+		&source.CreatedAt, &source.UpdatedAt,
+		&oauthRefreshToken, &googleClientID, &googleClientSecret,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -519,6 +561,12 @@ func scanSource(row *sql.Row) (*Source, error) {
 	if oauthRefreshToken.Valid {
 		source.OAuthRefreshToken = oauthRefreshToken.String
 	}
+	if googleClientID.Valid {
+		source.GoogleClientID = googleClientID.String
+	}
+	if googleClientSecret.Valid {
+		source.GoogleClientSecret = googleClientSecret.String
+	}
 
 	// Decode selected_calendars from JSON (backward compatible)
 	if selectedCalendarsJSON.Valid {
@@ -536,6 +584,8 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 	var syncDirection sql.NullString
 	var selectedCalendarsJSON sql.NullString
 	var oauthRefreshToken sql.NullString
+	var googleClientID sql.NullString
+	var googleClientSecret sql.NullString
 
 	err := rows.Scan(
 		&source.ID, &source.UserID, &source.Name, &source.SourceType,
@@ -544,7 +594,8 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 		&source.SyncInterval, &source.SyncDaysPast, &syncDirection, &source.ConflictStrategy,
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
-		&source.CreatedAt, &source.UpdatedAt, &oauthRefreshToken,
+		&source.CreatedAt, &source.UpdatedAt,
+		&oauthRefreshToken, &googleClientID, &googleClientSecret,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan source: %w", err)
@@ -560,6 +611,12 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 	}
 	if oauthRefreshToken.Valid {
 		source.OAuthRefreshToken = oauthRefreshToken.String
+	}
+	if googleClientID.Valid {
+		source.GoogleClientID = googleClientID.String
+	}
+	if googleClientSecret.Valid {
+		source.GoogleClientSecret = googleClientSecret.String
 	}
 
 	// Decode selected_calendars from JSON (backward compatible)

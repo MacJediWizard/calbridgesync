@@ -180,21 +180,34 @@ type Source struct {
 	// OAuthRefreshToken holds the encrypted Google OAuth2 refresh
 	// token for source_type == google. Empty for all other source
 	// types. Never exposed via JSON. (#70)
-	OAuthRefreshToken string           `json:"-"`
-	DestURL           string           `json:"dest_url"`
-	DestUsername      string           `json:"dest_username"`
-	DestPassword      string           `json:"-"` // Never include in JSON
-	SyncInterval      int              `json:"sync_interval"`
-	SyncDaysPast      int              `json:"sync_days_past"` // How many days in the past to sync (0 = unlimited)
-	SyncDirection     SyncDirection    `json:"sync_direction"`
-	ConflictStrategy  ConflictStrategy `json:"conflict_strategy"`
-	SelectedCalendars []CalendarConfig `json:"selected_calendars"` // Calendar configs to sync (empty = all)
-	Enabled           bool             `json:"enabled"`
-	LastSyncAt        *time.Time       `json:"last_sync_at"`
-	LastSyncStatus    SyncStatus       `json:"last_sync_status"`
-	LastSyncMessage   string           `json:"last_sync_message"`
-	CreatedAt         time.Time        `json:"created_at"`
-	UpdatedAt         time.Time        `json:"updated_at"`
+	OAuthRefreshToken string `json:"-"`
+	// GoogleClientID is the per-source Google Cloud OAuth client ID
+	// (public identifier — stored in plain text). Populated for
+	// source_type == google. Empty for all other source types. (#79)
+	//
+	// Per-source rather than global so each user can use their own
+	// Google Cloud project; the previous global env-var design only
+	// allowed a single client_id across the entire instance.
+	GoogleClientID string `json:"google_client_id,omitempty"`
+	// GoogleClientSecret is the per-source Google Cloud OAuth client
+	// secret, encrypted via the application's AES-256-GCM Encryptor
+	// (same as SourcePassword and OAuthRefreshToken). Populated for
+	// source_type == google. Never exposed via JSON. (#79)
+	GoogleClientSecret string           `json:"-"`
+	DestURL            string           `json:"dest_url"`
+	DestUsername       string           `json:"dest_username"`
+	DestPassword       string           `json:"-"` // Never include in JSON
+	SyncInterval       int              `json:"sync_interval"`
+	SyncDaysPast       int              `json:"sync_days_past"` // How many days in the past to sync (0 = unlimited)
+	SyncDirection      SyncDirection    `json:"sync_direction"`
+	ConflictStrategy   ConflictStrategy `json:"conflict_strategy"`
+	SelectedCalendars  []CalendarConfig `json:"selected_calendars"` // Calendar configs to sync (empty = all)
+	Enabled            bool             `json:"enabled"`
+	LastSyncAt         *time.Time       `json:"last_sync_at"`
+	LastSyncStatus     SyncStatus       `json:"last_sync_status"`
+	LastSyncMessage    string           `json:"last_sync_message"`
+	CreatedAt          time.Time        `json:"created_at"`
+	UpdatedAt          time.Time        `json:"updated_at"`
 }
 
 // SyncState represents the synchronization state for a calendar.

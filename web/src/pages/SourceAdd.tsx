@@ -7,7 +7,7 @@ import type { SourceFormData, Calendar } from '../types';
 // Google OAuth callback redirects back with when something goes
 // wrong. Keep this in sync with internal/web/oauth_google.go. (#70)
 const GOOGLE_OAUTH_ERRORS: Record<string, string> = {
-  google_not_configured: 'Google OAuth is not configured on this server. Ask your admin to set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET.',
+  google_not_configured: 'Google OAuth is not configured on this server. The instance redirect URL must be set (BASE_URL or GOOGLE_OAUTH_REDIRECT_URL).',
   invalid_state: 'OAuth state mismatch. Please start the flow again.',
   google_denied: 'You denied the Google consent request.',
   missing_code: 'Google did not return an authorization code.',
@@ -43,6 +43,8 @@ export default function SourceAdd() {
     sync_direction: 'one_way',
     conflict_strategy: 'source_wins',
     selected_calendars: [],
+    google_client_id: '',
+    google_client_secret: '',
   });
 
   // Surface Google OAuth errors returned by the backend callback as a
@@ -143,6 +145,13 @@ export default function SourceAdd() {
         // Google sources take a different path: hand the form to the
         // prepare endpoint, then redirect to Google's consent screen.
         // The backend callback creates the source and redirects back. (#70)
+        // As of #79 the user provides their own per-source Google
+        // Cloud OAuth credentials, so we pass them along.
+        if (!form.google_client_id || !form.google_client_secret) {
+          setError('Google OAuth Client ID and Client Secret are required');
+          setLoading(false);
+          return;
+        }
         const { redirect_url } = await prepareGoogleSource({
           name: form.name,
           sync_interval: form.sync_interval,
@@ -152,6 +161,8 @@ export default function SourceAdd() {
           dest_url: form.dest_url,
           dest_username: form.dest_username,
           dest_password: form.dest_password,
+          google_client_id: form.google_client_id,
+          google_client_secret: form.google_client_secret,
         });
         window.location.href = redirect_url;
         return;
@@ -282,17 +293,52 @@ export default function SourceAdd() {
                 </h3>
 
                 {isGoogleOAuth ? (
-                  /* Google sources use OAuth2 — no URL/username/password fields. (#70) */
-                  <div className="p-4 rounded border border-zinc-700 bg-black/30 space-y-3">
-                    <p className="text-sm text-white">
-                      Google Calendar requires OAuth2. When you click <span className="font-semibold">Connect Google Account & Save</span>, you'll be redirected to Google to sign in and approve calendar access.
-                    </p>
-                    <p className="text-xs text-gray-400">
-                      calbridgesync will store a refresh token so it can sync on your behalf. You can revoke access at any time at <a href="https://myaccount.google.com/permissions" className="text-red-400 underline" target="_blank" rel="noreferrer">myaccount.google.com/permissions</a>.
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      Your admin must have configured <code className="text-red-400">GOOGLE_OAUTH_CLIENT_ID</code> and <code className="text-red-400">GOOGLE_OAUTH_CLIENT_SECRET</code> on this server for this to work.
-                    </p>
+                  /* Google sources use OAuth2 with per-source credentials (#79). */
+                  <div className="space-y-4">
+                    <div className="p-4 rounded border border-zinc-700 bg-black/30 space-y-3">
+                      <p className="text-sm text-white">
+                        Google Calendar requires OAuth2. Provide your own Google Cloud project credentials below — each user supplies their own client ID and secret instead of relying on a shared instance-wide value.
+                      </p>
+                      <p className="text-xs text-gray-400">
+                        Create a project at <a href="https://console.cloud.google.com" className="text-red-400 underline" target="_blank" rel="noreferrer">console.cloud.google.com</a>, enable the Google Calendar API, create an OAuth 2.0 Client ID (Web application), and add this app's callback URL to the authorized redirect URIs.
+                      </p>
+                      <p className="text-xs text-gray-400">
+                        When you click <span className="font-semibold">Connect Google Account &amp; Save</span>, you'll be redirected to Google to approve calendar access. You can revoke access at any time at <a href="https://myaccount.google.com/permissions" className="text-red-400 underline" target="_blank" rel="noreferrer">myaccount.google.com/permissions</a>.
+                      </p>
+                    </div>
+                    <div>
+                      <label htmlFor="google_client_id" className="block text-sm font-medium text-gray-300 mb-1">
+                        Google OAuth Client ID
+                      </label>
+                      <input
+                        type="text"
+                        name="google_client_id"
+                        id="google_client_id"
+                        value={form.google_client_id || ''}
+                        onChange={handleChange}
+                        required
+                        autoComplete="off"
+                        placeholder="123456789012-abc...apps.googleusercontent.com"
+                        className="w-full"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="google_client_secret" className="block text-sm font-medium text-gray-300 mb-1">
+                        Google OAuth Client Secret
+                      </label>
+                      <input
+                        type="password"
+                        name="google_client_secret"
+                        id="google_client_secret"
+                        value={form.google_client_secret || ''}
+                        onChange={handleChange}
+                        required
+                        autoComplete="new-password"
+                        placeholder="GOCSPX-..."
+                        className="w-full"
+                      />
+                      <p className="text-xs text-gray-500 mt-1">Stored encrypted at rest (AES-256-GCM). Never shown back after saving.</p>
+                    </div>
                   </div>
                 ) : (
                   <>

@@ -25,10 +25,10 @@ const (
 // PendingGoogleSource holds the form data for a Google source that is
 // mid-OAuth. It's stashed in a short-lived session cookie between the
 // "prepare" API call and the OAuth callback, then read and cleared by
-// the callback when it creates the real Source row. DestPassword is
-// already encrypted via the application's AES-256-GCM Encryptor
-// before it lands in this struct — the session cookie does NOT carry
-// a plaintext password. (#70)
+// the callback when it creates the real Source row. DestPassword and
+// GoogleClientSecretEnc are already encrypted via the application's
+// AES-256-GCM Encryptor before they land in this struct — the
+// session cookie does NOT carry plaintext credentials. (#70 + #79)
 type PendingGoogleSource struct {
 	State            string `json:"state"`
 	Name             string `json:"name"`
@@ -39,6 +39,16 @@ type PendingGoogleSource struct {
 	DestURL          string `json:"dest_url"`
 	DestUsername     string `json:"dest_username"`
 	DestPasswordEnc  string `json:"dest_password_enc"` // already encrypted
+	// GoogleClientID is the user's Google Cloud OAuth client ID
+	// (public identifier — stored in plain text). Carried through
+	// the OAuth flow so the callback can build the same oauth2.Config
+	// as the prepare step. (#79)
+	GoogleClientID string `json:"google_client_id"`
+	// GoogleClientSecretEnc is the user's Google Cloud OAuth client
+	// secret, encrypted before being stashed in the session cookie.
+	// The callback decrypts it just long enough to call cfg.Exchange,
+	// then re-encrypts it for storage on the Source row. (#79)
+	GoogleClientSecretEnc string `json:"google_client_secret_enc"`
 }
 
 var (

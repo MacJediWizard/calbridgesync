@@ -42,20 +42,32 @@ type Config struct {
 	GoogleOAuth  GoogleOAuthConfig
 }
 
-// GoogleOAuthConfig holds the OAuth2 credentials for Google Calendar
-// source_type. These are optional: if ClientID or ClientSecret is unset,
-// the feature is disabled and the web UI surfaces a clear error instead
-// of letting the user start a flow that would 401 at the end. (#70)
+// GoogleOAuthConfig holds instance-level Google OAuth2 settings. As of
+// #79, the per-source client ID and client secret were moved out of
+// global env vars and into the sources table, so each user (or each
+// source) carries its own Google Cloud project credentials. This
+// struct now only holds the redirect URL, which must be a single
+// stable value because Google requires the redirect URI to be
+// pre-registered in each Cloud Console project — every user is
+// expected to register the same URL (this instance's callback) in
+// their own project. (#70 + #79)
 type GoogleOAuthConfig struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURL  string
+	// RedirectURL is the OAuth callback URL the application uses for
+	// every Google source on this instance. Computed from BASE_URL by
+	// default; can be overridden via GOOGLE_OAUTH_REDIRECT_URL for
+	// non-standard deployments. Must match what each user registers
+	// in their Google Cloud Console.
+	RedirectURL string
 }
 
-// Enabled returns true if both client ID and secret are configured.
-// Call this before routing users into the Google OAuth flow.
+// Enabled reports whether the Google OAuth feature can be used on
+// this instance at all. As of #79 the per-source credentials live in
+// the database, so the only instance-level requirement is a redirect
+// URL. The feature is enabled iff RedirectURL is non-empty. The web
+// handlers still validate that each individual source has its own
+// client_id and client_secret before starting a flow.
 func (g GoogleOAuthConfig) Enabled() bool {
-	return g.ClientID != "" && g.ClientSecret != ""
+	return g.RedirectURL != ""
 }
 
 // AlertConfig holds alerting configuration.
@@ -275,16 +287,16 @@ func Load() (*Config, error) {
 	}
 	cfg.Alerts.InitialBackoffMS = initialBackoffMS
 
-	// Google OAuth2 configuration (optional; feature is disabled when
-	// ClientID/ClientSecret are unset). (#70)
-	cfg.GoogleOAuth.ClientID = getEnv("GOOGLE_OAUTH_CLIENT_ID", "")
-	cfg.GoogleOAuth.ClientSecret = getEnv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+	// Google OAuth2 configuration. As of #79 the per-source client_id
+	// and client_secret live in the sources table, not in env vars.
+	// The only instance-level setting is the redirect URL, which
+	// defaults to <BASE_URL>/auth/oauth/google/callback unless
+	// explicitly overridden. Operators no longer need to set
+	// GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET — those env
+	// vars are intentionally ignored to avoid drift between the global
+	// values and the per-source values stored in the DB.
 	cfg.GoogleOAuth.RedirectURL = getEnv("GOOGLE_OAUTH_REDIRECT_URL", "")
-	// If redirect URL is not explicitly set but base URL is, default to
-	// <BASE_URL>/auth/oauth/google/callback. This matches the route
-	// registered in internal/web/routes.go and means operators usually
-	// only need to set the client id and secret.
-	if cfg.GoogleOAuth.RedirectURL == "" && cfg.Server.BaseURL != "" && cfg.GoogleOAuth.ClientID != "" {
+	if cfg.GoogleOAuth.RedirectURL == "" && cfg.Server.BaseURL != "" {
 		cfg.GoogleOAuth.RedirectURL = strings.TrimRight(cfg.Server.BaseURL, "/") + "/auth/oauth/google/callback"
 	}
 
