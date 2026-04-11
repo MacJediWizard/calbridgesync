@@ -37,6 +37,19 @@ var (
 const (
 	defaultTimeout = 300 * time.Second // 5 minutes default for slow CalDAV servers like iCloud
 	minTLSVersion  = tls.VersionTLS12
+
+	// maxCalDAVResponseSize caps every io.ReadAll over a CalDAV
+	// response body so a misbehaving or malicious CalDAV server
+	// cannot force the daemon to allocate unbounded memory. The
+	// cap is generous (200 MB) — real PROPFIND / REPORT responses
+	// for a 5000-event calendar are typically in the low single-
+	// digit MB range, so this is five to ten orders of magnitude
+	// larger than any legitimate response we'd expect. The point
+	// is to catch the runaway case (infinite response, slowloris-
+	// style trickle, zip bomb) without false-flagging any real
+	// user workload. Matches the existing maxICSResponseSize
+	// convention in ics_client.go (which uses 50 MB for ICS feeds). (#119)
+	maxCalDAVResponseSize = 200 * 1024 * 1024
 )
 
 // Calendar represents a CalDAV calendar.
@@ -259,8 +272,10 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, coll
 		return nil, fmt.Errorf("%w: unexpected status %d", ErrInvalidResponse, resp.StatusCode)
 	}
 
-	// Parse the multistatus response to get event paths
-	body, err := io.ReadAll(resp.Body)
+	// Parse the multistatus response to get event paths. Wrapped
+	// in io.LimitReader so a malicious or misbehaving CalDAV
+	// server cannot force an unbounded allocation. (#119)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCalDAVResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}

@@ -71,14 +71,22 @@ func (c *Client) SyncCollection(ctx context.Context, calendarPath, syncToken str
 		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotImplemented {
 			return nil, fmt.Errorf("WebDAV-Sync not supported")
 		}
-		body, readErr := io.ReadAll(resp.Body)
+		// Size-capped so an error response (which might be
+		// arbitrarily large under a misconfigured or malicious
+		// server) cannot force unbounded allocation. Error body
+		// is only used for the wrapped error message so a 200 MB
+		// cap is already absurdly generous for diagnostics. (#119)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxCalDAVResponseSize))
 		if readErr != nil {
 			return nil, fmt.Errorf("%w: unexpected status %d", ErrInvalidResponse, resp.StatusCode)
 		}
 		return nil, fmt.Errorf("%w: unexpected status %d: %s", ErrInvalidResponse, resp.StatusCode, string(body))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Success path: cap the multistatus response the same way so
+	// a malicious server can't OOM the daemon via a runaway
+	// WebDAV-Sync response. (#119)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCalDAVResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
