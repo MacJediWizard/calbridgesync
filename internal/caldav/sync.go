@@ -162,6 +162,86 @@ func shouldUpdateSourceFromDest(destETag string, prev *db.SyncedEvent) bool {
 	return prev.DestETag != destETag
 }
 
+// planTwoWayDeletion determines which destination events should be
+// deleted because they were removed from source during a two-way sync.
+// It is the dest-deletion mirror of planOrphanDeletion (one-way) and
+// the symmetric counterpart of planReverseCreate.
+//
+// Three safety rules are enforced:
+//
+//  1. Empty-dest guard: if destination returned 0 events but we have
+//     prior sync records, refuse. Same rationale as the original
+//     shouldSkipTwoWayDeletion check — an empty destination query is
+//     almost certainly a destination failure, not a user action.
+//
+//  2. Empty-source guard: if source returned 0 events but we have
+//     prior sync records, refuse. NEW in #80. Without this guard, a
+//     transient source query failure for one calendar would mass-
+//     delete the entire destination calendar — exactly the
+//     catastrophe that prompted this PR (William lost 748 events
+//     from SOGo when iCloud returned a partial set).
+//
+//  3. Mass-deletion ratio guard: if more than maxDeleteRatio of the
+//     prior records would be deleted in a single cycle, refuse and
+//     surface a warning. Mirrors planOrphanDeletion's ratio check
+//     for the two-way path. Defends against the case where source
+//     returned SOME events but is missing the bulk of them — neither
+//     of the empty-side guards catches this case, and the existing
+//     per-event time-based safety threshold only protects events
+//     that were synced very recently. Critical for the partial-
+//     source-failure scenario.
+//
+// Returns the list of dest UIDs to delete and a non-empty warning if
+// any safety rule was triggered. When a warning is returned, toDelete
+// is nil — the caller must not perform any deletions in that case.
+// (#80)
+func planTwoWayDeletion(
+	sourceEventMap map[string]Event,
+	destEventMap map[string]Event,
+	previouslySyncedMap map[string]*db.SyncedEvent,
+	maxDeleteRatio float64,
+) (toDelete []string, warning string) {
+	// Rule 1: empty destination with prior records → refuse.
+	if len(destEventMap) == 0 && len(previouslySyncedMap) > 0 {
+		return nil, fmt.Sprintf(
+			"destination returned 0 events but %d previously-synced records exist - "+
+				"skipping two-way deletion pass for safety (possible destination query failure)",
+			len(previouslySyncedMap),
+		)
+	}
+	// Rule 2: empty source with prior records → refuse. (#80)
+	if len(sourceEventMap) == 0 && len(previouslySyncedMap) > 0 {
+		return nil, fmt.Sprintf(
+			"source returned 0 events but %d previously-synced records exist - "+
+				"skipping two-way deletion pass for safety (possible source query failure)",
+			len(previouslySyncedMap),
+		)
+	}
+	// Build candidate list: previously-synced UIDs that no longer
+	// exist on source but still exist on destination.
+	candidates := make([]string, 0)
+	for uid := range previouslySyncedMap {
+		_, existsOnSource := sourceEventMap[uid]
+		_, existsOnDest := destEventMap[uid]
+		if !existsOnSource && existsOnDest {
+			candidates = append(candidates, uid)
+		}
+	}
+	// Rule 3: mass-deletion ratio guard. Only applied when there is
+	// prior state to measure against and a threshold is configured.
+	if maxDeleteRatio > 0 && len(previouslySyncedMap) > 0 {
+		ratio := float64(len(candidates)) / float64(len(previouslySyncedMap))
+		if ratio > maxDeleteRatio {
+			return nil, fmt.Sprintf(
+				"two-way deletion pass would delete %d of %d previously-synced events (%.0f%%), "+
+					"exceeds safety threshold %.0f%% - skipping for safety (possible partial source query failure)",
+				len(candidates), len(previouslySyncedMap), ratio*100, maxDeleteRatio*100,
+			)
+		}
+	}
+	return candidates, ""
+}
+
 // planReverseCreate determines which destination events should be uploaded
 // to source as new creates during a two-way sync. It is the mirror of
 // planOrphanDeletion for the reverse direction.
@@ -1115,78 +1195,118 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	sourceInterval := time.Duration(source.SyncInterval) * time.Second
 	now := time.Now()
 
-	// SAFETY: Skip two-way deletion entirely if destination query
-	// returned empty but we have synced events. Prevents mass
-	// deletion from source when the destination query fails.
-	skipTwoWayDeletion := shouldSkipTwoWayDeletion(syncDirection, len(destEventMap), len(previouslySyncedMap))
-	if skipTwoWayDeletion {
-		log.Printf("WARNING: Destination returned 0 events but we have %d previously synced events - skipping two-way deletions for safety", len(previouslySyncedMap))
-	}
-
-	if syncDirection == db.SyncDirectionTwoWay && !skipTwoWayDeletion && sourceClient != nil {
-		for uid, syncedEvent := range previouslySyncedMap {
-			_, existsOnSource := sourceEventMap[uid]
-			destEvent, existsOnDest := destEventMap[uid]
-
-			if !existsOnSource && existsOnDest {
-				// Event was deleted from source - delete from destination too
-				log.Printf("Event %s deleted from source, deleting from destination", uid)
-				if err := destClient.DeleteEvent(ctx, destEvent.Path); err != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete event from dest: %v", err))
-				} else {
-					result.Deleted++
-					updateProgress()
-				}
-				// Remove from synced_events
-				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-					log.Printf("Failed to delete synced event record: %v", err)
-				}
-				delete(destEventMap, uid)
-				continue
+	// Two-way deletion pass. Two independent steps with their own
+	// safety guards:
+	//
+	//   - Dest-deletion: events that were removed from source must be
+	//     removed from destination. Delegated to planTwoWayDeletion,
+	//     which enforces three guards (empty-dest, empty-source, and
+	//     mass-delete ratio). The empty-source and ratio guards are
+	//     new in #80 — without them, a partial source query failure
+	//     for one calendar mass-deletes the matching destination
+	//     events. (William lost 748 events to this exact bug.)
+	//
+	//   - Source-deletion: events that were removed from destination
+	//     must be removed from source. Still inline because each
+	//     candidate has its own per-event safety threshold
+	//     (isWithinSyncSafetyThreshold) protecting recently-synced
+	//     events; ratio-based protection for this direction is
+	//     deferred to a follow-up. The shouldSkipTwoWayDeletion
+	//     guard is still consulted to short-circuit when the dest
+	//     query failed entirely.
+	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil {
+		// Step 1: dest-deletion via planTwoWayDeletion. The helper's
+		// three guards subsume the previous shouldSkipTwoWayDeletion
+		// check for this direction and add empty-source + ratio
+		// protection on top. (#80)
+		toDeleteFromDest, deletionWarning := planTwoWayDeletion(
+			sourceEventMap,
+			destEventMap,
+			previouslySyncedMap,
+			defaultOrphanDeleteRatioThreshold,
+		)
+		if deletionWarning != "" {
+			log.Printf("WARNING: %s", deletionWarning)
+			result.Warnings = append(result.Warnings, deletionWarning)
+		}
+		// Track which UIDs the dest-deletion pass already handled so
+		// the source-deletion pass below skips them.
+		handledByDestDelete := make(map[string]bool, len(toDeleteFromDest))
+		for _, uid := range toDeleteFromDest {
+			destEvent := destEventMap[uid]
+			log.Printf("Event %s deleted from source, deleting from destination", uid)
+			if err := destClient.DeleteEvent(ctx, destEvent.Path); err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete event from dest: %v", err))
+			} else {
+				result.Deleted++
+				updateProgress()
 			}
+			// Remove from synced_events
+			if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+				log.Printf("Failed to delete synced event record: %v", err)
+			}
+			delete(destEventMap, uid)
+			handledByDestDelete[uid] = true
+		}
 
-			sourceEvent, existsOnSource := sourceEventMap[uid]
-			if existsOnSource && !existsOnDest {
-				// SAFETY CHECK: Only delete from source if the event was
-				// FIRST synced before the safety threshold (commit 23e88c1,
-				// Issue #72). Prevents deleting events that just appeared
-				// and haven't had time to fully propagate.
-				//
-				// We deliberately read CreatedAt (sticky, set once at first
-				// sync) rather than UpdatedAt (bumped every cycle via
-				// UpsertSyncedEvent). Reading UpdatedAt was a bug: for
-				// any normally-running sync, UpdatedAt is always within
-				// one sync interval of "now" because the upsert at the
-				// end of every cycle resets it, which made this safety
-				// guard fire unconditionally and silently block every
-				// two-way source-side deletion. CreatedAt preserves the
-				// original intent ("protect brand-new events") without
-				// the "protect everything forever" accident.
-				if isWithinSyncSafetyThreshold(syncedEvent.CreatedAt, sourceInterval, now) {
-					log.Printf("Event %s not on destination but newly synced (CreatedAt=%v) - skipping deletion from source (safety)", uid, syncedEvent.CreatedAt)
+		// Step 2: source-deletion + cleanup. Skip entirely if the
+		// dest query returned empty (would risk mass-deleting from
+		// source); the per-event safety threshold provides the
+		// remaining protection within an individual cycle.
+		skipSourceDeletion := shouldSkipTwoWayDeletion(syncDirection, len(destEventMap), len(previouslySyncedMap))
+		if skipSourceDeletion {
+			log.Printf("WARNING: Destination returned 0 events but we have %d previously synced events - skipping source-side deletions for safety", len(previouslySyncedMap))
+		}
+		if !skipSourceDeletion {
+			for uid, syncedEvent := range previouslySyncedMap {
+				if handledByDestDelete[uid] {
+					continue
+				}
+				sourceEvent, existsOnSource := sourceEventMap[uid]
+				_, existsOnDest := destEventMap[uid]
+
+				if existsOnSource && !existsOnDest {
+					// SAFETY CHECK: Only delete from source if the event was
+					// FIRST synced before the safety threshold (commit 23e88c1,
+					// Issue #72). Prevents deleting events that just appeared
+					// and haven't had time to fully propagate.
+					//
+					// We deliberately read CreatedAt (sticky, set once at first
+					// sync) rather than UpdatedAt (bumped every cycle via
+					// UpsertSyncedEvent). Reading UpdatedAt was a bug: for
+					// any normally-running sync, UpdatedAt is always within
+					// one sync interval of "now" because the upsert at the
+					// end of every cycle resets it, which made this safety
+					// guard fire unconditionally and silently block every
+					// two-way source-side deletion. CreatedAt preserves the
+					// original intent ("protect brand-new events") without
+					// the "protect everything forever" accident.
+					if isWithinSyncSafetyThreshold(syncedEvent.CreatedAt, sourceInterval, now) {
+						log.Printf("Event %s not on destination but newly synced (CreatedAt=%v) - skipping deletion from source (safety)", uid, syncedEvent.CreatedAt)
+						continue
+					}
+
+					// Event was deleted from destination - delete from source too
+					log.Printf("Event %s deleted from destination, deleting from source", uid)
+					if err := sourceClient.DeleteEvent(ctx, sourceEvent.Path); err != nil {
+						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete event from source: %v", err))
+					} else {
+						result.Deleted++
+						updateProgress()
+					}
+					// Remove from synced_events
+					if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+						log.Printf("Failed to delete synced event record: %v", err)
+					}
+					delete(sourceEventMap, uid)
 					continue
 				}
 
-				// Event was deleted from destination - delete from source too
-				log.Printf("Event %s deleted from destination, deleting from source", uid)
-				if err := sourceClient.DeleteEvent(ctx, sourceEvent.Path); err != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete event from source: %v", err))
-				} else {
-					result.Deleted++
-					updateProgress()
-				}
-				// Remove from synced_events
-				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-					log.Printf("Failed to delete synced event record: %v", err)
-				}
-				delete(sourceEventMap, uid)
-				continue
-			}
-
-			if !existsOnSource && !existsOnDest {
-				// Event deleted from both - just clean up the record
-				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, syncedEvent.EventUID); err != nil {
-					log.Printf("Failed to delete synced event record: %v", err)
+				if !existsOnSource && !existsOnDest {
+					// Event deleted from both - just clean up the record
+					if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, syncedEvent.EventUID); err != nil {
+						log.Printf("Failed to delete synced event record: %v", err)
+					}
 				}
 			}
 		}
