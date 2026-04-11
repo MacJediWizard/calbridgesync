@@ -21,6 +21,12 @@ services:
       - SESSION_SECRET=${SESSION_SECRET}
       - DATABASE_PATH=/app/data/calbridgesync.db
       - DEFAULT_DEST_URL=${DEFAULT_DEST_URL}
+      # REQUIRED in production mode (#101). Comma-separated list of
+      # allowed origins for CSRF validation. Without this, the
+      # server falls back to localhost-only defaults which block
+      # every non-localhost origin. Example:
+      #   ALLOWED_ORIGINS=https://calbridgesync.example.com
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       # Alert notifications (optional)
       - ALERT_WEBHOOK_ENABLED=${ALERT_WEBHOOK_ENABLED:-false}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
@@ -33,6 +39,22 @@ services:
       - ALERT_SMTP_TO=${ALERT_SMTP_TO:-}
       - ALERT_SMTP_TLS=${ALERT_SMTP_TLS:-false}
       - ALERT_COOLDOWN_MINUTES=${ALERT_COOLDOWN_MINUTES:-60}
+      # Optional tunables — all have sensible defaults, listed here
+      # for discoverability. Uncomment and set in .env if you need
+      # to override. (#105 / audit inventory)
+      #- SESSION_MAX_AGE_SECS=${SESSION_MAX_AGE_SECS:-86400}       # 24h
+      #- OAUTH_STATE_MAX_AGE_SECS=${OAUTH_STATE_MAX_AGE_SECS:-300} # 5m
+      #- CALDAV_REQUEST_TIMEOUT=${CALDAV_REQUEST_TIMEOUT:-300}     # 5m per HTTP call
+      #- RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-10.0}                    # requests/sec per client
+      #- RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-20}
+      #- MIN_SYNC_INTERVAL=${MIN_SYNC_INTERVAL:-30}                # seconds
+      #- MAX_SYNC_INTERVAL=${MAX_SYNC_INTERVAL:-3600}              # seconds
+      #- ALERT_MAX_SEND_ATTEMPTS=${ALERT_MAX_SEND_ATTEMPTS:-3}     # retry count for webhook/email
+      #- ALERT_INITIAL_BACKOFF_MS=${ALERT_INITIAL_BACKOFF_MS:-500} # first retry delay
+      # GOOGLE_OAUTH_REDIRECT_URL is auto-derived from BASE_URL if
+      # unset; override only if your Google Cloud project registered
+      # a non-standard callback path.
+      #- GOOGLE_OAUTH_REDIRECT_URL=${GOOGLE_OAUTH_REDIRECT_URL}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
       interval: 30s
