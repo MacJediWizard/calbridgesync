@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,104 @@ import (
 const (
 	maxICSResponseSize = 50 * 1024 * 1024 // 50MB limit for ICS feed responses
 )
+
+// icsLoopbackOnlyDialContext is the dial-time DNS-rebinding defense
+// for ICS feed subscriptions. It's analogous to the notify package's
+// safeDialContext but intentionally NARROWER: the webhook dial
+// rejects ALL private IPs (10/8, 172.16/12, 192.168/16, CGNAT,
+// link-local, etc.) because webhooks target external services, but
+// ICS feed URLs legitimately point at LAN calendar servers
+// (Nextcloud on 192.168.x, Radicale on 10.x, DavMail export to a
+// LAN host). Blocking private IPs would break real-world LAN
+// configurations.
+//
+// So this dial-time check only refuses the narrow set that is
+// ALWAYS an operator mistake for an ICS feed URL:
+//
+//  1. Loopback (127.0.0.0/8, ::1, ::ffff:127.0.0.1) — subscribing
+//     the calbridgesync instance's own listener to itself is
+//     operator typo, never legitimate.
+//
+//  2. Unspecified (0.0.0.0, ::) — routes to loopback on many
+//     systems, same category of mistake.
+//
+//  3. Link-local unicast / multicast (169.254.0.0/16, fe80::/10) —
+//     includes cloud metadata endpoints (AWS / GCP / Azure IMDS).
+//     Critical SSRF defense against credential exfiltration via
+//     a malicious DNS answer pointing at 169.254.169.254.
+//
+// RFC 1918 private, carrier NAT, unique-local IPv6 (fc00::/7)
+// remain allowed so LAN use cases work.
+//
+// Validation-time hostname checks (PR #128) catch the obvious
+// static cases at save time. This dial-time check catches DNS
+// rebinding: a hostname that resolved to a public IP at save time
+// but now resolves to 127.0.0.1 (or 169.254.169.254) at fetch
+// time. Same architecture as notify package's safeDialContext. (#129)
+//
+// Like the webhook dial, this resolves the host and dials the
+// resolved IP directly to close a last-mile TOCTOU window between
+// check and connect.
+func icsLoopbackOnlyDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPs resolved for %s", host)
+	}
+
+	// Reject if ANY resolved IP is in the narrow block-list. A
+	// DNS answer of [public-ip, 127.0.0.1] must not slip through
+	// just because Go's dialer might pick the public one — same
+	// defensive posture as the webhook dial.
+	for _, ip := range ips {
+		if blocked, reason := isICSBlockedIP(ip); blocked {
+			return nil, fmt.Errorf("blocked destination: %s resolves to %s (%s)", host, ip.String(), reason)
+		}
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	// Dial the first resolved IP directly to prevent a second
+	// resolver lookup from returning a different answer.
+	dialAddr := net.JoinHostPort(ips[0].String(), port)
+	return dialer.DialContext(ctx, network, dialAddr)
+}
+
+// isICSBlockedIP is the ICS-specific block classifier. Narrower
+// than notify.isBlockedIP: private IPs are allowed. See
+// icsLoopbackOnlyDialContext for the rationale. (#129)
+func isICSBlockedIP(ip net.IP) (bool, string) {
+	if ip == nil {
+		return true, "unparseable IP"
+	}
+	if ip.IsLoopback() {
+		return true, "loopback"
+	}
+	if ip.IsUnspecified() {
+		return true, "unspecified"
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true, "link-local (includes cloud IMDS)"
+	}
+	return false, ""
+}
+
+// icsDialContext is the dial function the ICS http.Client uses.
+// Package-level variable so future tests that spin up an
+// httptest.NewServer (which binds to 127.0.0.1) can swap in a
+// permissive dialer. Not currently needed by existing ICS tests
+// but keeping the pattern consistent with notify/webhookDialContext
+// avoids retrofitting if httptest-based ICS tests get added. (#129)
+var icsDialContext = icsLoopbackOnlyDialContext
 
 // ICSClient fetches and parses ICS calendar feeds over HTTP.
 type ICSClient struct {
@@ -99,6 +198,7 @@ func NewICSClient(feedURL, username, password string) (*ICSClient, error) {
 	}
 
 	transport := &http.Transport{
+		DialContext: icsDialContext,
 		TLSClientConfig: &tls.Config{
 			MinVersion: minTLSVersion,
 		},
