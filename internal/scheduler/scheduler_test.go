@@ -140,6 +140,97 @@ func TestGetSyncLock(t *testing.T) {
 	})
 }
 
+// TestSkipCountAccounting covers the consecutive-skip counter helpers
+// introduced in #93 so the WARNING-on-threshold escalation has a
+// regression test. The counter is per-source, increments on skip,
+// resets on successful lock acquisition, and must be safe for
+// concurrent callers.
+func TestSkipCountAccounting(t *testing.T) {
+	t.Run("increment returns running total", func(t *testing.T) {
+		sched := New(nil, nil, nil)
+
+		if got := sched.incrementSkipCount("source-1"); got != 1 {
+			t.Errorf("first increment: want 1, got %d", got)
+		}
+		if got := sched.incrementSkipCount("source-1"); got != 2 {
+			t.Errorf("second increment: want 2, got %d", got)
+		}
+		if got := sched.incrementSkipCount("source-1"); got != 3 {
+			t.Errorf("third increment: want 3 (threshold), got %d", got)
+		}
+	})
+
+	t.Run("different sources counted independently", func(t *testing.T) {
+		sched := New(nil, nil, nil)
+
+		sched.incrementSkipCount("source-a")
+		sched.incrementSkipCount("source-a")
+		sched.incrementSkipCount("source-b")
+
+		if got := sched.incrementSkipCount("source-a"); got != 3 {
+			t.Errorf("source-a: want 3, got %d", got)
+		}
+		if got := sched.incrementSkipCount("source-b"); got != 2 {
+			t.Errorf("source-b: want 2, got %d", got)
+		}
+	})
+
+	t.Run("reset zeros the counter", func(t *testing.T) {
+		sched := New(nil, nil, nil)
+
+		sched.incrementSkipCount("source-1")
+		sched.incrementSkipCount("source-1")
+		sched.incrementSkipCount("source-1")
+		sched.resetSkipCount("source-1")
+
+		if got := sched.incrementSkipCount("source-1"); got != 1 {
+			t.Errorf("after reset: want 1, got %d", got)
+		}
+	})
+
+	t.Run("reset on unknown source is safe", func(t *testing.T) {
+		sched := New(nil, nil, nil)
+
+		// Must not panic on sources that never incremented
+		sched.resetSkipCount("never-seen")
+	})
+
+	t.Run("concurrent increments are race-free", func(t *testing.T) {
+		// Sanity check; run under `go test -race` to prove no race.
+		sched := New(nil, nil, nil)
+
+		const workers = 32
+		const per = 10
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				for j := 0; j < per; j++ {
+					sched.incrementSkipCount("hot-source")
+				}
+			}()
+		}
+		wg.Wait()
+
+		// Final count via one more increment so we don't need a
+		// getter — expected is workers*per + 1
+		want := workers*per + 1
+		if got := sched.incrementSkipCount("hot-source"); got != want {
+			t.Errorf("concurrent final count: want %d, got %d", want, got)
+		}
+	})
+
+	t.Run("threshold constant is sensible", func(t *testing.T) {
+		if consecutiveSkipWarnThreshold < 2 {
+			t.Errorf("threshold %d is too sensitive — one skip should not warn", consecutiveSkipWarnThreshold)
+		}
+		if consecutiveSkipWarnThreshold > 10 {
+			t.Errorf("threshold %d is too lax — more than 10 skips means the warning comes too late to be actionable", consecutiveSkipWarnThreshold)
+		}
+	})
+}
+
 func TestRemoveJob(t *testing.T) {
 	t.Run("remove non-existent job is safe", func(t *testing.T) {
 		sched := New(nil, nil, nil)
