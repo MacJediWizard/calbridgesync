@@ -1,10 +1,12 @@
 package web
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -50,11 +52,139 @@ func SecurityHeaders() gin.HandlerFunc {
 	}
 }
 
-// RateLimiter creates a rate limiting middleware.
+// ipLimiterEntry tracks a per-client rate limiter and when it was
+// last touched so the cleanup sweep can evict idle entries.
+type ipLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// clientRateLimiters holds per-client-IP rate limiters. Prior to
+// #123 this middleware used a single global limiter shared across
+// every client, which meant one abusive IP could exhaust the
+// bucket and lock out every legitimate user on the instance. On a
+// multi-tenant deployment like William's (3 users today) that's
+// a real user-vs-user isolation gap: a stuck bot hammering one
+// user's session would also lock the other two users out of the
+// dashboard. Per-IP keys fix this by giving each source address
+// its own bucket. (#123)
+//
+// Keyed by string (the gin c.ClientIP() value). sync.Map because
+// lookups are hot-path per-request and writes (map growth) happen
+// only on first-sight IPs. A dedicated mutex around `lastSeen`
+// updates would be cleaner but sync.Map's `LoadOrStore` fast path
+// is preferable here for RPS-level throughput.
+//
+// **Memory leak defense:** the cleanup goroutine below evicts
+// entries whose lastSeen is older than `ipLimiterIdleEvict`,
+// preventing unbounded map growth from ever-changing source IPs
+// (NAT churn, DDoS probing, etc.). Without this the map would
+// grow forever.
+type clientRateLimiters struct {
+	mu       sync.Mutex
+	entries  map[string]*ipLimiterEntry
+	rps      rate.Limit
+	burst    int
+	createdC chan string // optional channel for tests to observe new entries
+}
+
+const (
+	// ipLimiterIdleEvict is the lastSeen horizon after which an
+	// entry in clientRateLimiters is garbage-collected. 10 minutes
+	// is long enough to span the longest reasonable request gap
+	// from a single session (page transitions, tab switches) and
+	// short enough to keep the map bounded even under adversarial
+	// IP churn.
+	ipLimiterIdleEvict = 10 * time.Minute
+
+	// ipLimiterCleanupInterval is how often the cleanup goroutine
+	// walks the map and evicts idle entries. 2 minutes keeps the
+	// upper bound on map size roughly at
+	// (peak_unique_ips_per_12_minutes) which for a home/small-
+	// team instance is negligible.
+	ipLimiterCleanupInterval = 2 * time.Minute
+)
+
+// getLimiter returns the rate.Limiter for the given client IP,
+// creating a fresh one on first sight. Updates lastSeen on every
+// call. Safe for concurrent callers.
+func (c *clientRateLimiters) getLimiter(clientIP string) *rate.Limiter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[clientIP]
+	if !ok {
+		entry = &ipLimiterEntry{
+			limiter: rate.NewLimiter(c.rps, c.burst),
+		}
+		c.entries[clientIP] = entry
+	}
+	entry.lastSeen = time.Now()
+	return entry.limiter
+}
+
+// sweepIdle removes entries whose lastSeen is older than
+// ipLimiterIdleEvict. Called periodically by the cleanup
+// goroutine spawned from newClientRateLimiters.
+func (c *clientRateLimiters) sweepIdle() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	cutoff := time.Now().Add(-ipLimiterIdleEvict)
+	removed := 0
+	for ip, entry := range c.entries {
+		if entry.lastSeen.Before(cutoff) {
+			delete(c.entries, ip)
+			removed++
+		}
+	}
+	return removed
+}
+
+// newClientRateLimiters constructs a clientRateLimiters and spawns
+// the background cleanup goroutine bound to the provided context.
+// When ctx is canceled the goroutine exits. Tests that don't care
+// about cleanup can pass context.Background() and rely on the
+// test process termination to reap.
+func newClientRateLimiters(ctx context.Context, rps float64, burst int) *clientRateLimiters {
+	c := &clientRateLimiters{
+		entries: make(map[string]*ipLimiterEntry),
+		rps:     rate.Limit(rps),
+		burst:   burst,
+	}
+	go func() {
+		ticker := time.NewTicker(ipLimiterCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if removed := c.sweepIdle(); removed > 0 {
+					log.Printf("rate-limiter: evicted %d idle per-IP entries", removed)
+				}
+			}
+		}
+	}()
+	return c
+}
+
+// RateLimiter creates a rate limiting middleware. Backwards-
+// compatible signature — existing callers are unchanged. Under
+// the hood it now uses per-client-IP buckets so one misbehaving
+// client cannot exhaust a single shared bucket and lock out every
+// other user on the instance. (#123)
+//
+// The background cleanup goroutine is tied to context.Background()
+// here because the middleware has no obvious owner lifecycle. In
+// practice this goroutine lives for the duration of the process,
+// which is fine — its only resource is the entries map it sweeps
+// periodically.
 func RateLimiter(rps float64, burst int) gin.HandlerFunc {
-	limiter := rate.NewLimiter(rate.Limit(rps), burst)
+	limiters := newClientRateLimiters(context.Background(), rps, burst)
 
 	return func(c *gin.Context) {
+		limiter := limiters.getLimiter(c.ClientIP())
 		if !limiter.Allow() {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"error": "rate limit exceeded",

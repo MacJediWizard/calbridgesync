@@ -1,10 +1,12 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -518,6 +520,135 @@ func TestIsHTMX(t *testing.T) {
 
 		if isHTMX(c) {
 			t.Error("expected isHTMX to return false for 'false' value")
+		}
+	})
+}
+
+// TestClientRateLimiters covers the per-IP bucket isolation from
+// #123: one abusive client must not be able to exhaust another
+// client's bucket. Runs with a deliberately tight rate (1 rps, 1
+// burst) so the test can prove a second IP still gets through
+// after the first has been saturated.
+func TestClientRateLimiters(t *testing.T) {
+	t.Run("different IPs get independent buckets", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		limiters := newClientRateLimiters(ctx, 1.0, 1)
+
+		// Hammer IP A past its burst. First call succeeds, second
+		// fails because burst = 1.
+		if !limiters.getLimiter("1.2.3.4").Allow() {
+			t.Fatal("first request from 1.2.3.4 should pass")
+		}
+		if limiters.getLimiter("1.2.3.4").Allow() {
+			t.Error("second back-to-back request from 1.2.3.4 should be throttled (burst=1)")
+		}
+
+		// IP B must still be allowed — its own bucket is fresh.
+		if !limiters.getLimiter("5.6.7.8").Allow() {
+			t.Error("first request from 5.6.7.8 must pass — bucket must be isolated per IP")
+		}
+	})
+
+	t.Run("same IP reuses the same limiter", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		limiters := newClientRateLimiters(ctx, 1.0, 1)
+
+		a := limiters.getLimiter("10.0.0.1")
+		b := limiters.getLimiter("10.0.0.1")
+		if a != b {
+			t.Error("same IP must return the same *rate.Limiter — otherwise the burst resets per request")
+		}
+	})
+
+	t.Run("sweepIdle evicts stale entries", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		limiters := newClientRateLimiters(ctx, 1.0, 1)
+
+		// Seed three IPs.
+		limiters.getLimiter("1.1.1.1")
+		limiters.getLimiter("2.2.2.2")
+		limiters.getLimiter("3.3.3.3")
+
+		// Backdate two of them past the idle cutoff.
+		limiters.mu.Lock()
+		limiters.entries["1.1.1.1"].lastSeen = time.Now().Add(-ipLimiterIdleEvict - time.Minute)
+		limiters.entries["2.2.2.2"].lastSeen = time.Now().Add(-ipLimiterIdleEvict - time.Minute)
+		limiters.mu.Unlock()
+
+		removed := limiters.sweepIdle()
+		if removed != 2 {
+			t.Errorf("want 2 entries evicted, got %d", removed)
+		}
+
+		limiters.mu.Lock()
+		defer limiters.mu.Unlock()
+		if _, ok := limiters.entries["3.3.3.3"]; !ok {
+			t.Error("fresh entry must be kept after sweepIdle")
+		}
+		if _, ok := limiters.entries["1.1.1.1"]; ok {
+			t.Error("stale entry 1.1.1.1 must be evicted")
+		}
+	})
+
+	t.Run("sweepIdle is safe on empty map", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		limiters := newClientRateLimiters(ctx, 1.0, 1)
+		// No entries yet; sweepIdle must not panic and must return 0.
+		if got := limiters.sweepIdle(); got != 0 {
+			t.Errorf("want 0 removed on empty map, got %d", got)
+		}
+	})
+
+	t.Run("cleanup goroutine exits on context cancel", func(t *testing.T) {
+		// Smoke test: the cleanup goroutine should exit when its
+		// context is canceled. We can't directly observe the
+		// goroutine terminating, but we can at least verify that
+		// cancellation doesn't panic and that the function returns.
+		ctx, cancel := context.WithCancel(context.Background())
+		_ = newClientRateLimiters(ctx, 1.0, 1)
+		cancel()
+		// Give the goroutine a moment to notice the cancellation.
+		time.Sleep(10 * time.Millisecond)
+	})
+}
+
+// TestRateLimiterPerIP is an integration-style test that exercises
+// the RateLimiter middleware end-to-end and verifies the per-IP
+// isolation visible from the handler layer.
+func TestRateLimiterPerIP(t *testing.T) {
+	t.Run("second IP still gets through after first is throttled", func(t *testing.T) {
+		mw := RateLimiter(1.0, 1)
+
+		runRequest := func(clientIP string) int {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+			c.Request.RemoteAddr = clientIP + ":1234"
+			mw(c)
+			return w.Code
+		}
+
+		// IP A's first request passes.
+		if code := runRequest("9.9.9.1"); code != http.StatusOK {
+			// Default test context returns 200 when not explicitly set
+			// and middleware didn't abort. A 429 means throttled.
+			if code == http.StatusTooManyRequests {
+				t.Errorf("IP A first request was throttled (want allowed): %d", code)
+			}
+		}
+
+		// IP A's second back-to-back request is throttled (burst=1).
+		if code := runRequest("9.9.9.1"); code != http.StatusTooManyRequests {
+			t.Errorf("IP A second request: want 429, got %d", code)
+		}
+
+		// IP B — fresh bucket — still allowed.
+		if code := runRequest("9.9.9.2"); code == http.StatusTooManyRequests {
+			t.Errorf("IP B first request was throttled even though its bucket is fresh — per-IP isolation broken (got 429)")
 		}
 	})
 }
