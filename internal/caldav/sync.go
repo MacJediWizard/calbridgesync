@@ -1282,6 +1282,38 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 		}
 	}
 
+	// Scan for zombie-master corruption fingerprints (#95). This
+	// detector catches two patterns — X-MOZ-FAKED-MASTER stubs and
+	// orphaned RECURRENCE-ID overrides — which are the fingerprint
+	// of a recurring series whose master VEVENT was destroyed
+	// during a round-trip through a lossy iCalendar library. The
+	// pattern was first observed on William's instance during the
+	// WOS Tech Team recovery in April 2026 where the whole weekly
+	// series became invisible in Calendar.app because the master
+	// had been replaced by an "Untitled" stub with no RRULE.
+	//
+	// We run this on the SOURCE side only (not dest) so operators
+	// see the corruption as close to the origin as possible. If
+	// the fingerprint fires on both sides, the source one will be
+	// reported first and the operator can use cmd/purge-uid to
+	// clean both. Running it on dest too would double-report in
+	// steady state without adding information.
+	//
+	// Detection is WARN-only: we never skip or refuse to sync the
+	// affected UIDs, because the sync engine already treats them
+	// as normal events and the ratio guards would catch any
+	// cascading damage. The goal here is observability — surface
+	// the corruption in result.Warnings so it shows up in the
+	// dashboard and the scheduled-sync alerts without changing
+	// sync behavior.
+	if zombies := FindZombieMasters(sourceEvents); len(zombies) > 0 {
+		for _, z := range zombies {
+			msg := fmt.Sprintf("Zombie recurring series detected on source (UID=%s, reason=%s, path=%s) - master VEVENT may be corrupted; use cmd/purge-uid to clean up and re-accept a fresh invite", z.UID, z.Reason, z.EventPath)
+			log.Printf("WARNING: %s", msg)
+			result.Warnings = append(result.Warnings, msg)
+		}
+	}
+
 	// Delegate to shared sync logic
 	return se.syncEventsToDestination(ctx, source, sourceClient, destClient, sourceEvents, calendar, calendarIndex, syncDirection)
 }
