@@ -134,3 +134,102 @@ func TestIsWithinSyncSafetyThreshold_FutureSyncedAt(t *testing.T) {
 		t.Error("future syncedAt should trivially be 'within' threshold (safe default)")
 	}
 }
+
+// TestShouldSkipTwoWayCreate_NormalCase verifies the happy path:
+// a two-way sync with source events present and previously synced
+// events does NOT skip the reverse create pass. This is the normal
+// operating mode — dest-only events should flow up to source. (#72)
+func TestShouldSkipTwoWayCreate_NormalCase(t *testing.T) {
+	if shouldSkipTwoWayCreate(db.SyncDirectionTwoWay, 50, 50) {
+		t.Error("normal case should not skip two-way create")
+	}
+}
+
+// TestShouldSkipTwoWayCreate_SourceEmptyWithPriorSync verifies the
+// critical safety case: two-way sync, source query returned empty,
+// previously synced events exist. MUST skip the create pass to
+// prevent mass-upload of the entire destination calendar back to
+// source when the source query silently failed. Mirror of
+// shouldSkipTwoWayDeletion. (#72)
+func TestShouldSkipTwoWayCreate_SourceEmptyWithPriorSync(t *testing.T) {
+	if !shouldSkipTwoWayCreate(db.SyncDirectionTwoWay, 0, 50) {
+		t.Fatal("source empty + prior sync records MUST skip create pass to prevent mass upload to source")
+	}
+}
+
+// TestShouldSkipTwoWayCreate_OneWayNotAffected verifies that the
+// guard only applies to two-way sync. A one-way sync has no reverse
+// create pass anyway, so the guard is a no-op for one-way. (#72)
+func TestShouldSkipTwoWayCreate_OneWayNotAffected(t *testing.T) {
+	if shouldSkipTwoWayCreate(db.SyncDirectionOneWay, 0, 50) {
+		t.Error("one-way sync should never be affected by the two-way create guard")
+	}
+}
+
+// TestShouldSkipTwoWayCreate_EmptySourceNoPrior verifies the
+// legitimate first-sync scenario: two-way sync, source empty, no
+// prior sync records. Nothing to protect against (no "prior state"
+// implying the source should have events) — don't block creates.
+// This is the initial-sync case where dest has events and source
+// is a fresh calendar waiting for them. (#72)
+func TestShouldSkipTwoWayCreate_EmptySourceNoPrior(t *testing.T) {
+	if shouldSkipTwoWayCreate(db.SyncDirectionTwoWay, 0, 0) {
+		t.Error("legitimate first-sync (empty source, no prior records) should not block creates")
+	}
+}
+
+// TestShouldSkipTwoWayCreate_PopulatedSourceNoPrior verifies that a
+// fresh two-way sync against a source that has events and no prior
+// records does not trigger the guard — the source is clearly
+// working, and any dest-only events should flow up. (#72)
+func TestShouldSkipTwoWayCreate_PopulatedSourceNoPrior(t *testing.T) {
+	if shouldSkipTwoWayCreate(db.SyncDirectionTwoWay, 10, 0) {
+		t.Error("populated source with no prior records should not trigger the guard")
+	}
+}
+
+// TestShouldSkipTwoWayCreate_Symmetric verifies that
+// shouldSkipTwoWayCreate and shouldSkipTwoWayDeletion are symmetric
+// mirrors of each other. The delete guard protects the destination
+// from mass deletion when the source returned empty; the create
+// guard protects the source from mass upload when the source
+// returned empty. Both trip on the same condition: "two-way mode,
+// one side empty, prior sync records exist." (#72)
+//
+// This test is a canary — if someone changes the logic of one guard
+// without the other, this test fails and flags the asymmetry.
+func TestShouldSkipTwoWayCreate_Symmetric(t *testing.T) {
+	// The delete guard's first param is destEventCount; the create
+	// guard's first param is sourceEventCount. Both should fire on
+	// "empty + prior records > 0" in two-way mode.
+	cases := []struct {
+		name                   string
+		direction              db.SyncDirection
+		emptySide              int // destEventCount for delete, sourceEventCount for create
+		priorCount             int
+		expectDeleteGuardFires bool
+		expectCreateGuardFires bool
+	}{
+		{"two-way empty + prior", db.SyncDirectionTwoWay, 0, 50, true, true},
+		{"two-way empty + no prior", db.SyncDirectionTwoWay, 0, 0, false, false},
+		{"two-way populated + prior", db.SyncDirectionTwoWay, 10, 50, false, false},
+		{"one-way empty + prior", db.SyncDirectionOneWay, 0, 50, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotDelete := shouldSkipTwoWayDeletion(tc.direction, tc.emptySide, tc.priorCount)
+			gotCreate := shouldSkipTwoWayCreate(tc.direction, tc.emptySide, tc.priorCount)
+			if gotDelete != tc.expectDeleteGuardFires {
+				t.Errorf("shouldSkipTwoWayDeletion: got %v, want %v", gotDelete, tc.expectDeleteGuardFires)
+			}
+			if gotCreate != tc.expectCreateGuardFires {
+				t.Errorf("shouldSkipTwoWayCreate: got %v, want %v", gotCreate, tc.expectCreateGuardFires)
+			}
+			// The two guards must agree on whether to skip (they're
+			// symmetric by design).
+			if gotDelete != gotCreate {
+				t.Errorf("guards disagree (delete=%v, create=%v) — they should be symmetric", gotDelete, gotCreate)
+			}
+		})
+	}
+}
