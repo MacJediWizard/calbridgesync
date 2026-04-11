@@ -151,10 +151,68 @@ func shouldUpdateDestFromSource(sourceETag string, prev *db.SyncedEvent) bool {
 	return prev.SourceETag != sourceETag
 }
 
-// shouldUpdateSourceFromDest is the symmetric helper for the reverse
-// dest_wins update pass. See shouldUpdateDestFromSource for the full
-// rationale — the only difference is we compare destETag against the
-// last-known DEST ETag from prev. (#79)
+// shouldUpdateSourceFromDest is the reverse-direction ETag check
+// used by the dest_wins update pass. It's a near-mirror of
+// shouldUpdateDestFromSource but NOT a full symmetric twin — the
+// nil-prev handling diverges intentionally, and this block exists
+// to document why so the next reader who spots the asymmetry does
+// not "unify" them and break one or both call sites. (#79, #99)
+//
+// Three cases:
+//
+//   - prev == nil: the event exists on both sides but has no
+//     tracking row. **Returns false** (skip the reverse PUT).
+//     Rationale: on this path we cannot tell whether the current
+//     dest ETag is a recent change or a long-standing state we've
+//     just never seen before — both look identical when there's
+//     no history. Guessing "push dest → source" on missing history
+//     would clobber source with a dest state we have no reason to
+//     trust as newer. Better to do nothing this cycle, let the
+//     upsert at the end of the pass record both ETags, and
+//     compare properly on the NEXT cycle. Locked in by
+//     TestShouldUpdateSourceFromDest_NilPrevSkips and
+//     TestEtagHelpers_SymmetricLegacyBehavior.
+//
+//   - prev.DestETag == "": legacy record from before DestETag
+//     tracking was wired in. Don't re-PUT the whole calendar on
+//     first deploy; skip and let this cycle's upsert start
+//     tracking DestETag from the current state. Same rollout
+//     protection the forward helper gives for prev.SourceETag.
+//
+//   - prev.DestETag != "": a real ETag we can compare. PUT iff
+//     the current dest ETag differs from the stored one.
+//
+// ### Why the asymmetry with shouldUpdateDestFromSource is load-bearing
+//
+// shouldUpdateDestFromSource returns **true** on nil prev, not
+// false. That's not a bug — the forward path is reached via the
+// `else if` of `!existsByUID`, which means the caller already
+// routed the "brand new event" case to the create branch. Seeing
+// nil prev on the forward path therefore implies an anomaly
+// (synced_events was cleared, a third-party tool wrote the event
+// out-of-band, etc.) and defaulting to "push source → dest" is
+// consistent with source_wins semantics: source is source of
+// truth so push it.
+//
+// The reverse path (this one) has a different context. It only
+// runs when conflict_strategy == dest_wins, and it walks
+// destEvents looking for events to push back to source. Seeing
+// nil prev here could mean:
+//
+//	(a) dest just got a brand new event the forward create pass
+//	    has not handled yet — in which case we should NOT push it
+//	    to source because the forward pass handles creates on
+//	    its own
+//	(b) a pre-existing same-UID event on both sides with no
+//	    tracking — in which case "guess dest is newer" risks
+//	    clobbering legitimate source state
+//
+// Both (a) and (b) favor "skip." The forward helper's nil-prev
+// default doesn't have (a) as a concern (it runs AFTER the
+// forward create pass inside the same `if existsByUID` branch).
+//
+// TL;DR: identical rationale, different calling context, so the
+// safe default flips. This is intentional and covered by tests.
 func shouldUpdateSourceFromDest(destETag string, prev *db.SyncedEvent) bool {
 	if prev == nil || prev.DestETag == "" {
 		return false
