@@ -573,7 +573,26 @@ func (s *Scheduler) getSyncLock(sourceID string) *sync.Mutex {
 }
 
 // executeSync runs the sync for a source.
+//
+// Has its own defer recoverPanic even though every caller already
+// wraps executeSync in its own recoverPanic (runJob, runJobFromTicker,
+// runJobWithDelay, TriggerSync). The caller's recover is enough to
+// keep the process alive, but it is NOT enough to keep the caller's
+// sync-loop alive: Go's panic propagation unwinds past the enclosing
+// `for { select { ... executeSync(...) } }` loop, so a panic in
+// sync.go silently kills the entire scheduler loop for that source
+// until the daemon restarts. Users silently stop getting syncs.
+//
+// With an inline recover, a panic inside SyncSource becomes a single
+// loud log line, executeSync returns normally, and the caller's
+// loop continues on the next tick. If the panic is caused by a
+// persistent condition (bad config, libical bug, etc.) every tick
+// will repeat the panic — that's intentional noise; it's easier for
+// operators to fix a persistently-crashing sync than to notice that
+// one source stopped syncing entirely. (#121)
 func (s *Scheduler) executeSync(sourceID string) {
+	defer recoverPanic(fmt.Sprintf("scheduler.executeSync[%s]", sourceID))
+
 	// Get per-source lock to prevent concurrent syncs
 	lock := s.getSyncLock(sourceID)
 
