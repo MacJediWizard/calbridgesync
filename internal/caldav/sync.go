@@ -1324,11 +1324,32 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			} else {
 				result.Deleted++
 				updateProgress()
+				// Remove from synced_events ONLY after a successful
+				// CalDAV DELETE. Previously this cleanup was
+				// unconditional, so a failed DELETE (auth blip,
+				// 5xx, transient network) would still wipe the
+				// tracking row — next cycle then had no record
+				// this UID was previously synced, so the
+				// reverse-create pass would dutifully re-upload
+				// the still-live dest event back to source. With
+				// PR #78 content dedupe this mostly got caught as
+				// a duplicate, but it was still wasted traffic
+				// and could mask real partial failures during
+				// recovery scenarios. (#89)
+				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+					log.Printf("Failed to delete synced event record: %v", err)
+				}
 			}
-			// Remove from synced_events
-			if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-				log.Printf("Failed to delete synced event record: %v", err)
-			}
+			// Regardless of delete success, drop this UID from the
+			// in-memory maps so the source-deletion pass below does
+			// not also attempt to process it. A failed DELETE still
+			// logged a warning; leaving the UID in play would have
+			// the source-deletion pass try to delete it from source
+			// as well (because it's "missing from dest" in that pass's
+			// view if we also deleted it from destEventMap — but we
+			// only reach the source-deletion pass if dest-delete
+			// planned it, so leaving it in the map is actively
+			// wrong). Drop-and-mark-handled is the safe choice.
 			delete(destEventMap, uid)
 			handledByDestDelete[uid] = true
 		}
@@ -1385,10 +1406,16 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			} else {
 				result.Deleted++
 				updateProgress()
-			}
-			// Remove from synced_events
-			if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-				log.Printf("Failed to delete synced event record: %v", err)
+				// Scrub synced_events ONLY on successful DELETE.
+				// Same rationale as the dest-deletion pass above:
+				// a failed DELETE combined with unconditional
+				// tracking-row cleanup would make the next cycle
+				// treat this UID as "never seen before" and let
+				// the forward-create pass push the still-live
+				// source event back to destination. (#89)
+				if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
+					log.Printf("Failed to delete synced event record: %v", err)
+				}
 			}
 			delete(sourceEventMap, uid)
 			handledBySourceDelete[uid] = true
