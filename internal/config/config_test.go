@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -826,6 +827,90 @@ func TestGoogleOAuthConfig_Enabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.cfg.Enabled(); got != tt.wantOk {
 				t.Errorf("Enabled() = %v, want %v", got, tt.wantOk)
+			}
+		})
+	}
+}
+
+// TestValidateAllowedOriginsForProd covers the production-mode
+// hard-fail from #101: if ENVIRONMENT=production and ALLOWED_ORIGINS
+// is unset, Config.Validate must return an error. Development mode
+// and explicitly-set production values must pass cleanly.
+func TestValidateAllowedOriginsForProd(t *testing.T) {
+	cases := []struct {
+		name        string
+		isProd      bool
+		envVar      string
+		wantErr     bool
+		wantErrType error
+	}{
+		{
+			name:    "dev mode + empty is OK (localhost defaults)",
+			isProd:  false,
+			envVar:  "",
+			wantErr: false,
+		},
+		{
+			name:    "dev mode + explicit is OK",
+			isProd:  false,
+			envVar:  "http://localhost:3000",
+			wantErr: false,
+		},
+		{
+			name:        "prod mode + empty is a hard fail",
+			isProd:      true,
+			envVar:      "",
+			wantErr:     true,
+			wantErrType: ErrValidationFailed,
+		},
+		{
+			name:    "prod mode + single origin is OK",
+			isProd:  true,
+			envVar:  "https://calbridgesync.example.com",
+			wantErr: false,
+		},
+		{
+			name:    "prod mode + multiple origins is OK",
+			isProd:  true,
+			envVar:  "https://calbridgesync.example.com,https://admin.example.com",
+			wantErr: false,
+		},
+		{
+			// The validator only checks "non-empty." Format
+			// validation (isValidOrigin) happens later in
+			// middleware.go's getAllowedOrigins. A whitespace-only
+			// value makes it past this check but then gets logged
+			// as invalid by middleware and falls back to empty,
+			// which in turn blocks all non-empty origins. That's
+			// a deployment bug but not our job to catch here —
+			// the goal of this check is the far-more-common
+			// "operator forgot to set it" case.
+			name:    "prod mode + whitespace-only env passes (not our layer to format-check)",
+			isProd:  true,
+			envVar:  "   ",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAllowedOriginsForProd(tc.isProd, tc.envVar)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got nil")
+				}
+				if tc.wantErrType != nil && !errors.Is(err, tc.wantErrType) {
+					t.Errorf("want error type %v, got %v", tc.wantErrType, err)
+				}
+				// The error message should mention ALLOWED_ORIGINS so
+				// operators can grep the startup logs and find it.
+				if !strings.Contains(err.Error(), "ALLOWED_ORIGINS") {
+					t.Errorf("error message must mention ALLOWED_ORIGINS for operator grep-ability, got: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
 			}
 		})
 	}
