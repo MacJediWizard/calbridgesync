@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,10 +26,76 @@ type ICSClient struct {
 	httpClient *http.Client
 }
 
+// validateICSFeedURL rejects obviously unsafe ICS feed URLs. The
+// threat model for ICS subscriptions sits between webhook URLs
+// (strictly external HTTPS, private IPs rejected) and CalDAV
+// source URLs (LAN servers are common and legitimate). ICS feeds
+// are most often public calendar subscription URLs (Google
+// Calendar public feeds, university schedules, sports calendars)
+// but can also legitimately point at a LAN calendar with ICS
+// export. So this validator is deliberately narrower than
+// validateWebhookURL:
+//
+//  1. Scheme must be http or https. Rejects file://, gopher://,
+//     dict://, data://, and other schemes that would let a
+//     crafted feed URL exfiltrate local files or pivot to
+//     non-HTTP protocols. This is the primary SSRF defense — the
+//     Go HTTP client would technically try to dial a file:// URL
+//     as a relative path lookup, which is almost always the
+//     wrong behavior.
+//
+//  2. Hostname cannot be localhost / 127.0.0.1 / ::1. A feed URL
+//     pointing at the calbridgesync instance's own HTTP listener
+//     is almost always an operator typo — nobody legitimately
+//     subscribes their own instance to itself, and accepting it
+//     gives an attacker (or a confused user) the ability to
+//     trigger recursive fetches or probe internal endpoints.
+//
+//  3. Hostname cannot end in `.local` or `.internal`. Catches
+//     mDNS and intranet-style suffixes that are almost always
+//     operator typos for the non-suffixed form, and that leak
+//     intent about the internal network when they fail.
+//
+// **Not** blocked here: RFC 1918 private ranges (10.0.0.0/8,
+// 172.16.0.0/12, 192.168.0.0/16) and link-local (169.254/16).
+// Legitimate LAN ICS subscriptions exist (Nextcloud, Radicale,
+// DavMail exporting to a LAN address) and blocking them would
+// break real configurations on home / small-team deployments.
+// The webhook validator blocks private IPs because webhook
+// alerts are strictly external; ICS feeds are not.
+//
+// The second-pass audit flagged this gap after it observed that
+// PR #116 hardened the webhook path but left ICS completely
+// unvalidated. (#127)
+func validateICSFeedURL(feedURL string) error {
+	if feedURL == "" {
+		return fmt.Errorf("ICS feed URL is required")
+	}
+	parsed, err := url.Parse(feedURL)
+	if err != nil {
+		return fmt.Errorf("invalid ICS feed URL: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("ICS feed URL scheme must be http or https, got %q", scheme)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return fmt.Errorf("ICS feed URL is missing a host")
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return fmt.Errorf("ICS feed URL cannot point to localhost")
+	}
+	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return fmt.Errorf("ICS feed URL cannot point to .local or .internal hosts")
+	}
+	return nil
+}
+
 // NewICSClient creates a new ICS feed client.
 func NewICSClient(feedURL, username, password string) (*ICSClient, error) {
-	if feedURL == "" {
-		return nil, fmt.Errorf("%w: feed URL is required", ErrConnectionFailed)
+	if err := validateICSFeedURL(feedURL); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrConnectionFailed, err)
 	}
 
 	transport := &http.Transport{
