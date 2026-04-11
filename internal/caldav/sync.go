@@ -636,6 +636,74 @@ func planOrphanDeletion(
 	return candidates, ""
 }
 
+// caldavEventDeleter is the narrow CalDAV client surface that
+// performDeletionAndCleanup needs. Defined as an interface so the
+// unit test for the helper can mock it without spinning up an
+// entire HTTP stack. The production *Client satisfies it
+// implicitly. (#97)
+type caldavEventDeleter interface {
+	DeleteEvent(ctx context.Context, eventPath string) error
+}
+
+// syncedEventTrackingDeleter is the narrow DB surface that
+// performDeletionAndCleanup needs. Same rationale as
+// caldavEventDeleter — keeping the mock small by depending only
+// on the one method we actually call. The production *db.DB
+// satisfies it implicitly. (#97)
+type syncedEventTrackingDeleter interface {
+	DeleteSyncedEvent(sourceID, calendarHref, eventUID string) error
+}
+
+// performDeletionAndCleanup issues a CalDAV DELETE for one event
+// and, ONLY on success, scrubs the corresponding synced_events
+// tracking row. This is the invariant that a previous refactor
+// got wrong (#89 / PR #90): the inline two-way deletion loops
+// in fullSync used to call db.DeleteSyncedEvent unconditionally
+// after the CalDAV DELETE, so a failed DELETE would still wipe
+// the tracking row — and the next cycle, with no "previously
+// synced" context for the still-live event, would re-propagate
+// it back to the other side via the forward-create or reverse-
+// create pass.
+//
+// Extracting this invariant into a single named helper means
+// future refactors cannot accidentally reintroduce the bug: any
+// caller that wants to delete an event AND clean up its tracking
+// row has exactly one path for doing both in the correct order,
+// and the behavior is covered by a direct unit test that mocks
+// both sides and asserts the cleanup happens only on success.
+//
+// Returns the error from the CalDAV DELETE. A DB error is
+// logged but not returned because the DB cleanup is a consistency
+// hint, not a data-safety requirement — at worst we leak one
+// synced_events row that the next cycle's cleanup pass will
+// garbage-collect. Returning the DB error would tempt callers
+// to abort the outer loop on a recoverable failure, which is
+// worse than tolerating a stale row.
+//
+// Callers are responsible for:
+//
+//   - Incrementing result.Deleted on nil return
+//   - Appending to result.Warnings on non-nil return (with
+//     their own context about source-side vs dest-side)
+//   - Updating any per-cycle in-memory state maps (destEventMap,
+//     sourceEventMap, handledByDestDelete, handledBySourceDelete)
+//     — those are caller concerns because they affect how later
+//     passes in the same cycle behave.
+func performDeletionAndCleanup(
+	ctx context.Context,
+	client caldavEventDeleter,
+	tracker syncedEventTrackingDeleter,
+	eventPath, sourceID, calendarHref, uid string,
+) error {
+	if err := client.DeleteEvent(ctx, eventPath); err != nil {
+		return err
+	}
+	if err := tracker.DeleteSyncedEvent(sourceID, calendarHref, uid); err != nil {
+		log.Printf("Failed to delete synced event tracking row for %s: %v", uid, err)
+	}
+	return nil
+}
+
 // SyncResult represents the result of a sync operation.
 type SyncResult struct {
 	Success           bool          `json:"success"`
@@ -1319,16 +1387,30 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		for _, uid := range toDeleteFromDest {
 			destEvent := destEventMap[uid]
 			log.Printf("Event %s deleted from source, deleting from destination", uid)
-			if err := destClient.DeleteEvent(ctx, destEvent.Path); err != nil {
+			// performDeletionAndCleanup enforces the success-only
+			// invariant for synced_events cleanup (#97). A failed
+			// DELETE no longer wipes the tracking row — see the
+			// helper's doc comment for the full rationale.
+			if err := performDeletionAndCleanup(
+				ctx,
+				destClient,
+				se.db,
+				destEvent.Path,
+				source.ID,
+				calendar.Path,
+				uid,
+			); err != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete event from dest: %v", err))
 			} else {
 				result.Deleted++
 				updateProgress()
 			}
-			// Remove from synced_events
-			if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-				log.Printf("Failed to delete synced event record: %v", err)
-			}
+			// In-memory map mutations stay unconditional: even on a
+			// failed DELETE we want the source-deletion pass below
+			// to skip this UID (leaving it in play would have that
+			// pass try to delete from source as well, which is the
+			// wrong direction for a UID whose dest DELETE just
+			// failed).
 			delete(destEventMap, uid)
 			handledByDestDelete[uid] = true
 		}
@@ -1380,15 +1462,21 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			}
 
 			log.Printf("Event %s deleted from destination, deleting from source", uid)
-			if err := sourceClient.DeleteEvent(ctx, sourceEvent.Path); err != nil {
+			// Same success-only cleanup invariant as the dest
+			// deletion pass above. (#97)
+			if err := performDeletionAndCleanup(
+				ctx,
+				sourceClient,
+				se.db,
+				sourceEvent.Path,
+				source.ID,
+				calendar.Path,
+				uid,
+			); err != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete event from source: %v", err))
 			} else {
 				result.Deleted++
 				updateProgress()
-			}
-			// Remove from synced_events
-			if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-				log.Printf("Failed to delete synced event record: %v", err)
 			}
 			delete(sourceEventMap, uid)
 			handledBySourceDelete[uid] = true
