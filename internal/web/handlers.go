@@ -381,18 +381,15 @@ func (h *Handlers) EditSourcePage(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	sourceID := c.Param("id")
 
-	source, err := h.db.GetSourceByID(sourceID)
+	// Scoped lookup — unscoped GetSourceByID + post-hoc UserID
+	// check would return 403 on a valid source owned by another
+	// user, which leaks the existence of that source. Scoped
+	// lookup returns ErrNotFound uniformly for "wrong owner" and
+	// "no such ID," matching the pattern in api_handlers.go. (#109)
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.HTML(http.StatusNotFound, "error.html", gin.H{
 			"error": "Source not found",
-		})
-		return
-	}
-
-	// Verify ownership
-	if source.UserID != session.UserID {
-		c.HTML(http.StatusForbidden, "error.html", gin.H{
-			"error": "Access denied",
 		})
 		return
 	}
@@ -412,15 +409,11 @@ func (h *Handlers) UpdateSource(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	sourceID := c.Param("id")
 
-	source, err := h.db.GetSourceByID(sourceID)
+	// Scoped lookup — see EditSourcePage for the 403/404 oracle
+	// rationale. (#109)
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		h.respondError(c, http.StatusNotFound, "Source not found")
-		return
-	}
-
-	// Verify ownership
-	if source.UserID != session.UserID {
-		h.respondError(c, http.StatusForbidden, "Access denied")
 		return
 	}
 
@@ -479,15 +472,10 @@ func (h *Handlers) DeleteSource(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	sourceID := c.Param("id")
 
-	source, err := h.db.GetSourceByID(sourceID)
+	// Scoped lookup to avoid the 403/404 oracle. (#109)
+	_, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		h.respondError(c, http.StatusNotFound, "Source not found")
-		return
-	}
-
-	// Verify ownership
-	if source.UserID != session.UserID {
-		h.respondError(c, http.StatusForbidden, "Access denied")
 		return
 	}
 
@@ -513,15 +501,10 @@ func (h *Handlers) TriggerSync(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	sourceID := c.Param("id")
 
-	source, err := h.db.GetSourceByID(sourceID)
+	// Scoped lookup to avoid the 403/404 oracle. (#109)
+	_, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		h.respondError(c, http.StatusNotFound, "Source not found")
-		return
-	}
-
-	// Verify ownership
-	if source.UserID != session.UserID {
-		h.respondError(c, http.StatusForbidden, "Access denied")
 		return
 	}
 
@@ -543,15 +526,10 @@ func (h *Handlers) ToggleSource(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	sourceID := c.Param("id")
 
-	source, err := h.db.GetSourceByID(sourceID)
+	// Scoped lookup to avoid the 403/404 oracle. (#109)
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		h.respondError(c, http.StatusNotFound, "Source not found")
-		return
-	}
-
-	// Verify ownership
-	if source.UserID != session.UserID {
-		h.respondError(c, http.StatusForbidden, "Access denied")
 		return
 	}
 
@@ -583,18 +561,11 @@ func (h *Handlers) ViewLogs(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	sourceID := c.Param("id")
 
-	source, err := h.db.GetSourceByID(sourceID)
+	// Scoped lookup to avoid the 403/404 oracle. (#109)
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.HTML(http.StatusNotFound, "error.html", gin.H{
 			"error": "Source not found",
-		})
-		return
-	}
-
-	// Verify ownership
-	if source.UserID != session.UserID {
-		c.HTML(http.StatusForbidden, "error.html", gin.H{
-			"error": "Access denied",
 		})
 		return
 	}
