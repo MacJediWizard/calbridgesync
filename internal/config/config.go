@@ -39,6 +39,23 @@ type Config struct {
 	RateLimiting RateLimitConfig
 	Sync         SyncConfig
 	Alerts       AlertConfig
+	GoogleOAuth  GoogleOAuthConfig
+}
+
+// GoogleOAuthConfig holds the OAuth2 credentials for Google Calendar
+// source_type. These are optional: if ClientID or ClientSecret is unset,
+// the feature is disabled and the web UI surfaces a clear error instead
+// of letting the user start a flow that would 401 at the end. (#70)
+type GoogleOAuthConfig struct {
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+}
+
+// Enabled returns true if both client ID and secret are configured.
+// Call this before routing users into the Google OAuth flow.
+func (g GoogleOAuthConfig) Enabled() bool {
+	return g.ClientID != "" && g.ClientSecret != ""
 }
 
 // AlertConfig holds alerting configuration.
@@ -257,6 +274,19 @@ func Load() (*Config, error) {
 			ErrInvalidConfig, initialBackoffMS)
 	}
 	cfg.Alerts.InitialBackoffMS = initialBackoffMS
+
+	// Google OAuth2 configuration (optional; feature is disabled when
+	// ClientID/ClientSecret are unset). (#70)
+	cfg.GoogleOAuth.ClientID = getEnv("GOOGLE_OAUTH_CLIENT_ID", "")
+	cfg.GoogleOAuth.ClientSecret = getEnv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+	cfg.GoogleOAuth.RedirectURL = getEnv("GOOGLE_OAUTH_REDIRECT_URL", "")
+	// If redirect URL is not explicitly set but base URL is, default to
+	// <BASE_URL>/auth/oauth/google/callback. This matches the route
+	// registered in internal/web/routes.go and means operators usually
+	// only need to set the client id and secret.
+	if cfg.GoogleOAuth.RedirectURL == "" && cfg.Server.BaseURL != "" && cfg.GoogleOAuth.ClientID != "" {
+		cfg.GoogleOAuth.RedirectURL = strings.TrimRight(cfg.Server.BaseURL, "/") + "/auth/oauth/google/callback"
+	}
 
 	// Check for missing required configuration
 	missing := cfg.getMissingRequired()

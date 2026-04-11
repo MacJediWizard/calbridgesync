@@ -40,10 +40,10 @@ func New(dbPath string) (*DB, error) {
 	// Configure connection pool limits to prevent resource exhaustion
 	// SQLite handles concurrency differently than other databases, but these
 	// limits still help prevent file descriptor exhaustion and memory issues
-	conn.SetMaxOpenConns(25)       // Maximum number of open connections
-	conn.SetMaxIdleConns(5)        // Maximum idle connections in pool
-	conn.SetConnMaxLifetime(0)     // Connections are reused forever
-	conn.SetConnMaxIdleTime(0)     // Idle connections are kept forever
+	conn.SetMaxOpenConns(25)   // Maximum number of open connections
+	conn.SetMaxIdleConns(5)    // Maximum idle connections in pool
+	conn.SetConnMaxLifetime(0) // Connections are reused forever
+	conn.SetConnMaxIdleTime(0) // Idle connections are kept forever
 
 	// Configure SQLite for optimal performance and security
 	pragmas := []string{
@@ -224,6 +224,12 @@ func (db *DB) migrate() error {
 
 		// Migration: Add sync_days_past column to sources (default 30 days)
 		`ALTER TABLE sources ADD COLUMN sync_days_past INTEGER NOT NULL DEFAULT 30`,
+
+		// Migration (#70): Add oauth_refresh_token column for Google
+		// Calendar sources. Stored encrypted via the application's
+		// AES-256-GCM Encryptor, same as source_password. Nullable
+		// because non-Google sources never populate it.
+		`ALTER TABLE sources ADD COLUMN oauth_refresh_token TEXT`,
 	}
 
 	for _, migration := range migrations {

@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+
 	"github.com/macjediwizard/calbridgesync/internal/auth"
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/config"
@@ -83,8 +86,33 @@ func main() {
 		cfg.Security.OAuthStateMaxAgeSecs,
 	)
 
+	// Build the Google OAuth2 config if credentials are configured.
+	// This is passed through to the sync engine so Google sources can
+	// authenticate via Bearer tokens. nil when the feature is not
+	// configured — in that case, attempting to sync a Google source
+	// will surface a clear error from the engine. (#70)
+	var googleOAuthConfig *oauth2.Config
+	if cfg.GoogleOAuth.Enabled() {
+		googleOAuthConfig = &oauth2.Config{
+			ClientID:     cfg.GoogleOAuth.ClientID,
+			ClientSecret: cfg.GoogleOAuth.ClientSecret,
+			RedirectURL:  cfg.GoogleOAuth.RedirectURL,
+			Endpoint:     google.Endpoint,
+			Scopes: []string{
+				// Full calendar scope is required for CalDAV access.
+				// The narrower .events scope is NOT sufficient because
+				// CalDAV requires PROPFIND on calendar-home-set.
+				"https://www.googleapis.com/auth/calendar",
+				// Needed to fetch the user's primary email during the
+				// OAuth callback so we can build the per-calendar URL.
+				"https://www.googleapis.com/auth/userinfo.email",
+			},
+		}
+		log.Printf("Google OAuth2 enabled (redirect=%s)", cfg.GoogleOAuth.RedirectURL)
+	}
+
 	// Initialize sync engine
-	syncEngine := caldav.NewSyncEngine(database, encryptor)
+	syncEngine := caldav.NewSyncEngine(database, encryptor, googleOAuthConfig)
 
 	// Initialize notifier for alerts
 	notifyCfg := &notify.Config{
