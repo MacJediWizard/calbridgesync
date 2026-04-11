@@ -41,7 +41,7 @@ func TestPlanReverseCreate_AllCandidatesReturnedInNormalCase(t *testing.T) {
 	}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if warning != "" {
 		t.Errorf("expected no warning in normal case, got %q", warning)
@@ -72,7 +72,7 @@ func TestPlanReverseCreate_SkipsEventsAlreadyOnSource(t *testing.T) {
 	}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if warning != "" {
 		t.Errorf("expected no warning, got %q", warning)
@@ -97,7 +97,7 @@ func TestPlanReverseCreate_SkipsEventsInPreviouslySynced(t *testing.T) {
 		"was-synced-then-deleted-from-source": {EventUID: "was-synced-then-deleted-from-source"},
 	}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if warning != "" {
 		t.Errorf("expected no warning, got %q", warning)
@@ -119,7 +119,7 @@ func TestPlanReverseCreate_SkipsEventsWithEmptyUID(t *testing.T) {
 	sourceEventMap := map[string]Event{"other": {UID: "other"}}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, _ := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, _ := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if len(toUpload) != 1 || toUpload[0].UID != "valid" {
 		t.Errorf("expected only the valid-UID event, got %+v", toUpload)
@@ -142,7 +142,7 @@ func TestPlanReverseCreate_EmptySourceWithPriorRecordsRefusesAll(t *testing.T) {
 		"e2": {EventUID: "e2"},
 	}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if warning == "" {
 		t.Fatal("expected a safety warning when source is empty + prior records exist")
@@ -165,7 +165,7 @@ func TestPlanReverseCreate_EmptySourceNoPriorAllowsNormalUpload(t *testing.T) {
 	sourceEventMap := map[string]Event{}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if warning != "" {
 		t.Errorf("first-sync case should not trigger safety: got warning %q", warning)
@@ -188,7 +188,7 @@ func TestPlanReverseCreate_HardCapExceededRefusesAll(t *testing.T) {
 	sourceEventMap := map[string]Event{"other": {UID: "other"}}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 100)
 
 	if warning == "" {
 		t.Fatal("expected a safety warning when candidate count exceeds cap")
@@ -209,7 +209,7 @@ func TestPlanReverseCreate_HardCapOfZeroDisabled(t *testing.T) {
 	sourceEventMap := map[string]Event{"other": {UID: "other"}}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 0)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 0)
 
 	if warning != "" {
 		t.Errorf("cap=0 should disable the cap check, got warning %q", warning)
@@ -231,7 +231,7 @@ func TestPlanReverseCreate_CapExactlyAtCandidateCountAllowed(t *testing.T) {
 	sourceEventMap := map[string]Event{"other": {UID: "other"}}
 	previouslySyncedMap := map[string]*db.SyncedEvent{}
 
-	toUpload, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 5)
+	toUpload, _, warning := planReverseCreate(destEvents, sourceEventMap, previouslySyncedMap, 5)
 
 	if warning != "" {
 		t.Errorf("exact-cap case should allow upload, got warning %q", warning)

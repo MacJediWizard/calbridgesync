@@ -141,18 +141,39 @@ func planReverseCreate(
 	sourceEventMap map[string]Event,
 	previouslySyncedMap map[string]*db.SyncedEvent,
 	maxCreates int,
-) (toUpload []Event, warning string) {
+) (toUpload []Event, alreadyOnSourceByContent []Event, warning string) {
 	// Rule 2: empty source with prior records → refuse to upload anything.
 	if len(sourceEventMap) == 0 && len(previouslySyncedMap) > 0 {
-		return nil, fmt.Sprintf(
+		return nil, nil, fmt.Sprintf(
 			"source returned 0 events but %d previously-synced records exist - "+
 				"skipping two-way reverse create pass for safety (possible source query failure)",
 			len(previouslySyncedMap),
 		)
 	}
 
-	// Rule 1: collect dest-only, never-before-synced events.
+	// Rule 1a: build a content index of source events (Summary+StartTime).
+	// Used to detect "same event under a different UID" on source vs dest,
+	// which is the forward direction's existing dedupe strategy (see
+	// destDedupeMap in syncEventsToDestination). Without this check the
+	// reverse create pass happily uploaded dest events whose content
+	// already existed on source under a different UID, producing
+	// visible duplicates on source (e.g., iCloud). Fix for Issue #78.
+	sourceDedupeMap := make(map[string]bool)
+	for _, e := range sourceEventMap {
+		key := e.DedupeKey()
+		if key != "|" {
+			sourceDedupeMap[key] = true
+		}
+	}
+
+	// Rule 1b: collect dest-only, never-before-synced events, filtering
+	// out content-level duplicates. Events that match an existing source
+	// event by Summary+StartTime (but under a different UID) are returned
+	// separately in alreadyOnSourceByContent so the caller can record
+	// them in currentUIDs — otherwise the next sync cycle would retry
+	// the upload and produce the same warning indefinitely.
 	candidates := make([]Event, 0)
+	contentDupes := make([]Event, 0)
 	for _, event := range destEvents {
 		if event.UID == "" {
 			continue
@@ -163,13 +184,24 @@ func planReverseCreate(
 		if _, wasPrevSynced := previouslySyncedMap[event.UID]; wasPrevSynced {
 			continue
 		}
+		// Content dedupe: same Summary+StartTime already exists on
+		// source under a different UID. Don't upload (would create a
+		// duplicate on source), but record separately so the caller can
+		// mark the dest UID as "processed" for synced_events tracking.
+		key := event.DedupeKey()
+		if key != "|" && sourceDedupeMap[key] {
+			contentDupes = append(contentDupes, event)
+			continue
+		}
 		candidates = append(candidates, event)
 	}
 
-	// Rule 3: hard cap. Applied unconditionally — the cap is a blast-radius
-	// protection, independent of prior sync history.
+	// Rule 3: hard cap. Applied to the actual upload candidates only —
+	// content dupes are not counted against the cap because they won't
+	// result in any PUTs. Blast-radius protection, independent of prior
+	// sync history.
 	if maxCreates > 0 && len(candidates) > maxCreates {
-		return nil, fmt.Sprintf(
+		return nil, contentDupes, fmt.Sprintf(
 			"two-way reverse create pass would upload %d new events to source "+
 				"(cap=%d) - skipping pass for safety. Lower sync_days_past, "+
 				"raise the cap in code, or let prior cycles populate sync state first.",
@@ -177,7 +209,7 @@ func planReverseCreate(
 		)
 	}
 
-	return candidates, ""
+	return candidates, contentDupes, ""
 }
 
 // isWithinSyncSafetyThreshold returns true if the given
@@ -1187,8 +1219,12 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil {
 		// Case 1: reverse create pass, delegated to planReverseCreate
 		// so the ownership/empty-source/cap safety rules are all
-		// enforced in one testable place.
-		toUpload, planWarning := planReverseCreate(
+		// enforced in one testable place. The helper also filters out
+		// dest events whose Summary+StartTime already matches a source
+		// event under a different UID (content dedupe, #78), returning
+		// those separately in contentDupes so we can record the dest
+		// UID in currentUIDs and prevent the next cycle from retrying.
+		toUpload, contentDupes, planWarning := planReverseCreate(
 			destEvents,
 			sourceEventMap,
 			previouslySyncedMap,
@@ -1197,6 +1233,20 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		if planWarning != "" {
 			log.Printf("WARNING: %s", planWarning)
 			result.Warnings = append(result.Warnings, planWarning)
+		}
+
+		// Record content-dedupe skips in currentUIDs. The dest UID is
+		// not the same as the source UID for the matching event, but
+		// recording it here ensures the next cycle's
+		// previouslySyncedMap has an entry and the ownership filter
+		// in planReverseCreate skips this dest event instead of
+		// proposing another upload. This stops the infinite-retry
+		// loop for content duplicates. (#78)
+		for i := range contentDupes {
+			currentUIDs[contentDupes[i].UID] = true
+		}
+		if len(contentDupes) > 0 {
+			log.Printf("Two-way sync: %d destination events already exist on source by content (Summary+StartTime) under different UIDs - recorded as synced to prevent retry", len(contentDupes))
 		}
 
 		log.Printf("Two-way sync enabled, uploading %d new destination events to source", len(toUpload))
