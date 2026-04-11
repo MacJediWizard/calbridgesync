@@ -291,16 +291,61 @@ func TestValidateWebhookURL(t *testing.T) {
 		url     string
 		wantErr bool
 	}{
+		// Happy path
 		{"valid HTTPS URL", "https://hooks.slack.com/services/xxx", false},
+		{"valid HTTPS URL with path", "https://hooks.example.com/endpoint/12345", false},
+		{"valid HTTPS URL with public IPv4", "https://8.8.8.8/webhook", false},
+
+		// Scheme
 		{"HTTP not allowed", "http://example.com/webhook", true},
+		{"ftp scheme not allowed", "ftp://example.com/webhook", true},
+
+		// Hostname-based blocks (existing cases, still must pass)
 		{"localhost not allowed", "https://localhost/webhook", true},
+		{"localhost uppercase not allowed", "https://LOCALHOST/webhook", true},
+		{".local domain not allowed", "https://server.local/webhook", true},
+		{".internal domain not allowed", "https://api.internal/webhook", true},
+
+		// Loopback — regression for #115: the old check only blocked
+		// the exact literal "127.0.0.1", not the rest of 127.0.0.0/8.
 		{"127.0.0.1 not allowed", "https://127.0.0.1/webhook", true},
+		{"127.0.0.2 not allowed (regression)", "https://127.0.0.2/webhook", true},
+		{"127.1.2.3 not allowed (regression)", "https://127.1.2.3/webhook", true},
+		{"IPv6 loopback ::1 not allowed", "https://[::1]/webhook", true},
+
+		// RFC 1918 private ranges — existing coverage
 		{"192.168.x.x not allowed", "https://192.168.0.1/webhook", true},
 		{"10.x.x.x not allowed", "https://10.0.0.1/webhook", true},
 		{"172.16.x.x not allowed", "https://172.16.0.1/webhook", true},
-		{".local domain not allowed", "https://server.local/webhook", true},
-		{".internal domain not allowed", "https://api.internal/webhook", true},
+		{"172.31.x.x not allowed", "https://172.31.255.254/webhook", true},
+		// 172.32.x.x is NOT RFC 1918; should be allowed (old prefix-
+		// based check was correct to exclude it, new check uses
+		// net.IP.IsPrivate which has the RFC 1918 range exactly).
+		{"172.32.x.x is NOT private (public)", "https://172.32.0.1/webhook", false},
+
+		// Link-local / cloud metadata — NEW in #115. The 169.254.x.x
+		// block includes AWS/GCP/Azure IMDS endpoints at
+		// 169.254.169.254 which were not blocked by the old prefix
+		// check at all.
+		{"AWS IMDS 169.254.169.254 not allowed (regression)", "https://169.254.169.254/latest/meta-data/", true},
+		{"link-local 169.254.x.x not allowed", "https://169.254.1.2/webhook", true},
+
+		// Unspecified address — NEW in #115. On many systems
+		// 0.0.0.0 routes to loopback.
+		{"0.0.0.0 not allowed (regression)", "https://0.0.0.0/webhook", true},
+
+		// Carrier-grade NAT (100.64.0.0/10) — Tailscale and some
+		// ISPs. Not caught by net.IP.IsPrivate(), explicit check.
+		{"100.64.x.x carrier NAT not allowed", "https://100.64.0.1/webhook", true},
+		{"100.127.255.254 carrier NAT not allowed", "https://100.127.255.254/webhook", true},
+
+		// IPv6 private / link-local
+		{"IPv6 unique-local fc00:: not allowed", "https://[fc00::1]/webhook", true},
+		{"IPv6 link-local fe80:: not allowed", "https://[fe80::1]/webhook", true},
+
+		// Malformed URLs
 		{"invalid URL", "not-a-url", true},
+		{"URL with no host", "https:///path", true},
 	}
 
 	for _, tt := range tests {

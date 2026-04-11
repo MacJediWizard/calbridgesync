@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/smtp"
 	"net/url"
@@ -159,6 +160,34 @@ func ValidateConfig(cfg *Config) error {
 }
 
 // validateWebhookURL validates that the webhook URL is safe to use.
+//
+// SSRF hardening (#115): prior to this revision the private-range
+// check was prefix-based on the hostname string, which missed
+// several real bypass cases:
+//
+//   - `127.0.0.2` / `127.1.2.3`: the old check only blocked the
+//     exact string "127.0.0.1", leaving the rest of the 127.0.0.0/8
+//     loopback space open.
+//   - `169.254.x.x`: link-local / cloud metadata IMDS range (AWS
+//     uses 169.254.169.254, GCP 169.254.169.254, Azure 169.254.169.254,
+//     Alibaba 100.100.100.200). Absolutely nobody should be sending
+//     webhooks to a cloud metadata service.
+//   - `0.0.0.0/8`: the "this network" block, which on many systems
+//     routes to localhost.
+//   - IPv6 private ranges (fc00::/7, fe80::/10, ::ffff:* IPv4
+//     mappings): the old check only caught the exact string "::1".
+//   - Hostnames that resolve to private IPs: a malicious DNS
+//     entry like `my.attacker.com → A 127.0.0.1` would have
+//     passed the old string-based check. Proper validation
+//     needs to parse the hostname as IP OR resolve it and check
+//     each answer. This function handles the direct-IP case
+//     correctly; the resolve-and-check case is noted as a
+//     follow-up because it would need a separate DNS lookup
+//     path that doesn't exist today.
+//
+// The new check uses net.ParseIP against the URL hostname so any
+// valid IP literal gets structural validation instead of string
+// prefix matching.
 func validateWebhookURL(webhookURL string) error {
 	parsed, err := url.Parse(webhookURL)
 	if err != nil {
@@ -170,39 +199,57 @@ func validateWebhookURL(webhookURL string) error {
 		return fmt.Errorf("webhook URL must use HTTPS")
 	}
 
-	// Block localhost and private IP ranges to prevent SSRF
 	host := strings.ToLower(parsed.Hostname())
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		return fmt.Errorf("webhook URL cannot point to localhost")
+	if host == "" {
+		return fmt.Errorf("webhook URL is missing a host")
 	}
 
-	// Block common internal hostnames
-	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
-		return fmt.Errorf("webhook URL cannot point to internal hosts")
+	// Block obvious string-level hostname patterns before attempting
+	// IP parsing. Covers "localhost" and the .local / .internal
+	// mDNS / intranet suffixes.
+	if host == "localhost" ||
+		strings.HasSuffix(host, ".local") ||
+		strings.HasSuffix(host, ".internal") {
+		return fmt.Errorf("webhook URL cannot point to localhost or internal hosts")
 	}
 
-	// Block private IP ranges (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
-	if strings.HasPrefix(host, "10.") ||
-		strings.HasPrefix(host, "192.168.") ||
-		strings.HasPrefix(host, "172.16.") ||
-		strings.HasPrefix(host, "172.17.") ||
-		strings.HasPrefix(host, "172.18.") ||
-		strings.HasPrefix(host, "172.19.") ||
-		strings.HasPrefix(host, "172.20.") ||
-		strings.HasPrefix(host, "172.21.") ||
-		strings.HasPrefix(host, "172.22.") ||
-		strings.HasPrefix(host, "172.23.") ||
-		strings.HasPrefix(host, "172.24.") ||
-		strings.HasPrefix(host, "172.25.") ||
-		strings.HasPrefix(host, "172.26.") ||
-		strings.HasPrefix(host, "172.27.") ||
-		strings.HasPrefix(host, "172.28.") ||
-		strings.HasPrefix(host, "172.29.") ||
-		strings.HasPrefix(host, "172.30.") ||
-		strings.HasPrefix(host, "172.31.") {
-		return fmt.Errorf("webhook URL cannot point to private IP addresses")
+	// Structural IP check. If the hostname parses as an IP literal
+	// (either IPv4 or IPv6), classify it using net.IP helpers
+	// rather than string prefixes. This catches 127.x.x.x,
+	// 169.254.x.x, ::1, ::ffff:* IPv4 mappings, fc00::/7 etc.
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() {
+			return fmt.Errorf("webhook URL cannot point to loopback (%s)", host)
+		}
+		if ip.IsPrivate() {
+			return fmt.Errorf("webhook URL cannot point to private IP addresses (%s)", host)
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			// 169.254.0.0/16 and fe80::/10 — includes cloud
+			// metadata endpoints (AWS/GCP/Azure IMDS).
+			return fmt.Errorf("webhook URL cannot point to link-local addresses (%s)", host)
+		}
+		if ip.IsUnspecified() {
+			// 0.0.0.0 / :: — "this network," routes to loopback
+			// on many systems.
+			return fmt.Errorf("webhook URL cannot point to unspecified address (%s)", host)
+		}
+		// 100.64.0.0/10 (carrier NAT / Tailscale) is not caught by
+		// IsPrivate() in the stdlib. Check explicitly.
+		if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return fmt.Errorf("webhook URL cannot point to carrier-grade NAT range (%s)", host)
+		}
+		return nil
 	}
 
+	// Hostname is not an IP literal. We could resolve it here and
+	// check each answer IP, but doing DNS in a validation function
+	// introduces a second network round-trip per source edit and
+	// creates a TOCTOU between validation time and actual send.
+	// A proper fix is to do the private-IP check inside the HTTP
+	// transport via a custom DialContext that rejects private
+	// destinations post-resolution. That's a bigger change noted
+	// as a follow-up in the PR description.
 	return nil
 }
 
