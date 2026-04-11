@@ -337,10 +337,18 @@ func (h *Handlers) APIDashboardStats(c *gin.Context) {
 		}
 	}
 
-	// Count syncs today
+	// Count syncs today. GetSyncLogs errors are logged but not
+	// surfaced — the dashboard still renders with whatever stats we
+	// could compute. Previously this used `logs, _ :=` which hid the
+	// error entirely; operators couldn't tell the difference between
+	// "no syncs today" and "DB query failed." (#93)
 	today := time.Now().Truncate(24 * time.Hour)
 	for _, s := range sources {
-		logs, _ := h.db.GetSyncLogs(s.ID, 100)
+		logs, err := h.db.GetSyncLogs(s.ID, 100)
+		if err != nil {
+			log.Printf("APIDashboardStats: failed to load sync logs for source %s: %v", s.ID, err)
+			continue
+		}
 		for _, l := range logs {
 			if l.CreatedAt.After(today) {
 				stats.SyncsToday++
@@ -374,10 +382,18 @@ func (h *Handlers) APISyncHistory(c *gin.Context) {
 	}
 
 	// Collect all logs for all sources
-	// Use 2000 to support up to ~10 days at 192 syncs/day per source
+	// Use 2000 to support up to ~10 days at 192 syncs/day per source.
+	// GetSyncLogs errors are logged but not surfaced so a partial
+	// DB failure degrades the chart gracefully — previously this
+	// used `logs, _ :=` which silently treated a DB failure as
+	// "zero logs." (#93)
 	var allLogs []*db.SyncLog
 	for _, s := range sources {
-		logs, _ := h.db.GetSyncLogs(s.ID, 2000)
+		logs, err := h.db.GetSyncLogs(s.ID, 2000)
+		if err != nil {
+			log.Printf("APISyncHistory: failed to load sync logs for source %s: %v", s.ID, err)
+			continue
+		}
 		allLogs = append(allLogs, logs...)
 	}
 

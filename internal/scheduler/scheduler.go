@@ -64,6 +64,20 @@ type Job struct {
 	nextSyncAt time.Time
 }
 
+// consecutiveSkipWarnThreshold is the number of consecutive
+// executeSync skips on the same source that triggers a WARNING log
+// line. Each skip happens because the previous sync for that source
+// is still holding its per-source mutex — either legitimately slow
+// or hung. The liveness watchdog (#43) catches fully frozen
+// goroutines on a longer horizon; this counter catches the
+// slow-but-not-frozen case earlier so operators have a chance to
+// intervene (widen sync_interval, check CalDAV server health)
+// before the watchdog alert fires. Tunable via future env var if
+// needed; 3 is an empirical default — one skip is noise, three in
+// a row means the sync interval is too tight or something is
+// genuinely stuck. (#93)
+const consecutiveSkipWarnThreshold = 3
+
 // Scheduler manages background sync jobs.
 type Scheduler struct {
 	db         *db.DB
@@ -85,6 +99,15 @@ type Scheduler struct {
 	// on the hot path of job lookups.
 	heartbeatsMu sync.RWMutex
 	heartbeats   map[string]time.Time
+
+	// skipCounts tracks consecutive executeSync skips per source so
+	// the scheduler can escalate from a normal-volume log line to a
+	// WARNING after consecutiveSkipWarnThreshold in a row. Reset to
+	// zero every time a source successfully acquires its sync lock.
+	// Separate mutex from mu to keep the hot path of job lookups
+	// uncontended. (#93)
+	skipCountsMu sync.Mutex
+	skipCounts   map[string]int
 }
 
 // New creates a new scheduler.
@@ -99,7 +122,27 @@ func New(database *db.DB, syncEngine *caldav.SyncEngine, notifier *notify.Notifi
 		ctx:        ctx,
 		cancel:     cancel,
 		heartbeats: make(map[string]time.Time),
+		skipCounts: make(map[string]int),
 	}
+}
+
+// incrementSkipCount bumps the consecutive skip count for a source
+// and returns the new value. Safe for concurrent callers. (#93)
+func (s *Scheduler) incrementSkipCount(sourceID string) int {
+	s.skipCountsMu.Lock()
+	defer s.skipCountsMu.Unlock()
+	s.skipCounts[sourceID]++
+	return s.skipCounts[sourceID]
+}
+
+// resetSkipCount zeros the consecutive skip count for a source.
+// Called when the source successfully acquires its sync lock so a
+// single-cycle slowdown doesn't leave a stale counter behind. Safe
+// for concurrent callers. (#93)
+func (s *Scheduler) resetSkipCount(sourceID string) {
+	s.skipCountsMu.Lock()
+	defer s.skipCountsMu.Unlock()
+	delete(s.skipCounts, sourceID)
 }
 
 // Start loads all enabled sources and starts their sync jobs.
@@ -577,11 +620,24 @@ func (s *Scheduler) executeSync(sourceID string) {
 	// Get per-source lock to prevent concurrent syncs
 	lock := s.getSyncLock(sourceID)
 
-	// Try to acquire lock without blocking - skip if another sync is in progress
+	// Try to acquire lock without blocking - skip if another sync is in
+	// progress. Repeated skips on the same source indicate that a sync
+	// cycle is taking longer than the scheduler interval — either a
+	// hang the liveness watchdog will catch, or a legitimately slow
+	// sync (large calendar, network latency, CalDAV server throttling)
+	// that the operator should know about. Track per-source consecutive
+	// skip counts and escalate to a WARNING at the threshold so
+	// operators have a visible signal before the watchdog fires. (#93)
 	if !lock.TryLock() {
-		log.Printf("Skipping sync for source %s - another sync is already in progress", sourceID)
+		skips := s.incrementSkipCount(sourceID)
+		if skips >= consecutiveSkipWarnThreshold {
+			log.Printf("WARNING: sync for source %s has been skipped %d consecutive times — previous cycle is still running. Check for hung CalDAV calls or widen sync_interval.", sourceID, skips)
+		} else {
+			log.Printf("Skipping sync for source %s - another sync is already in progress (consecutive skips: %d)", sourceID, skips)
+		}
 		return
 	}
+	s.resetSkipCount(sourceID)
 	defer lock.Unlock()
 
 	// Get the source

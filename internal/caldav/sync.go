@@ -995,7 +995,17 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 								SourceETag:   item.ETag,
 							}
 							if err := se.db.UpsertSyncedEvent(syncedEvent); err != nil {
-								log.Printf("Failed to upsert synced event record for %s: %v", event.UID, err)
+								// Previously this only logged. The next
+								// sync's previouslySyncedMap won't know
+								// this UID exists, so the forward pass
+								// may treat it as a new event and re-PUT
+								// it — wasted traffic, and potentially a
+								// duplicate if the parsed UID drifts.
+								// Surface as a Warning so operators see
+								// the DB write failure in SyncResult. (#93)
+								msg := fmt.Sprintf("Failed to upsert synced event record for %s: %v", event.UID, err)
+								log.Printf("%s", msg)
+								result.Warnings = append(result.Warnings, msg)
 							}
 						}
 					}
@@ -1025,7 +1035,17 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 					// PutEvent convention.
 					if uid := extractUIDFromEventPath(destEventPath); uid != "" {
 						if err := se.db.DeleteSyncedEvent(source.ID, calendar.Path, uid); err != nil {
-							log.Printf("Failed to delete synced event record for %s: %v", uid, err)
+							// Same rationale as the UpsertSyncedEvent
+							// warning above: a failed DB cleanup means
+							// the next cycle's previouslySyncedMap
+							// still contains this UID even though it
+							// no longer exists on destination — the
+							// two-way deletion pass may then try to
+							// delete from source. Surface the failure
+							// so operators see it. (#93)
+							msg := fmt.Sprintf("Failed to delete synced event record for %s: %v", uid, err)
+							log.Printf("%s", msg)
+							result.Warnings = append(result.Warnings, msg)
 						}
 					}
 				}
@@ -1204,7 +1224,23 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	updateStatus("fetching destination events")
 	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
 	if err != nil {
-		log.Printf("Failed to get destination events (path: %s): %v", destCalendarPath, err)
+		// Previously this failure only logged and then proceeded with
+		// an empty destEvents slice. That silently masked a real
+		// destination failure — the rest of the sync would compute
+		// deltas against "zero destination events" and either mass-
+		// delete tracked UIDs (caught by the ratio guards from #80/#82)
+		// or mass-create them as if the destination was empty.
+		//
+		// Append to Warnings so operators actually see the failure
+		// surfaced in the sync result. Not escalated to result.Errors
+		// because one-way source_wins semantics can tolerate an
+		// empty-destination view — the ratio guards still protect
+		// against cascading deletions, and escalating to Errors would
+		// flip every transient destination fetch failure into a hard
+		// sync failure. Operator design call to tighten this further. (#93)
+		msg := fmt.Sprintf("Failed to get destination events (path: %s): %v - proceeding with empty destination view, ratio guards will protect against cascades", destCalendarPath, err)
+		log.Printf("%s", msg)
+		result.Warnings = append(result.Warnings, msg)
 		destEvents = []Event{}
 	}
 	log.Printf("Fetched %d events from destination calendar", len(destEvents))
