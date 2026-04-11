@@ -33,6 +33,30 @@ func isForbiddenError(err error) bool {
 	return strings.Contains(errStr, "403") || strings.Contains(errStr, "Forbidden")
 }
 
+// isSourceAlreadyExistsError reports whether a PutEvent error against the
+// source CalDAV server indicates that the event already exists there — either
+// in the calendar being synced (412 Precondition Failed on the If-None-Match
+// header) or anywhere else on the same account (409 Conflict on a UID
+// collision). iCloud in particular returns 409 Conflict when you try to PUT
+// an event whose UID already exists under a DIFFERENT calendar on the same
+// account — CalDAV UIDs are account-global on iCloud, so an event that lives
+// on iCloud's "Home" calendar can't be created again on iCloud's "Work"
+// calendar. (#74)
+//
+// This is only used by the two-way reverse create pass — the main forward
+// direction uses isAlreadyExistsError, which stays 412-only so existing
+// update-conflict logic in the forward path is unchanged.
+func isSourceAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "412") ||
+		strings.Contains(errStr, "Precondition Failed") ||
+		strings.Contains(errStr, "409") ||
+		strings.Contains(errStr, "Conflict")
+}
+
 // shouldSkipTwoWayDeletion returns true if the two-way deletion pass
 // should be skipped entirely for this sync cycle. This is the guard
 // introduced in commit b772c56 (and extended by PR #22) against mass
@@ -80,6 +104,82 @@ func shouldSkipTwoWayCreate(direction db.SyncDirection, sourceEventCount, previo
 		previouslySyncedCount > 0
 }
 
+// planReverseCreate determines which destination events should be uploaded
+// to source as new creates during a two-way sync. It is the mirror of
+// planOrphanDeletion for the reverse direction.
+//
+// Three safety rules are enforced:
+//
+//  1. Ownership: only events that are NOT in sourceEventMap AND NOT in
+//     previouslySyncedMap are candidates. Events present on source are
+//     handled by the main forward loop (or the dest_wins reverse update
+//     branch). Events in previouslySyncedMap that are missing from source
+//     were deleted from source and are handled by the two-way deletion pass.
+//     The remaining category — dest-only events with no sync history — are
+//     genuine user-created destination events that two-way sync must push
+//     back to source.
+//
+//  2. Empty-source guard: if the source returned zero events but we have
+//     prior sync records, refuse to upload anything. Same rationale as
+//     shouldSkipTwoWayDeletion — an empty source query is almost certainly
+//     a source failure, not a user action. Without this guard a transient
+//     iCloud hiccup would trigger a mass-upload of the entire destination
+//     calendar back to iCloud on the very next cycle.
+//
+//  3. Hard cap: if the candidate list exceeds maxCreates, refuse the
+//     entire pass with a warning. Normal two-way operation uploads a
+//     handful of events per cycle; a batch of 100+ is almost always a
+//     first-sync scenario or a misconfiguration that the operator should
+//     explicitly notice. The cap is per-calendar — each selected calendar
+//     gets its own budget.
+//
+// Returns the events to upload and a non-empty warning string if any safety
+// rule was triggered. When a warning is returned, toUpload is nil — the
+// caller must not perform any uploads in that case. (#74)
+func planReverseCreate(
+	destEvents []Event,
+	sourceEventMap map[string]Event,
+	previouslySyncedMap map[string]*db.SyncedEvent,
+	maxCreates int,
+) (toUpload []Event, warning string) {
+	// Rule 2: empty source with prior records → refuse to upload anything.
+	if len(sourceEventMap) == 0 && len(previouslySyncedMap) > 0 {
+		return nil, fmt.Sprintf(
+			"source returned 0 events but %d previously-synced records exist - "+
+				"skipping two-way reverse create pass for safety (possible source query failure)",
+			len(previouslySyncedMap),
+		)
+	}
+
+	// Rule 1: collect dest-only, never-before-synced events.
+	candidates := make([]Event, 0)
+	for _, event := range destEvents {
+		if event.UID == "" {
+			continue
+		}
+		if _, existsOnSource := sourceEventMap[event.UID]; existsOnSource {
+			continue
+		}
+		if _, wasPrevSynced := previouslySyncedMap[event.UID]; wasPrevSynced {
+			continue
+		}
+		candidates = append(candidates, event)
+	}
+
+	// Rule 3: hard cap. Applied unconditionally — the cap is a blast-radius
+	// protection, independent of prior sync history.
+	if maxCreates > 0 && len(candidates) > maxCreates {
+		return nil, fmt.Sprintf(
+			"two-way reverse create pass would upload %d new events to source "+
+				"(cap=%d) - skipping pass for safety. Lower sync_days_past, "+
+				"raise the cap in code, or let prior cycles populate sync state first.",
+			len(candidates), maxCreates,
+		)
+	}
+
+	return candidates, ""
+}
+
 // isWithinSyncSafetyThreshold returns true if the given
 // "last synced at" timestamp is within the safety window — meaning
 // the event was synced recently enough that we should NOT delete it
@@ -118,6 +218,18 @@ func getSyncDirectionForCalendar(source *db.Source, calendarPath string) db.Sync
 // Exceeding this threshold usually indicates an auth failure, broken source URL,
 // or filter misconfiguration rather than a legitimate bulk cleanup.
 const defaultOrphanDeleteRatioThreshold = 0.5
+
+// defaultReverseCreateHardCap is the maximum number of new destination-only
+// events the two-way reverse create pass will upload to source in a single
+// cycle. Mirror of defaultOrphanDeleteRatioThreshold for the reverse
+// direction — uploading hundreds of events to iCloud in one cycle triggers
+// rate limiting, blocks subsequent syncs, and is almost always the sign of a
+// first-sync scenario that the operator should be explicitly aware of
+// (rather than silently push). When exceeded, planReverseCreate returns a
+// warning and an empty list — the caller must not perform any uploads.
+// 100 is low enough to catch runaway first-syncs but high enough to let
+// normal day-to-day sync (a few new events per cycle) through. (#74)
+const defaultReverseCreateHardCap = 100
 
 // extractUIDFromEventPath returns the event UID embedded in a CalDAV object
 // path. By PutEvent convention (client.go:602), events are written as
@@ -1042,131 +1154,123 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 
 	// Two-way sync: sync destination events back to source.
 	//
-	// This pass handles two cases:
+	// Three cases, in order:
 	//
-	//  1. CREATE: a destination event that does NOT exist on source and
-	//     is NOT in previouslySyncedMap — a user-created SOGo event that
-	//     needs to be uploaded to iCloud. Prior to Issue #72 this case
-	//     was explicitly skipped with the comment "may be from another
-	//     source or was already deleted", which meant calbridgesync
-	//     never propagated new SOGo events up to iCloud in two-way
-	//     mode. The ownership check against previouslySyncedMap is
-	//     what distinguishes "user just created this on dest" (NOT in
-	//     prev-synced, upload it) from "source deleted this and the
-	//     deletion pass already handled it" (IS in prev-synced, skip).
+	//  1. CREATE new dest-only events on source. Delegated to
+	//     planReverseCreate, which applies all three safety rules
+	//     (ownership, empty-source guard, hard cap) before returning
+	//     the candidate list. See planReverseCreate's doc comment for
+	//     the full rationale. (#72 + #74)
 	//
-	//  2. UPDATE with dest_wins: a destination event that exists on
+	//  2. Silently skip dest events that already exist on source
+	//     (either in sourceEventMap or in previouslySyncedMap).
+	//     planReverseCreate's ownership filter handles this — they
+	//     fall through to case 3 without being candidates.
+	//
+	//  3. UPDATE with dest_wins: a destination event that exists on
 	//     both sides with a different ETag, when the user has
-	//     explicitly opted into dest_wins conflict resolution. Unchanged
-	//     from pre-#72 behavior.
-	//
-	// The create case is guarded by shouldSkipTwoWayCreate: if the
-	// source query returned empty while we have prior sync records,
-	// we treat that as a transient source failure and skip the create
-	// pass to avoid mass-uploading the entire destination calendar
-	// back to the source. Symmetric with the existing
-	// shouldSkipTwoWayDeletion guard.
+	//     explicitly opted into dest_wins conflict resolution.
+	//     Unchanged from pre-#72 behavior.
 	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil {
-		skipTwoWayCreate := shouldSkipTwoWayCreate(syncDirection, len(sourceEventMap), len(previouslySyncedMap))
-		if skipTwoWayCreate {
-			log.Printf("WARNING: Source returned 0 events but we have %d previously synced events - skipping two-way create pass for safety", len(previouslySyncedMap))
+		// Case 1: reverse create pass, delegated to planReverseCreate
+		// so the ownership/empty-source/cap safety rules are all
+		// enforced in one testable place.
+		toUpload, planWarning := planReverseCreate(
+			destEvents,
+			sourceEventMap,
+			previouslySyncedMap,
+			defaultReverseCreateHardCap,
+		)
+		if planWarning != "" {
+			log.Printf("WARNING: %s", planWarning)
+			result.Warnings = append(result.Warnings, planWarning)
 		}
 
-		log.Printf("Two-way sync enabled, syncing destination events to source")
+		log.Printf("Two-way sync enabled, uploading %d new destination events to source", len(toUpload))
 		skippedAlreadyExists := 0
 		skippedForbidden := 0
-		for _, destEvent := range destEvents {
-			if destEvent.UID == "" {
-				continue
+		for i := range toUpload {
+			destEvent := toUpload[i]
+			// Clear the Path so PutEvent generates a source-side
+			// path for the upload (source and dest namespaces are
+			// different — reusing the dest path would land at the
+			// wrong URL on source). PutEvent synthesizes a path
+			// from the calendar path + UID.
+			destEvent.Path = ""
+			if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
+				switch {
+				case errors.Is(err, ErrEventSkipped):
+					result.Skipped++
+				case isSourceAlreadyExistsError(err):
+					// Event already exists on source — either in this
+					// calendar (412) or in a different calendar on the
+					// same account (409, common on iCloud). Count as
+					// a silent skip AND record the UID in currentUIDs
+					// so the synced_events upsert at the end of this
+					// pass stops us from retrying the upload on every
+					// subsequent cycle (which would otherwise produce
+					// the same 409/412 warning indefinitely). (#74)
+					skippedAlreadyExists++
+					currentUIDs[destEvent.UID] = true
+				case isForbiddenError(err):
+					// Source calendar is read-only (iCloud subscribed
+					// calendars, shared read-only, etc). Count as a
+					// silent skip.
+					skippedForbidden++
+				default:
+					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to create event on source: %v", err))
+				}
+			} else {
+				result.Created++
+				// Track the newly-uploaded event so the sync_events
+				// upsert at the end of this calendar's pass records
+				// it. Without this, the next cycle would see the
+				// same event as "not in previouslySyncedMap" and
+				// try to re-upload it.
+				currentUIDs[destEvent.UID] = true
 			}
+			updateProgress()
+		}
 
-			sourceEvent, exists := sourceEventMap[destEvent.UID]
-
-			if !exists {
-				// Destination event has no counterpart on source. Two
-				// possibilities:
-				//
-				//   (a) It's in previouslySyncedMap — it was synced before
-				//       and is now gone from source. This means the source
-				//       deleted it, and the two-way deletion pass above
-				//       already handled propagating that deletion to the
-				//       destination (or decided not to for safety
-				//       reasons). Either way, leave it alone here.
-				//
-				//   (b) It's NOT in previouslySyncedMap — it's a brand-new
-				//       destination-side event, created directly on
-				//       SOGo by the user. In two-way mode this MUST be
-				//       uploaded to source, which is Issue #72's core
-				//       fix. (If it was in prev-synced but somehow not
-				//       in source, case (a) already covered it.)
-				//
-				// The shouldSkipTwoWayCreate guard above is a
-				// hard-stop: if source returned 0 events while we
-				// have prior sync state, we don't create anything to
-				// avoid mass-upload on a broken source query.
-				if _, wasPrevSynced := previouslySyncedMap[destEvent.UID]; wasPrevSynced {
+		// Case 3: dest_wins update pass. Unchanged from pre-#72 behavior.
+		// Walks destEvents (not just candidates) because the update
+		// branch fires on UID match with ETag mismatch — that's a
+		// different filter than "dest-only" and can't reuse the
+		// candidate list.
+		if source.ConflictStrategy == db.ConflictDestWins {
+			for _, destEvent := range destEvents {
+				if destEvent.UID == "" {
 					continue
 				}
-				if skipTwoWayCreate {
+				sourceEvent, exists := sourceEventMap[destEvent.UID]
+				if !exists {
+					// Case 1 already handled this.
 					continue
 				}
-				// Clear the Path so PutEvent generates a source-side
-				// path for the upload (source and dest namespaces are
-				// different — reusing the dest path would land at the
-				// wrong URL on source). PutEvent synthesizes a path
-				// from the calendar path + UID.
-				destEvent.Path = ""
+				if destEvent.ETag == sourceEvent.ETag {
+					continue
+				}
+				destEvent.Path = sourceEvent.Path
 				if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
 					switch {
 					case errors.Is(err, ErrEventSkipped):
 						result.Skipped++
-					case isAlreadyExistsError(err):
-						// Race: event appeared on source between the
-						// source fetch and our write. Count as skip.
+					case isSourceAlreadyExistsError(err):
 						skippedAlreadyExists++
 					case isForbiddenError(err):
-						// Source calendar is read-only (iCloud
-						// subscribed calendars, shared read-only, etc).
 						skippedForbidden++
 					default:
-						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to create event on source: %v", err))
+						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on source: %v", err))
 					}
 				} else {
-					result.Created++
-					// Track the newly-uploaded event so the sync_events
-					// upsert at the end of this calendar's pass records
-					// it. Without this, the next cycle would see the
-					// same event again as "not in previouslySyncedMap"
-					// and try to re-upload it.
-					currentUIDs[destEvent.UID] = true
-				}
-				updateProgress()
-				continue
-			}
-
-			if destEvent.ETag != sourceEvent.ETag {
-				if source.ConflictStrategy == db.ConflictDestWins {
-					destEvent.Path = sourceEvent.Path
-					if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
-						switch {
-						case errors.Is(err, ErrEventSkipped):
-							result.Skipped++
-						case isAlreadyExistsError(err):
-							skippedAlreadyExists++
-						case isForbiddenError(err):
-							skippedForbidden++
-						default:
-							result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on source: %v", err))
-						}
-					} else {
-						result.Updated++
-					}
+					result.Updated++
 				}
 				updateProgress()
 			}
 		}
+
 		if skippedAlreadyExists > 0 {
-			log.Printf("Two-way sync: %d events already exist on source (skipped)", skippedAlreadyExists)
+			log.Printf("Two-way sync: %d events already exist on source (skipped, recorded as synced)", skippedAlreadyExists)
 		}
 		if skippedForbidden > 0 {
 			log.Printf("Two-way sync: %d events skipped (source calendar read-only)", skippedForbidden)
