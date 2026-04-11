@@ -353,6 +353,39 @@ func (c *Config) Validate(ctx context.Context) error {
 		return fmt.Errorf("%w: DEFAULT_DEST_URL: %w", ErrValidationFailed, err)
 	}
 
+	// ALLOWED_ORIGINS is required in production mode. See
+	// validateAllowedOriginsForProd for the full rationale.
+	if err := validateAllowedOriginsForProd(c.IsProduction(), os.Getenv("ALLOWED_ORIGINS")); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateAllowedOriginsForProd enforces that ALLOWED_ORIGINS is
+// set when running in production mode. Returns nil in development
+// mode or when the env var is non-empty. Returns a wrapped
+// ErrValidationFailed otherwise.
+//
+// Without this check, internal/web/middleware.go falls back to
+// localhost-only defaults — correct for dev, but silently blocks
+// every legitimate non-localhost origin in prod. The bug path the
+// audit flagged (#101) was: operator deploys to a public domain,
+// forgets ALLOWED_ORIGINS, CORS rejects every request, user sees
+// a blank dashboard, operator blames the app. Fail-fast at
+// startup instead.
+//
+// Extracted as a package-private helper so the rule can be
+// unit-tested without spinning up a full Config.Validate() call
+// chain (which also hits ValidateOIDCIssuer, a network call).
+// The caller in Validate() passes the pre-computed inputs.
+func validateAllowedOriginsForProd(isProd bool, allowedOriginsEnv string) error {
+	if !isProd {
+		return nil
+	}
+	if allowedOriginsEnv == "" {
+		return fmt.Errorf("%w: ALLOWED_ORIGINS must be set in production mode (comma-separated list of allowed origins, e.g. https://calbridgesync.example.com) - the localhost-only defaults silently block non-localhost CORS requests", ErrValidationFailed)
+	}
 	return nil
 }
 
