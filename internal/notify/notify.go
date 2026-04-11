@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/smtp"
 	"net/url"
@@ -105,12 +106,113 @@ type Notifier struct {
 	inFlightAlerts map[string]bool
 }
 
+// safeDialContext is a net.Dialer.DialContext replacement that
+// resolves the hostname and rejects connections to any IP
+// classified as loopback, private, link-local, unspecified, or
+// carrier-NAT. It is the dial-time half of SSRF defense: the
+// validation-time check in validateWebhookURL catches static
+// hostnames that parse as blocked IPs, and this dial-time check
+// catches DNS-rebinding attacks where the resolved IP changes
+// between validation and send. (#117)
+//
+// A hostname that resolves to multiple IPs is blocked if ANY
+// of them is in a denied range. Rejecting on the strictest
+// single answer is the defensive choice — an attacker who
+// returns [public-ip, private-ip] in the same DNS answer cannot
+// bypass the check by hoping Go's dialer picks the public one.
+//
+// After the classification check passes, we dial the resolved
+// IP directly (not the original hostname) so a second resolver
+// lookup between our check and the dial cannot return a
+// different answer — closing the last-mile TOCTOU window.
+func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPs resolved for %s", host)
+	}
+
+	for _, ip := range ips {
+		if blocked, reason := isBlockedIP(ip); blocked {
+			return nil, fmt.Errorf("blocked destination: %s resolves to %s (%s)", host, ip.String(), reason)
+		}
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	dialAddr := net.JoinHostPort(ips[0].String(), port)
+	return dialer.DialContext(ctx, network, dialAddr)
+}
+
+// isBlockedIP classifies an IP as safe or blocked using the same
+// rules as validateWebhookURL's literal-IP check. Returns a
+// human-readable reason for the block so errors pinpoint which
+// rule fired. (#117)
+//
+// Kept as a package-private helper so both the validation-time
+// (validateWebhookURL, indirectly via net.ParseIP check) and
+// dial-time (safeDialContext) paths enforce exactly the same
+// policy. Adding a new block rule here covers both call sites.
+func isBlockedIP(ip net.IP) (bool, string) {
+	if ip == nil {
+		return true, "unparseable IP"
+	}
+	if ip.IsLoopback() {
+		return true, "loopback"
+	}
+	if ip.IsPrivate() {
+		return true, "private"
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true, "link-local (includes cloud IMDS)"
+	}
+	if ip.IsUnspecified() {
+		return true, "unspecified"
+	}
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return true, "carrier-grade NAT (100.64.0.0/10)"
+	}
+	return false, ""
+}
+
+// webhookDialContext is the DialContext function used by the
+// webhook http.Client. Package-level variable so tests can swap
+// in a permissive version that allows 127.0.0.1 destinations for
+// httptest-backed test servers. Production code uses
+// safeDialContext which rejects private/loopback/link-local
+// destinations. Tests overwrite this in an init function in
+// notify_test.go using a default net.Dialer. (#117)
+var webhookDialContext = safeDialContext
+
 // New creates a new Notifier.
 func New(cfg *Config) *Notifier {
+	// Custom http.Transport with webhookDialContext so every
+	// outbound webhook connection goes through the DNS-rebinding
+	// defense. The validation-time check in validateWebhookURL
+	// catches static bad hostnames at save time; this catches
+	// dynamic ones that change between save and send. (#117)
+	transport := &http.Transport{
+		DialContext:         webhookDialContext,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConns:        10,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+
 	return &Notifier{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 		lastAlertTimes:        make(map[string]time.Time),
 		staleState:            make(map[string]bool),
