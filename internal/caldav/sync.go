@@ -222,14 +222,27 @@ const defaultOrphanDeleteRatioThreshold = 0.5
 // defaultReverseCreateHardCap is the maximum number of new destination-only
 // events the two-way reverse create pass will upload to source in a single
 // cycle. Mirror of defaultOrphanDeleteRatioThreshold for the reverse
-// direction — uploading hundreds of events to iCloud in one cycle triggers
-// rate limiting, blocks subsequent syncs, and is almost always the sign of a
-// first-sync scenario that the operator should be explicitly aware of
-// (rather than silently push). When exceeded, planReverseCreate returns a
-// warning and an empty list — the caller must not perform any uploads.
-// 100 is low enough to catch runaway first-syncs but high enough to let
-// normal day-to-day sync (a few new events per cycle) through. (#74)
-const defaultReverseCreateHardCap = 100
+// direction — serves as a blast-radius limit against truly runaway uploads
+// (a misconfigured source, a bug in the ownership filter, corrupted state,
+// etc.). When exceeded, planReverseCreate returns a warning and an empty
+// list — the caller must not perform any uploads in that cycle, and the
+// operator sees the warning in the sync log.
+//
+// The cap is per-calendar — each selected calendar gets its own budget.
+//
+// Initial value was 100 (#74), which turned out to be too aggressive for
+// legitimate first-sync scenarios. William's iCloud source had a calendar
+// with 748 real dest-only events that needed to flow to iCloud, and the
+// 100 cap blocked the entire pass every cycle. Raised to 5000 in #77 —
+// still catches clearly-insane mass upload scenarios (e.g., 50k events
+// from a runaway bug) but lets ordinary first-syncs and bulk imports
+// through in one cycle.
+//
+// If you're hitting this cap with legitimate data, either increase the
+// value here, lower sync_days_past on the source to shrink the window,
+// or break the work across multiple smaller source calendars. A future
+// PR will move this to a per-source setting in the DB. (#77)
+const defaultReverseCreateHardCap = 5000
 
 // extractUIDFromEventPath returns the event UID embedded in a CalDAV object
 // path. By PutEvent convention (client.go:602), events are written as
