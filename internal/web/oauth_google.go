@@ -24,6 +24,7 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -292,9 +293,15 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 
 	// Validate state BEFORE anything else — this is the CSRF check.
 	// GetOAuthState atomically reads and clears the state cookie.
+	// Compared constant-time because queryState is attacker-
+	// controllable (comes from the Google redirect query string)
+	// and savedState is secret (our server-generated random value
+	// stashed in the session cookie). Same rationale as the CSRF
+	// token comparison fix in #111. (#113)
 	queryState := c.Query("state")
 	savedState, err := h.session.GetOAuthState(c.Writer, c.Request)
-	if err != nil || savedState == "" || savedState != googleOAuthStatePrefix+queryState {
+	expectedState := googleOAuthStatePrefix + queryState
+	if err != nil || savedState == "" || subtle.ConstantTimeCompare([]byte(savedState), []byte(expectedState)) != 1 {
 		log.Printf("Google OAuth callback: state mismatch (saved=%q query=%q err=%v)", savedState, queryState, err)
 		c.Redirect(http.StatusFound, "/sources/add?error=invalid_state")
 		return
@@ -380,8 +387,10 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 
 	// Cross-check: the state in the pending source cookie must
 	// match the state we just validated. This is belt-and-braces on
-	// top of the state cookie CSRF check.
-	if pending.State != queryState {
+	// top of the state cookie CSRF check. Constant-time comparison
+	// for the same reason as above — queryState is attacker-
+	// controllable, pending.State is server-side secret. (#113)
+	if subtle.ConstantTimeCompare([]byte(pending.State), []byte(queryState)) != 1 {
 		log.Printf("Google OAuth callback: pending state mismatch (pending=%q query=%q)", pending.State, queryState)
 		c.Redirect(http.StatusFound, "/sources/add?error=state_mismatch")
 		return
