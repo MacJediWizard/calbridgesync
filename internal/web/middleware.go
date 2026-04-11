@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -159,49 +160,56 @@ func ValidateOrigin() gin.HandlerFunc {
 	}
 }
 
-// allowedOriginsCache caches the parsed origins to avoid repeated parsing and logging
-var allowedOriginsCache []string
-var allowedOriginsCacheInit bool
+// allowedOriginsCache caches the parsed origins so we don't re-parse
+// ALLOWED_ORIGINS on every request. Initialization is guarded by
+// allowedOriginsOnce so the parse happens exactly once even under
+// concurrent first-request load. Previously this was a bool +
+// unguarded slice pair, which was a data race: two goroutines hitting
+// the first request simultaneously could read and write the slice
+// with no synchronization, and under the Go memory model that's
+// undefined behavior — in the worst case a half-initialized slice
+// visible to one goroutine before the cache init flag flipped
+// could cause a request to fail-open or fail-closed depending on
+// scheduling. sync.Once gives us a lock-free fast path after the
+// initialization completes, so the per-request cost stays trivial. (#91)
+var (
+	allowedOriginsCache []string
+	allowedOriginsOnce  sync.Once
+)
 
 // getAllowedOrigins returns the list of allowed origins for CSRF validation.
 // SECURITY: In production, always set ALLOWED_ORIGINS environment variable.
 func getAllowedOrigins() []string {
-	// Return cached value if already initialized
-	if allowedOriginsCacheInit {
-		return allowedOriginsCache
-	}
+	allowedOriginsOnce.Do(func() {
+		origins := []string{}
 
-	origins := []string{}
-
-	// Add from environment variable if set
-	if env := os.Getenv("ALLOWED_ORIGINS"); env != "" {
-		for _, o := range strings.Split(env, ",") {
-			origin := strings.TrimSpace(o)
-			if isValidOrigin(origin) {
-				origins = append(origins, origin)
-			} else {
-				log.Printf("WARNING: Invalid origin in ALLOWED_ORIGINS ignored: %s", origin)
+		// Add from environment variable if set
+		if env := os.Getenv("ALLOWED_ORIGINS"); env != "" {
+			for _, o := range strings.Split(env, ",") {
+				origin := strings.TrimSpace(o)
+				if isValidOrigin(origin) {
+					origins = append(origins, origin)
+				} else {
+					log.Printf("WARNING: Invalid origin in ALLOWED_ORIGINS ignored: %s", origin)
+				}
 			}
 		}
-	}
 
-	// Fall back to localhost origins for development only
-	if len(origins) == 0 {
-		// Log warning - this should not happen in production
-		log.Printf("WARNING: ALLOWED_ORIGINS not set - using localhost defaults. Set ALLOWED_ORIGINS in production!")
-		origins = []string{
-			"http://localhost:8080",
-			"http://localhost:5173",
-			"http://127.0.0.1:8080",
-			"http://127.0.0.1:5173",
+		// Fall back to localhost origins for development only
+		if len(origins) == 0 {
+			// Log warning - this should not happen in production
+			log.Printf("WARNING: ALLOWED_ORIGINS not set - using localhost defaults. Set ALLOWED_ORIGINS in production!")
+			origins = []string{
+				"http://localhost:8080",
+				"http://localhost:5173",
+				"http://127.0.0.1:8080",
+				"http://127.0.0.1:5173",
+			}
 		}
-	}
 
-	// Cache the result
-	allowedOriginsCache = origins
-	allowedOriginsCacheInit = true
-
-	return origins
+		allowedOriginsCache = origins
+	})
+	return allowedOriginsCache
 }
 
 // isValidOrigin validates that an origin string is a proper URL format.
