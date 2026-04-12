@@ -411,6 +411,9 @@ func (n *Notifier) initialBackoff() time.Duration {
 // variants. The legacy functions had no callers and were just dead code.
 
 // WebhookPayload is the JSON payload sent to webhooks.
+// WebhookPayload is the generic JSON payload for webhook
+// notifications. Used when the webhook URL doesn't match a
+// known platform (Slack or Discord).
 type WebhookPayload struct {
 	AlertType  string `json:"alert_type"`
 	SourceID   string `json:"source_id"`
@@ -422,31 +425,149 @@ type WebhookPayload struct {
 	Text string `json:"text,omitempty"`
 }
 
-func (n *Notifier) sendWebhook(ctx context.Context, alert Alert) error {
-	// Build Slack-compatible message.
-	// Idempotent setup lives outside the retry: re-marshaling the same
-	// payload every attempt is wasted work.
-	emoji := ""
-	switch alert.Type {
+// webhookPlatform identifies which platform-specific formatter to
+// use for a webhook URL.
+type webhookPlatform string
+
+const (
+	platformGeneric webhookPlatform = "generic"
+	platformSlack   webhookPlatform = "slack"
+	platformDiscord webhookPlatform = "discord"
+)
+
+// detectWebhookPlatform infers the target platform from the webhook
+// URL so we can send rich-formatted payloads (Slack Block Kit,
+// Discord embeds) instead of a generic JSON blob.
+func detectWebhookPlatform(webhookURL string) webhookPlatform {
+	lower := strings.ToLower(webhookURL)
+	if strings.Contains(lower, "hooks.slack.com") {
+		return platformSlack
+	}
+	if strings.Contains(lower, "discord.com/api/webhooks") || strings.Contains(lower, "discordapp.com/api/webhooks") {
+		return platformDiscord
+	}
+	return platformGeneric
+}
+
+// alertEmoji returns the emoji string for an alert type.
+func alertEmoji(alertType AlertType) string {
+	switch alertType {
 	case AlertTypeStale:
-		emoji = ":warning:"
+		return ":warning:"
 	case AlertTypeRecovery:
-		emoji = ":white_check_mark:"
+		return ":white_check_mark:"
 	case AlertTypeError:
-		emoji = ":x:"
+		return ":x:"
+	default:
+		return ":bell:"
 	}
+}
 
-	payload := WebhookPayload{
-		AlertType:  string(alert.Type),
-		SourceID:   alert.SourceID,
-		SourceName: alert.SourceName,
-		Message:    alert.Message,
-		Details:    alert.Details,
-		Timestamp:  alert.Timestamp.Format(time.RFC3339),
-		Text:       fmt.Sprintf("%s *%s*\n%s", emoji, alert.Message, alert.Details),
+// alertColor returns a color integer for the alert type, used by
+// Discord embeds and Slack attachment sidebars.
+func alertColor(alertType AlertType) int {
+	switch alertType {
+	case AlertTypeError:
+		return 15158332 // red
+	case AlertTypeRecovery:
+		return 3066993 // green
+	case AlertTypeStale:
+		return 15105570 // orange
+	default:
+		return 3447003 // blue
 	}
+}
 
-	body, err := json.Marshal(payload)
+// formatSlackPayload builds a Slack Block Kit payload with a
+// colored sidebar, header, and structured fields.
+func formatSlackPayload(alert Alert) ([]byte, error) {
+	emoji := alertEmoji(alert.Type)
+	color := fmt.Sprintf("#%06x", alertColor(alert.Type))
+
+	payload := map[string]interface{}{
+		"text": fmt.Sprintf("%s %s", emoji, alert.Message),
+		"attachments": []map[string]interface{}{
+			{
+				"color": color,
+				"blocks": []map[string]interface{}{
+					{
+						"type": "section",
+						"fields": []map[string]interface{}{
+							{"type": "mrkdwn", "text": fmt.Sprintf("*Alert:* %s", alert.Type)},
+							{"type": "mrkdwn", "text": fmt.Sprintf("*Source:* %s", alert.SourceName)},
+						},
+					},
+					{
+						"type": "section",
+						"text": map[string]interface{}{
+							"type": "mrkdwn",
+							"text": alert.Details,
+						},
+					},
+					{
+						"type": "context",
+						"elements": []map[string]interface{}{
+							{"type": "mrkdwn", "text": fmt.Sprintf("CalBridgeSync | %s", alert.Timestamp.Format(time.RFC1123))},
+						},
+					},
+				},
+			},
+		},
+	}
+	return json.Marshal(payload)
+}
+
+// formatDiscordPayload builds a Discord embed payload with a
+// colored sidebar, title, fields, and timestamp.
+func formatDiscordPayload(alert Alert) ([]byte, error) {
+	payload := map[string]interface{}{
+		"content": fmt.Sprintf("%s %s", alertEmoji(alert.Type), alert.Message),
+		"embeds": []map[string]interface{}{
+			{
+				"title":       "CalBridgeSync Alert",
+				"description": alert.Details,
+				"color":       alertColor(alert.Type),
+				"fields": []map[string]interface{}{
+					{"name": "Type", "value": string(alert.Type), "inline": true},
+					{"name": "Source", "value": alert.SourceName, "inline": true},
+					{"name": "Source ID", "value": alert.SourceID, "inline": false},
+				},
+				"timestamp": alert.Timestamp.Format(time.RFC3339),
+				"footer": map[string]interface{}{
+					"text": "CalBridgeSync",
+				},
+			},
+		},
+	}
+	return json.Marshal(payload)
+}
+
+// buildWebhookPayload selects the appropriate formatter based on
+// the webhook URL and returns the marshaled JSON payload.
+func buildWebhookPayload(alert Alert, webhookURL string) ([]byte, error) {
+	platform := detectWebhookPlatform(webhookURL)
+	switch platform {
+	case platformSlack:
+		return formatSlackPayload(alert)
+	case platformDiscord:
+		return formatDiscordPayload(alert)
+	default:
+		emoji := alertEmoji(alert.Type)
+		payload := WebhookPayload{
+			AlertType:  string(alert.Type),
+			SourceID:   alert.SourceID,
+			SourceName: alert.SourceName,
+			Message:    alert.Message,
+			Details:    alert.Details,
+			Timestamp:  alert.Timestamp.Format(time.RFC3339),
+			Text:       fmt.Sprintf("%s *%s*\n%s", emoji, alert.Message, alert.Details),
+		}
+		return json.Marshal(payload)
+	}
+}
+
+func (n *Notifier) sendWebhook(ctx context.Context, alert Alert) error {
+	body, err := buildWebhookPayload(alert, n.cfg.WebhookURL)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
@@ -963,6 +1084,8 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 }
 
 // sendWebhookToURL sends a webhook to a specific URL (for user webhooks).
+// Uses the same platform-detection + rich-formatting as sendWebhook so
+// per-user Slack/Discord webhooks get Block Kit / embed payloads too.
 func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL string) error {
 	// Validate URL before sending (security check). Validation failures
 	// are permanent — no point retrying a URL that will never pass.
@@ -970,29 +1093,7 @@ func (n *Notifier) sendWebhookToURL(ctx context.Context, alert Alert, webhookURL
 		return fmt.Errorf("invalid webhook URL: %w", err)
 	}
 
-	// Build Slack-compatible message. Idempotent setup stays outside
-	// the retry.
-	emoji := ""
-	switch alert.Type {
-	case AlertTypeStale:
-		emoji = ":warning:"
-	case AlertTypeRecovery:
-		emoji = ":white_check_mark:"
-	case AlertTypeError:
-		emoji = ":x:"
-	}
-
-	payload := WebhookPayload{
-		AlertType:  string(alert.Type),
-		SourceID:   alert.SourceID,
-		SourceName: alert.SourceName,
-		Message:    alert.Message,
-		Details:    alert.Details,
-		Timestamp:  alert.Timestamp.Format(time.RFC3339),
-		Text:       fmt.Sprintf("%s *%s*\n%s", emoji, alert.Message, alert.Details),
-	}
-
-	body, err := json.Marshal(payload)
+	body, err := buildWebhookPayload(alert, webhookURL)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
