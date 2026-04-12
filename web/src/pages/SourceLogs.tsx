@@ -145,16 +145,47 @@ export default function SourceLogs() {
                       </td>
                       <td className="px-4 py-3 text-gray-300">
                         <div className="max-w-md truncate" title={log.message}>{log.message}</div>
-                        {log.details && (
-                          <details className="mt-1">
-                            <summary className="text-xs text-red-400 cursor-pointer hover:text-red-300">
-                              Details
-                            </summary>
-                            <pre className="mt-1 text-xs text-gray-400 bg-black p-2 rounded overflow-x-auto max-w-md">
-                              {log.details}
-                            </pre>
-                          </details>
-                        )}
+                        {log.details && (() => {
+                          const lines = log.details.split('\n');
+                          const conflicts = lines.filter(l => l.startsWith('CONFLICT:'));
+                          const otherDetails = lines.filter(l => !l.startsWith('CONFLICT:')).join('\n').trim();
+                          return (
+                            <>
+                              {conflicts.length > 0 && (
+                                <details className="mt-1">
+                                  <summary className="text-xs text-yellow-400 cursor-pointer hover:text-yellow-300">
+                                    {conflicts.length} conflict{conflicts.length > 1 ? 's' : ''} resolved
+                                  </summary>
+                                  <div className="mt-1 space-y-1">
+                                    {conflicts.map((c, i) => {
+                                      try {
+                                        const data = JSON.parse(c.replace('CONFLICT:', ''));
+                                        return (
+                                          <div key={i} className="text-xs bg-yellow-900/20 border border-yellow-800/50 rounded p-2">
+                                            <span className="text-yellow-300 font-medium">{data.summary || data.uid}</span>
+                                            <span className="text-gray-400 ml-2">→ {data.winner} wins ({data.strategy})</span>
+                                          </div>
+                                        );
+                                      } catch {
+                                        return <div key={i} className="text-xs text-gray-400">{c}</div>;
+                                      }
+                                    })}
+                                  </div>
+                                </details>
+                              )}
+                              {otherDetails && (
+                                <details className="mt-1">
+                                  <summary className="text-xs text-red-400 cursor-pointer hover:text-red-300">
+                                    Details
+                                  </summary>
+                                  <pre className="mt-1 text-xs text-gray-400 bg-black p-2 rounded overflow-x-auto max-w-md">
+                                    {otherDetails}
+                                  </pre>
+                                </details>
+                              )}
+                            </>
+                          );
+                        })()}
                       </td>
                       <td className="px-4 py-3 text-gray-400 whitespace-nowrap">{formatDuration(log.duration)}</td>
                     </tr>

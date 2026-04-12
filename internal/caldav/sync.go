@@ -1740,6 +1740,14 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				}
 			} else {
 				result.Updated++
+				// Log conflict resolution for the UI (#136).
+				// In two-way mode, pushing source → dest means source
+				// won this conflict (or it's source_wins default).
+				if syncDirection == db.SyncDirectionTwoWay {
+					result.Warnings = append(result.Warnings, fmt.Sprintf(
+						"CONFLICT:{\"uid\":%q,\"winner\":\"source\",\"summary\":%q,\"strategy\":%q}",
+						sourceEvent.UID, sourceEvent.Summary, source.ConflictStrategy))
+				}
 				// Record both ETags: source from the server we just
 				// read, dest from the server we just wrote. Note the
 				// dest ETag here is the OLD one — we don't have the
@@ -1930,6 +1938,11 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					}
 				} else {
 					result.Updated++
+					// Log conflict resolution for the UI (#136).
+					// Pushing dest → source means dest won this conflict.
+					result.Warnings = append(result.Warnings, fmt.Sprintf(
+						"CONFLICT:{\"uid\":%q,\"winner\":\"dest\",\"summary\":%q,\"strategy\":%q}",
+						destEvent.UID, destEvent.Summary, source.ConflictStrategy))
 					// Record the dest ETag we just propagated back
 					// to source so the next cycle can detect another
 					// dest-side change. We don't know the new source
