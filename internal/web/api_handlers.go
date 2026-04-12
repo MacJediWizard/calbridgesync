@@ -14,6 +14,7 @@ import (
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 	"github.com/macjediwizard/calbridgesync/internal/notify"
+	"github.com/macjediwizard/calbridgesync/internal/version"
 )
 
 // sanitizeError returns a user-safe error message without exposing internal details.
@@ -299,6 +300,13 @@ func (h *Handlers) APIAuthStatus(c *gin.Context) {
 			Avatar: session.Picture,
 		},
 	})
+}
+
+// APIGetVersion returns the build version of the calbridgesync binary.
+// Unauthenticated — available on the public API group so the login
+// page and footer can display the version without a session.
+func (h *Handlers) APIGetVersion(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"version": version.Version})
 }
 
 // APILogout logs out the user.

@@ -50,6 +50,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	apiGroup.Use(auth.OptionalAuth(sm))
 	{
 		apiGroup.GET("/auth/status", h.APIAuthStatus)
+		apiGroup.GET("/version", h.APIGetVersion)
 		apiGroup.POST("/auth/logout", h.APILogout)
 	}
 
