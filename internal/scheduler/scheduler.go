@@ -14,12 +14,12 @@ import (
 )
 
 const (
-	cleanupInterval   = 24 * time.Hour
-	logRetentionDays  = 30
-	syncTimeout       = 120 * time.Minute // Maximum time for a single sync operation (2 hours for slow iCloud with multiple calendars)
-	healthLogInterval = 5 * time.Minute   // Interval for scheduler health logging
-	staleMultiplier   = 2                 // Source is stale if last sync > staleMultiplier * interval
-	startupStagger    = 30 * time.Second  // Delay between starting each source's first sync
+	cleanupInterval         = 24 * time.Hour
+	defaultLogRetentionDays = 30
+	syncTimeout             = 120 * time.Minute // Maximum time for a single sync operation (2 hours for slow iCloud with multiple calendars)
+	healthLogInterval       = 5 * time.Minute   // Interval for scheduler health logging
+	staleMultiplier         = 2                 // Source is stale if last sync > staleMultiplier * interval
+	startupStagger          = 30 * time.Second  // Delay between starting each source's first sync
 
 	// Liveness watchdog constants (Issue #43). The watchdog detects
 	// routines that have crashed (caught by PR #38 panic recovery but
@@ -108,21 +108,40 @@ type Scheduler struct {
 	// uncontended. (#93)
 	skipCountsMu sync.Mutex
 	skipCounts   map[string]int
+
+	// logRetentionDays is the number of days to keep sync logs before
+	// the daily cleanup routine purges them. Configurable via
+	// SYNC_LOG_RETENTION_DAYS env var; defaults to 30. (#136)
+	logRetentionDays int
+
+	// authFailCounts tracks consecutive authentication failures per
+	// source so the scheduler can alert when credentials may have
+	// expired. Reset on successful sync. (#136)
+	authFailCountsMu sync.Mutex
+	authFailCounts   map[string]int
 }
 
-// New creates a new scheduler.
-func New(database *db.DB, syncEngine *caldav.SyncEngine, notifier *notify.Notifier) *Scheduler {
+// New creates a new scheduler. logRetentionDays controls how many
+// days of sync logs the daily cleanup routine keeps. Pass 0 to use
+// the default (30 days).
+func New(database *db.DB, syncEngine *caldav.SyncEngine, notifier *notify.Notifier, logRetentionDays ...int) *Scheduler {
+	retention := defaultLogRetentionDays
+	if len(logRetentionDays) > 0 && logRetentionDays[0] > 0 {
+		retention = logRetentionDays[0]
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
-		db:         database,
-		syncEngine: syncEngine,
-		notifier:   notifier,
-		jobs:       make(map[string]*Job),
-		syncLocks:  make(map[string]*sync.Mutex),
-		ctx:        ctx,
-		cancel:     cancel,
-		heartbeats: make(map[string]time.Time),
-		skipCounts: make(map[string]int),
+		db:               database,
+		syncEngine:       syncEngine,
+		notifier:         notifier,
+		logRetentionDays: retention,
+		jobs:             make(map[string]*Job),
+		syncLocks:        make(map[string]*sync.Mutex),
+		ctx:              ctx,
+		cancel:           cancel,
+		heartbeats:       make(map[string]time.Time),
+		skipCounts:       make(map[string]int),
+		authFailCounts:   make(map[string]int),
 	}
 }
 
@@ -143,6 +162,77 @@ func (s *Scheduler) resetSkipCount(sourceID string) {
 	s.skipCountsMu.Lock()
 	defer s.skipCountsMu.Unlock()
 	delete(s.skipCounts, sourceID)
+}
+
+// authFailureAlertThreshold is how many consecutive auth failures
+// must occur before the scheduler sends a credential-expiry alert.
+// Fires exactly once at the threshold; subsequent failures are
+// logged but don't re-alert (the regular sync failure alert
+// covers those). Reset on any successful sync. (#136)
+const authFailureAlertThreshold = 3
+
+// incrementAuthFailCount bumps the auth failure counter and returns
+// the new value. Safe for concurrent callers.
+func (s *Scheduler) incrementAuthFailCount(sourceID string) int {
+	s.authFailCountsMu.Lock()
+	defer s.authFailCountsMu.Unlock()
+	s.authFailCounts[sourceID]++
+	return s.authFailCounts[sourceID]
+}
+
+// resetAuthFailCount zeros the auth failure counter for a source.
+// Called on every successful sync.
+func (s *Scheduler) resetAuthFailCount(sourceID string) {
+	s.authFailCountsMu.Lock()
+	defer s.authFailCountsMu.Unlock()
+	delete(s.authFailCounts, sourceID)
+}
+
+// isAuthError returns true if the sync result looks like it failed
+// due to an authentication or authorization problem. Uses substring
+// matching against the error strings because CalDAV servers report
+// auth failures inconsistently.
+func (s *Scheduler) isAuthError(result *caldav.SyncResult) bool {
+	check := func(text string) bool {
+		lower := strings.ToLower(text)
+		return strings.Contains(lower, "401") ||
+			strings.Contains(lower, "403") ||
+			strings.Contains(lower, "unauthorized") ||
+			strings.Contains(lower, "forbidden") ||
+			strings.Contains(lower, "authentication failed") ||
+			strings.Contains(lower, "access denied") ||
+			strings.Contains(lower, "invalid credentials")
+	}
+	if check(result.Message) {
+		return true
+	}
+	for _, e := range result.Errors {
+		if check(e) {
+			return true
+		}
+	}
+	return false
+}
+
+// sendCredentialExpiryAlert fires a one-shot alert when a source
+// hits authFailureAlertThreshold consecutive auth failures. Uses
+// the existing notifier with a distinctive message so operators
+// can tell "credentials expired" apart from "server down."
+func (s *Scheduler) sendCredentialExpiryAlert(source *db.Source, consecutiveFailures int) {
+	if s.notifier == nil {
+		return
+	}
+	userEmail := ""
+	if user, err := s.db.GetUserByID(source.UserID); err == nil {
+		userEmail = user.Email
+	}
+	userPrefs := s.getUserAlertPrefs(source.UserID)
+	msg := fmt.Sprintf("Credentials may be expired for source '%s' — %d consecutive authentication failures. Re-enter credentials in the web UI.",
+		source.Name, consecutiveFailures)
+	s.notifier.SendSyncFailureAlertWithPrefs(
+		s.ctx, source.ID, source.Name, userEmail,
+		msg, "Check if the app password or OAuth token was revoked.", userPrefs,
+	)
 }
 
 // Start loads all enabled sources and starts their sync jobs.
@@ -735,6 +825,9 @@ func (s *Scheduler) executeSync(sourceID string) {
 		log.Printf("Sync completed for source %s: %d created, %d updated, %d deleted, %d duplicates removed in %v",
 			source.Name, result.Created, result.Updated, result.Deleted, result.DuplicatesRemoved, result.Duration)
 
+		// Reset auth failure counter on success
+		s.resetAuthFailCount(sourceID)
+
 		// Send recovery notification if source was previously stale
 		if s.notifier != nil && s.notifier.IsEnabled() {
 			// Look up user email for per-user notifications
@@ -749,6 +842,17 @@ func (s *Scheduler) executeSync(sourceID string) {
 		}
 	} else {
 		log.Printf("Sync failed for source %s: %s", source.Name, result.Message)
+
+		// Track consecutive auth failures. If the sync failed
+		// because of authentication (401/403), increment the
+		// counter. At the threshold, send an alert so the operator
+		// knows credentials may have expired. (#136)
+		if s.isAuthError(result) {
+			count := s.incrementAuthFailCount(sourceID)
+			if count == authFailureAlertThreshold {
+				s.sendCredentialExpiryAlert(source, count)
+			}
+		}
 	}
 
 	// Fire a failure alert when appropriate. This covers two cases:
@@ -848,7 +952,7 @@ func (s *Scheduler) cleanupRoutine() {
 
 // cleanupOldLogs deletes sync logs older than retention period.
 func (s *Scheduler) cleanupOldLogs() {
-	cutoff := time.Now().AddDate(0, 0, -logRetentionDays)
+	cutoff := time.Now().AddDate(0, 0, -s.logRetentionDays)
 	deleted, err := s.db.CleanOldSyncLogs(cutoff)
 	if err != nil {
 		log.Printf("Failed to clean old sync logs: %v", err)

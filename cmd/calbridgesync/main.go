@@ -131,8 +131,8 @@ func main() {
 			cfg.Alerts.WebhookEnabled, cfg.Alerts.EmailEnabled, cfg.Alerts.CooldownMinutes)
 	}
 
-	// Initialize scheduler
-	sched := scheduler.New(database, syncEngine, notifier)
+	// Initialize scheduler with configurable log retention
+	sched := scheduler.New(database, syncEngine, notifier, cfg.LogRetentionDays)
 
 	// Initialize health checker
 	healthChecker := health.NewChecker(database, cfg.OIDC.Issuer, cfg.CalDAV.DefaultDestURL)

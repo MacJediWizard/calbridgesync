@@ -40,6 +40,10 @@ type Config struct {
 	Sync         SyncConfig
 	Alerts       AlertConfig
 	GoogleOAuth  GoogleOAuthConfig
+	// LogRetentionDays controls how many days of sync logs the
+	// scheduler's daily cleanup routine keeps. Configurable via
+	// SYNC_LOG_RETENTION_DAYS env var. Default 30.
+	LogRetentionDays int
 }
 
 // GoogleOAuthConfig holds instance-level Google OAuth2 settings. As of
@@ -299,6 +303,19 @@ func Load() (*Config, error) {
 	if cfg.GoogleOAuth.RedirectURL == "" && cfg.Server.BaseURL != "" {
 		cfg.GoogleOAuth.RedirectURL = strings.TrimRight(cfg.Server.BaseURL, "/") + "/auth/oauth/google/callback"
 	}
+
+	// Sync log retention (default 30 days, range 1-365)
+	logRetention, err := getEnvInt("SYNC_LOG_RETENTION_DAYS", 30)
+	if err != nil {
+		return nil, fmt.Errorf("%w: SYNC_LOG_RETENTION_DAYS: %w", ErrInvalidConfig, err)
+	}
+	if logRetention < 1 {
+		logRetention = 1
+	}
+	if logRetention > 365 {
+		logRetention = 365
+	}
+	cfg.LogRetentionDays = logRetention
 
 	// Check for missing required configuration
 	missing := cfg.getMissingRequired()

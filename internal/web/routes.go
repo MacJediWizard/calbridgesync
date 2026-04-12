@@ -75,6 +75,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		protectedAPI.DELETE("/malformed-events/:id", h.APIDeleteMalformedEvent)
 		protectedAPI.GET("/settings/alerts", h.APIGetAlertPreferences)
 		protectedAPI.PUT("/settings/alerts", h.APIUpdateAlertPreferences)
+		protectedAPI.GET("/settings/log-stats", h.APIGetLogStats)
 		protectedAPI.GET("/activity", h.APIGetActivity)
 	}
 

@@ -73,9 +73,23 @@ func TestSchedulerConstants(t *testing.T) {
 		}
 	})
 
-	t.Run("log retention is 30 days", func(t *testing.T) {
-		if logRetentionDays != 30 {
-			t.Errorf("expected logRetentionDays to be 30, got %d", logRetentionDays)
+	t.Run("default log retention is 30 days", func(t *testing.T) {
+		if defaultLogRetentionDays != 30 {
+			t.Errorf("expected defaultLogRetentionDays to be 30, got %d", defaultLogRetentionDays)
+		}
+	})
+
+	t.Run("scheduler uses configured retention days", func(t *testing.T) {
+		sched := New(nil, nil, nil, 60)
+		if sched.logRetentionDays != 60 {
+			t.Errorf("expected logRetentionDays 60, got %d", sched.logRetentionDays)
+		}
+	})
+
+	t.Run("scheduler defaults to 30 when no retention arg", func(t *testing.T) {
+		sched := New(nil, nil, nil)
+		if sched.logRetentionDays != 30 {
+			t.Errorf("expected logRetentionDays 30, got %d", sched.logRetentionDays)
 		}
 	})
 

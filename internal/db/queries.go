@@ -490,6 +490,18 @@ func (db *DB) CleanOldSyncLogs(olderThan time.Time) (int64, error) {
 	return affected, nil
 }
 
+// GetSyncLogStats returns aggregate stats about the sync_logs table:
+// total count and oldest log timestamp. Used by the Settings page to
+// show log retention status. (#136)
+func (db *DB) GetSyncLogStats() (count int64, oldest time.Time, err error) {
+	row := db.conn.QueryRow(`SELECT COUNT(*), COALESCE(MIN(created_at), CURRENT_TIMESTAMP) FROM sync_logs`)
+	err = row.Scan(&count, &oldest)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("failed to get sync log stats: %w", err)
+	}
+	return count, oldest, nil
+}
+
 // parseSelectedCalendars parses selected_calendars JSON with backward compatibility.
 // Old format: ["path1", "path2"] (array of strings)
 // New format: [{"path": "path1", "sync_direction": "one_way"}] (array of CalendarConfig)
