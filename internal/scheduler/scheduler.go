@@ -867,6 +867,42 @@ func (s *Scheduler) executeSync(sourceID string) {
 	//      the underlying problem (broken source, auth expired, etc.)
 	//      still needs user attention.
 	s.maybeSendFailureAlert(sourceID, source, result)
+
+	// ICS adaptive polling (#146): if the content hash changed,
+	// reset to the original interval. If unchanged, double it
+	// (up to 8x). This reduces unnecessary polling when an ICS
+	// feed is static for long periods.
+	if result.Success && result.ContentHash != "" && source.SourceType == db.SourceTypeICS {
+		currentInterval := source.SyncInterval
+		if source.AdaptiveInterval > 0 {
+			currentInterval = source.AdaptiveInterval
+		}
+
+		if source.LastContentHash == result.ContentHash {
+			// Content unchanged — double the interval (cap at 8x original)
+			maxInterval := source.SyncInterval * 8
+			newInterval := currentInterval * 2
+			if newInterval > maxInterval {
+				newInterval = maxInterval
+			}
+			if newInterval != currentInterval {
+				log.Printf("ICS adaptive polling: %s content unchanged, extending interval %ds → %ds",
+					source.Name, currentInterval, newInterval)
+			}
+			if err := s.db.UpdateSourceAdaptiveState(sourceID, result.ContentHash, newInterval); err != nil {
+				log.Printf("Failed to update adaptive state: %v", err)
+			}
+		} else {
+			// Content changed — reset to original interval
+			if currentInterval != source.SyncInterval {
+				log.Printf("ICS adaptive polling: %s content changed, resetting interval to %ds",
+					source.Name, source.SyncInterval)
+			}
+			if err := s.db.UpdateSourceAdaptiveState(sourceID, result.ContentHash, 0); err != nil {
+				log.Printf("Failed to update adaptive state: %v", err)
+			}
+		}
+	}
 }
 
 // maybeSendFailureAlert inspects a sync result and fires a failure alert if
