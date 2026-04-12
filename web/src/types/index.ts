@@ -31,6 +31,7 @@ export interface Calendar {
   name: string;
   path: string;
   color?: string;
+  event_count?: number;
 }
 
 export interface CalendarConfig {

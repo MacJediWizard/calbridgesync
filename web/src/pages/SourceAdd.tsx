@@ -406,38 +406,49 @@ export default function SourceAdd() {
                   )}
                   {calendars.length > 0 && (
                     <div className="mt-3 p-3 bg-black/50 rounded border border-zinc-700">
-                      <p className="text-xs text-gray-400 mb-2">Select calendars to sync (each can have its own sync direction):</p>
-                      <div className="space-y-2">
-                        {calendars.map((cal) => (
-                          <div key={cal.path} className="flex items-center justify-between">
-                            <label className="flex items-center space-x-2 cursor-pointer flex-1">
-                              <input
-                                type="checkbox"
-                                checked={isCalendarSelected(cal.path)}
-                                onChange={() => handleCalendarToggle(cal.path)}
-                                className="rounded border-zinc-600 bg-zinc-800 text-red-600 focus:ring-red-500"
-                              />
-                              <span className="text-sm text-white">{cal.name || cal.path}</span>
-                              {cal.color && (
-                                <span
-                                  className="w-3 h-3 rounded-full"
-                                  style={{ backgroundColor: cal.color }}
-                                />
-                              )}
-                            </label>
-                            {isCalendarSelected(cal.path) && (
-                              <select
-                                value={getCalendarSyncDirection(cal.path)}
-                                onChange={(e) => handleCalendarSyncDirection(cal.path, e.target.value as '' | 'one_way' | 'two_way')}
-                                className="ml-2 text-xs bg-zinc-800 border-zinc-600 rounded px-2 py-1"
-                              >
-                                <option value="">Source default</option>
-                                <option value="one_way">One-way</option>
-                                <option value="two_way">Two-way</option>
-                              </select>
-                            )}
-                          </div>
-                        ))}
+                      <p className="text-xs text-gray-400 mb-2">Select calendars to sync (click to toggle, each can have its own sync direction):</p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {calendars.map((cal) => {
+                          const selected = isCalendarSelected(cal.path);
+                          return (
+                            <div
+                              key={cal.path}
+                              onClick={() => handleCalendarToggle(cal.path)}
+                              className={`p-3 rounded-lg border cursor-pointer transition-colors ${
+                                selected
+                                  ? 'border-red-600 bg-red-900/20'
+                                  : 'border-zinc-700 bg-zinc-800/50 hover:border-zinc-600'
+                              }`}
+                            >
+                              <div className="flex items-center space-x-2">
+                                {cal.color && (
+                                  <span
+                                    className="w-3 h-3 rounded-full flex-shrink-0"
+                                    style={{ backgroundColor: cal.color }}
+                                  />
+                                )}
+                                <span className="text-sm text-white font-medium truncate">{cal.name || cal.path}</span>
+                              </div>
+                              <div className="flex items-center justify-between mt-1">
+                                <span className="text-xs text-gray-500">
+                                  {cal.event_count !== undefined ? `${cal.event_count} events` : ''}
+                                </span>
+                                {selected && (
+                                  <select
+                                    value={getCalendarSyncDirection(cal.path)}
+                                    onChange={(e) => { e.stopPropagation(); handleCalendarSyncDirection(cal.path, e.target.value as '' | 'one_way' | 'two_way'); }}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="text-xs bg-zinc-800 border-zinc-600 rounded px-2 py-0.5"
+                                  >
+                                    <option value="">Source default</option>
+                                    <option value="one_way">One-way</option>
+                                    <option value="two_way">Two-way</option>
+                                  </select>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                       <p className="text-xs text-gray-500 mt-2">
                         {form.selected_calendars.length} of {calendars.length} selected
