@@ -93,6 +93,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		expensiveAPI.POST("/sources/google/prepare", h.APIPrepareGoogleSource) // Tests dest + stashes pending Google source (#70)
 		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars)       // Discovers calendars via network
 		expensiveAPI.POST("/settings/alerts/test-webhook", h.APITestWebhook)   // Tests webhook via network
+		expensiveAPI.GET("/export/calendars", h.APIExportCalendars)            // Exports all user calendars as ICS
 	}
 
 	// Serve React app static files

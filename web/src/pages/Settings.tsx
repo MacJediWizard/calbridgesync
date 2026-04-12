@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getAlertPreferences, updateAlertPreferences, testWebhook, getLogStats } from '../services/api';
+import { getAlertPreferences, updateAlertPreferences, testWebhook, getLogStats, exportCalendars } from '../services/api';
 import type { AlertPreferences } from '../types';
 
 interface LogStatsData {
@@ -220,6 +220,38 @@ export default function Settings() {
       </div>
 
       {/* Log Retention Stats */}
+      {/* Data Export */}
+      <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden mt-6">
+        <div className="p-4 border-b border-zinc-800">
+          <h3 className="text-lg font-medium text-white">Data Export</h3>
+          <p className="text-sm text-gray-400 mt-1">Download your calendar data as a standard .ics file for backup or import into other apps</p>
+        </div>
+        <div className="p-4">
+          <button
+            onClick={async () => {
+              try {
+                const blob = await exportCalendars();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `calbridgesync-export-${new Date().toISOString().slice(0, 10)}.ics`;
+                a.click();
+                URL.revokeObjectURL(url);
+              } catch {
+                setError('Failed to export calendars');
+              }
+            }}
+            className="px-4 py-2 rounded bg-zinc-800 hover:bg-zinc-700 text-white text-sm font-medium transition-colors border border-zinc-700"
+          >
+            Export My Calendars (.ics)
+          </button>
+          <p className="text-xs text-gray-500 mt-2">
+            Downloads all events from your synced destination calendars in iCalendar format.
+            Compatible with Apple Calendar, Google Calendar, Outlook, and any CalDAV app.
+          </p>
+        </div>
+      </div>
+
       {logStats && (
         <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden mt-6">
           <div className="p-4 border-b border-zinc-800">

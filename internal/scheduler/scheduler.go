@@ -119,6 +119,13 @@ type Scheduler struct {
 	// expired. Reset on successful sync. (#136)
 	authFailCountsMu sync.Mutex
 	authFailCounts   map[string]int
+
+	// backupMgr is the automated backup manager. Nil if backups
+	// are disabled. Called from the daily cleanup routine.
+	backupMgr interface {
+		RunBackup() (string, error)
+		PurgeOldBackups() (int, error)
+	}
 }
 
 // New creates a new scheduler. logRetentionDays controls how many
@@ -982,8 +989,34 @@ func (s *Scheduler) cleanupRoutine() {
 		case <-ticker.C:
 			s.heartbeat(routineCleanup)
 			s.cleanupOldLogs()
+			s.runAutomatedBackup()
 		}
 	}
+}
+
+// runAutomatedBackup runs the daily automated database backup if
+// a backup manager is configured. Errors are logged but not fatal
+// — a failed backup doesn't affect sync operation. (#148)
+func (s *Scheduler) runAutomatedBackup() {
+	if s.backupMgr == nil {
+		return
+	}
+	if _, err := s.backupMgr.RunBackup(); err != nil {
+		log.Printf("Automated backup failed: %v", err)
+		return
+	}
+	if _, err := s.backupMgr.PurgeOldBackups(); err != nil {
+		log.Printf("Backup purge failed: %v", err)
+	}
+}
+
+// SetBackupManager configures the automated backup manager. Called
+// from main.go after creating the backup.Manager, before Start().
+func (s *Scheduler) SetBackupManager(mgr interface {
+	RunBackup() (string, error)
+	PurgeOldBackups() (int, error)
+}) {
+	s.backupMgr = mgr
 }
 
 // cleanupOldLogs deletes sync logs older than retention period.

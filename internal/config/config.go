@@ -44,6 +44,15 @@ type Config struct {
 	// scheduler's daily cleanup routine keeps. Configurable via
 	// SYNC_LOG_RETENTION_DAYS env var. Default 30.
 	LogRetentionDays int
+	// Backup settings for automated DB snapshots.
+	Backup BackupConfig
+}
+
+// BackupConfig holds automated backup settings. (#148)
+type BackupConfig struct {
+	Enabled        bool
+	Dir            string
+	RetentionCount int
 }
 
 // GoogleOAuthConfig holds instance-level Google OAuth2 settings. As of
@@ -316,6 +325,21 @@ func Load() (*Config, error) {
 		logRetention = 365
 	}
 	cfg.LogRetentionDays = logRetention
+
+	// Backup configuration
+	cfg.Backup.Enabled = strings.ToLower(getEnv("BACKUP_ENABLED", "true")) != "false"
+	cfg.Backup.Dir = getEnv("BACKUP_DIR", "./data/backups")
+	backupRetention, err := getEnvInt("BACKUP_RETENTION_COUNT", 7)
+	if err != nil {
+		return nil, fmt.Errorf("%w: BACKUP_RETENTION_COUNT: %w", ErrInvalidConfig, err)
+	}
+	if backupRetention < 1 {
+		backupRetention = 1
+	}
+	if backupRetention > 100 {
+		backupRetention = 100
+	}
+	cfg.Backup.RetentionCount = backupRetention
 
 	// Check for missing required configuration
 	missing := cfg.getMissingRequired()

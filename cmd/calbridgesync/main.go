@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/macjediwizard/calbridgesync/internal/auth"
+	"github.com/macjediwizard/calbridgesync/internal/backup"
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/config"
 	"github.com/macjediwizard/calbridgesync/internal/crypto"
@@ -133,6 +134,17 @@ func main() {
 
 	// Initialize scheduler with configurable log retention
 	sched := scheduler.New(database, syncEngine, notifier, cfg.LogRetentionDays)
+
+	// Initialize automated backup if enabled
+	if cfg.Backup.Enabled {
+		backupMgr, err := backup.New(cfg.Database.Path, cfg.Backup.Dir, cfg.Backup.RetentionCount)
+		if err != nil {
+			log.Printf("WARNING: automated backup disabled: %v", err)
+		} else {
+			sched.SetBackupManager(backupMgr)
+			log.Printf("Automated backup enabled (dir=%s, retention=%d)", cfg.Backup.Dir, cfg.Backup.RetentionCount)
+		}
+	}
 
 	// Initialize health checker
 	healthChecker := health.NewChecker(database, cfg.OIDC.Issuer, cfg.CalDAV.DefaultDestURL)
