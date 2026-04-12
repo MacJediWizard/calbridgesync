@@ -100,6 +100,18 @@ export const triggerSync = async (id: string): Promise<void> => {
   await api.post(`/sources/${id}/sync`);
 };
 
+export const getSourceStats = async (id: string): Promise<{
+  synced_event_count: number;
+  malformed_count: number;
+  success_rate: number;
+  health_score: number;
+  health_label: string;
+  recent_syncs: { status: string; duration_ms: number; created_at: string }[];
+}> => {
+  const response = await api.get(`/sources/${id}/stats`);
+  return response.data;
+};
+
 // Logs
 export const getSourceLogs = async (sourceId: string, page: number = 1): Promise<{ logs: SyncLog[]; total_pages: number; page: number }> => {
   const response = await api.get(`/sources/${sourceId}/logs`, { params: { page } });

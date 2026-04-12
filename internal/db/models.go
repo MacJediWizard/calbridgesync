@@ -273,3 +273,20 @@ type MalformedEvent struct {
 	ErrorMessage string    `json:"error_message"`
 	DiscoveredAt time.Time `json:"discovered_at"`
 }
+
+// SourceStats holds per-source statistics for the dashboard. (#136)
+type SourceStats struct {
+	SyncedEventCount int           `json:"synced_event_count"`
+	MalformedCount   int           `json:"malformed_count"`
+	RecentSyncs      []MiniSyncLog `json:"recent_syncs"`
+	SuccessRate      float64       `json:"success_rate"`
+	HealthScore      float64       `json:"health_score"`
+	HealthLabel      string        `json:"health_label"`
+}
+
+// MiniSyncLog is a compact sync log entry for sparklines. (#136)
+type MiniSyncLog struct {
+	Status     SyncStatus `json:"status"`
+	DurationMs int        `json:"duration_ms"`
+	CreatedAt  time.Time  `json:"created_at"`
+}

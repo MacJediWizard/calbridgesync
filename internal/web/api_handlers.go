@@ -881,6 +881,28 @@ func (h *Handlers) APITriggerSync(c *gin.Context) {
 }
 
 // APIGetSourceLogs returns logs for a source.
+// APIGetSourceStats returns per-source statistics including event
+// count, malformed count, recent sync history, success rate, and
+// health score for the dashboard. (#136)
+func (h *Handlers) APIGetSourceStats(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	sourceID := c.Param("id")
+	if _, err := h.db.GetSourceByIDForUser(sourceID, session.UserID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+	stats, err := h.db.GetSourceStats(sourceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get source stats"})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
+}
+
 func (h *Handlers) APIGetSourceLogs(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	if session == nil {

@@ -490,6 +490,86 @@ func (db *DB) CleanOldSyncLogs(olderThan time.Time) (int64, error) {
 	return affected, nil
 }
 
+// GetSourceStats returns per-source statistics including event count,
+// malformed count, recent sync history, success rate, and health
+// score for the dashboard. (#136)
+func (db *DB) GetSourceStats(sourceID string) (*SourceStats, error) {
+	stats := &SourceStats{}
+
+	// Synced event count
+	row := db.conn.QueryRow(`SELECT COUNT(*) FROM synced_events WHERE source_id = ?`, sourceID)
+	if err := row.Scan(&stats.SyncedEventCount); err != nil {
+		return nil, fmt.Errorf("failed to count synced events: %w", err)
+	}
+
+	// Malformed event count
+	row = db.conn.QueryRow(`SELECT COUNT(*) FROM malformed_events WHERE source_id = ?`, sourceID)
+	if err := row.Scan(&stats.MalformedCount); err != nil {
+		return nil, fmt.Errorf("failed to count malformed events: %w", err)
+	}
+
+	// Last 20 sync logs for sparkline + success rate
+	rows, err := db.conn.Query(
+		`SELECT status, duration_ms, created_at FROM sync_logs WHERE source_id = ? ORDER BY created_at DESC LIMIT 20`,
+		sourceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent sync logs: %w", err)
+	}
+	defer rows.Close()
+
+	var successCount int
+	for rows.Next() {
+		var mini MiniSyncLog
+		var durationMs int
+		if err := rows.Scan(&mini.Status, &durationMs, &mini.CreatedAt); err != nil {
+			continue
+		}
+		mini.DurationMs = durationMs
+		stats.RecentSyncs = append(stats.RecentSyncs, mini)
+		if mini.Status == SyncStatusSuccess {
+			successCount++
+		}
+	}
+
+	total := len(stats.RecentSyncs)
+	if total > 0 {
+		stats.SuccessRate = float64(successCount) / float64(total) * 100
+	}
+
+	// Health score: weighted
+	// Success rate (0.5) + malformed (0.2) + warning frequency (0.3)
+	successScore := stats.SuccessRate / 100.0
+	malformedScore := 1.0
+	if stats.MalformedCount > 5 {
+		malformedScore = 0.3
+	} else if stats.MalformedCount > 0 {
+		malformedScore = 0.7
+	}
+	// Warning frequency: count partial/error in recent syncs
+	warningCount := 0
+	for _, s := range stats.RecentSyncs {
+		if s.Status == SyncStatusPartial || s.Status == SyncStatusError {
+			warningCount++
+		}
+	}
+	warningScore := 1.0
+	if total > 0 {
+		warningScore = 1.0 - float64(warningCount)/float64(total)
+	}
+
+	stats.HealthScore = successScore*0.5 + malformedScore*0.2 + warningScore*0.3
+	if stats.HealthScore >= 0.8 {
+		stats.HealthLabel = "healthy"
+	} else if stats.HealthScore >= 0.5 {
+		stats.HealthLabel = "degraded"
+	} else {
+		stats.HealthLabel = "unhealthy"
+	}
+
+	return stats, nil
+}
+
 // GetSyncLogStats returns aggregate stats about the sync_logs table:
 // total count and oldest log timestamp. Used by the Settings page to
 // show log retention status. (#136)
