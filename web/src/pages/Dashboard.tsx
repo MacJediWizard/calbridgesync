@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { getDashboardStats, getSources, triggerSync, getSyncHistory, getMalformedEvents, deleteMalformedEvent, deleteAllMalformedEvents } from '../services/api';
+import { getDashboardStats, getSources, triggerSync, getSyncHistory, getMalformedEvents, deleteMalformedEvent, deleteAllMalformedEvents, getSourceStats } from '../services/api';
 import type { DashboardStats, Source, SyncHistory, MalformedEvent } from '../types';
 import {
   AreaChart,
@@ -28,6 +28,7 @@ export default function Dashboard() {
   const [sources, setSources] = useState<Source[]>([]);
   const [syncHistory, setSyncHistory] = useState<SyncHistory | null>(null);
   const [malformedEvents, setMalformedEvents] = useState<MalformedEvent[]>([]);
+  const [sourceStatsMap, setSourceStatsMap] = useState<Record<string, { health_label: string; synced_event_count: number }>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [syncingId, setSyncingId] = useState<string | null>(null);
@@ -55,6 +56,18 @@ export default function Dashboard() {
       setSources(sourcesData);
       setSyncHistory(historyData);
       setMalformedEvents(malformedData);
+
+      // Fetch per-source stats for health dots + event counts
+      const statsResults = await Promise.allSettled(
+        sourcesData.map(s => getSourceStats(s.id).then(st => ({ id: s.id, ...st })))
+      );
+      const newMap: Record<string, { health_label: string; synced_event_count: number }> = {};
+      for (const r of statsResults) {
+        if (r.status === 'fulfilled') {
+          newMap[r.value.id] = { health_label: r.value.health_label, synced_event_count: r.value.synced_event_count };
+        }
+      }
+      setSourceStatsMap(newMap);
     } catch (err) {
       setError('Failed to load dashboard data');
       console.error(err);
@@ -410,8 +423,24 @@ export default function Dashboard() {
                       <td className="px-4 py-3">
                         <div className="flex items-center space-x-2">
                           {isSourceSyncing && <Spinner className="h-4 w-4 text-blue-400" />}
+                          {!isSourceSyncing && sourceStatsMap[source.id] && (
+                            <span
+                              className={`inline-block w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+                                sourceStatsMap[source.id].health_label === 'healthy' ? 'bg-green-400' :
+                                sourceStatsMap[source.id].health_label === 'degraded' ? 'bg-yellow-400' : 'bg-red-400'
+                              }`}
+                              title={`Health: ${sourceStatsMap[source.id].health_label}`}
+                            />
+                          )}
                           <div>
-                            <div className="font-medium text-white">{source.name}</div>
+                            <div className="font-medium text-white">
+                              {source.name}
+                              {sourceStatsMap[source.id] && (
+                                <span className="ml-2 text-xs text-gray-500 font-normal">
+                                  {sourceStatsMap[source.id].synced_event_count} events
+                                </span>
+                              )}
+                            </div>
                             <div className="text-xs text-gray-500 truncate max-w-xs">{source.source_url}</div>
                           </div>
                         </div>
