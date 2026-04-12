@@ -122,9 +122,10 @@ type APISource struct {
 
 // APICalendar represents a calendar discovered on a CalDAV server.
 type APICalendar struct {
-	Name  string `json:"name"`
-	Path  string `json:"path"`
-	Color string `json:"color,omitempty"`
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Color      string `json:"color,omitempty"`
+	EventCount int    `json:"event_count"`
 }
 
 // APICalendarConfig represents per-calendar configuration including sync direction.
@@ -1130,11 +1131,18 @@ func (h *Handlers) APIDiscoverCalendars(c *gin.Context) {
 
 	apiCalendars := make([]*APICalendar, len(calendars))
 	for i, cal := range calendars {
-		apiCalendars[i] = &APICalendar{
+		apiCal := &APICalendar{
 			Name:  cal.Name,
 			Path:  cal.Path,
 			Color: cal.Color,
 		}
+		// Best-effort event count — don't fail the whole discovery
+		// if counting events for one calendar errors out. (#142)
+		events, err := client.GetEvents(ctx, cal.Path, nil)
+		if err == nil {
+			apiCal.EventCount = len(events)
+		}
+		apiCalendars[i] = apiCal
 	}
 
 	c.JSON(http.StatusOK, apiCalendars)
