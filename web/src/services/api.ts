@@ -18,6 +18,11 @@ export const logout = async (): Promise<void> => {
   await api.post('/auth/logout');
 };
 
+export const getVersion = async (): Promise<{ version: string }> => {
+  const response = await api.get('/version');
+  return response.data;
+};
+
 // Dashboard
 export const getDashboardStats = async (): Promise<DashboardStats> => {
   const response = await api.get('/dashboard/stats');

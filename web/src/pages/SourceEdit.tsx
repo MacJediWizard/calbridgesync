@@ -68,22 +68,18 @@ export default function SourceEdit() {
       return;
     }
 
-    // For editing, we need to use the stored password if not changed
-    const password = form.source_password || 'USE_EXISTING';
-    if (password === 'USE_EXISTING' && !source) {
-      setDiscoverError('Please enter password to discover calendars');
+    // Calendar discovery requires the source password because the
+    // backend makes a live CalDAV PROPFIND against the server.
+    // Stored passwords are encrypted and not returned by the API,
+    // so the user must re-enter the password to rediscover.
+    if (!form.source_password) {
+      setDiscoverError('Re-enter your source password above to rediscover calendars (stored passwords are encrypted and cannot be reused for discovery)');
       return;
     }
 
     setDiscovering(true);
     setDiscoverError(null);
     try {
-      // If password is empty, we can't discover - need to inform user
-      if (!form.source_password) {
-        setDiscoverError('Please enter password to discover calendars');
-        setDiscovering(false);
-        return;
-      }
       const discovered = await discoverCalendars(form.source_url, form.source_username, form.source_password);
       setCalendars(discovered);
       // If no calendars selected yet, select all by default with source default sync direction
@@ -272,6 +268,13 @@ export default function SourceEdit() {
                   <option value={90}>90 days</option>
                   <option value={0}>Unlimited</option>
                 </select>
+                {form.sync_days_past > 0 ? (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Syncing events from {new Date(Date.now() - form.sync_days_past * 86400000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} to today
+                  </p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-1">Syncing all events regardless of date</p>
+                )}
               </div>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

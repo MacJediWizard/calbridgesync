@@ -28,7 +28,7 @@ COPY . .
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-w -s -X main.Version=$(git describe --tags --always --dirty 2>/dev/null || echo 'dev')" \
+    -ldflags="-w -s -X github.com/macjediwizard/calbridgesync/internal/version.Version=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}" \
     -o /app/calbridgesync \
     ./cmd/calbridgesync
 

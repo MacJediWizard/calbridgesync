@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Link, useLocation, Outlet } from 'react-router-dom';
 import type { User } from '../types';
+import { getVersion } from '../services/api';
 
 // Local logo
 const LOGO_URL = '/logo.png';
@@ -13,6 +14,11 @@ interface LayoutProps {
 export default function Layout({ user, onLogout }: LayoutProps) {
   const location = useLocation();
   const [logoError, setLogoError] = useState(false);
+  const [appVersion, setAppVersion] = useState<string>('');
+
+  useEffect(() => {
+    getVersion().then(v => setAppVersion(v.version)).catch(() => {});
+  }, []);
 
   const isActive = (path: string) => {
     if (path === '/') return location.pathname === '/';
@@ -126,7 +132,7 @@ export default function Layout({ user, onLogout }: LayoutProps) {
       {/* Footer */}
       <footer className="bg-zinc-900 border-t border-zinc-800 py-4 mt-auto">
         <div className="max-w-6xl mx-auto px-4 text-center">
-          <p className="text-gray-500 text-sm">CalBridgeSync - CalDAV Synchronization</p>
+          <p className="text-gray-500 text-sm">CalBridgeSync{appVersion ? ` v${appVersion}` : ''} - CalDAV Synchronization</p>
           <p className="text-gray-600 text-xs mt-1">Powered by MacJediWizard Digital Wizardry</p>
         </div>
       </footer>

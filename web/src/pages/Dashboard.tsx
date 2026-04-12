@@ -416,7 +416,16 @@ export default function Dashboard() {
                           </div>
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-gray-400">{source.source_type}</td>
+                      <td className="px-4 py-3">
+                        <span className="text-gray-400">{source.source_type}</span>
+                        {source.sync_days_past > 0 ? (
+                          <span className="ml-2 text-xs text-gray-600" title={`Syncing events from the last ${source.sync_days_past} days`}>
+                            {source.sync_days_past}d
+                          </span>
+                        ) : (
+                          <span className="ml-2 text-xs text-gray-600" title="Syncing all events (no date filter)">all</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3">
                         <div className="flex items-center space-x-2">
                           {source.enabled ? (
