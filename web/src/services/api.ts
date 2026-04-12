@@ -142,6 +142,11 @@ export const testWebhook = async (url: string): Promise<void> => {
   await api.post('/settings/alerts/test-webhook', { webhook_url: url });
 };
 
+export const getLogStats = async (): Promise<{ total_logs: number; oldest_log: string; retention_days: number }> => {
+  const response = await api.get('/settings/log-stats');
+  return response.data;
+};
+
 // Activity
 export const getActivity = async (): Promise<ActivityData> => {
   const response = await api.get('/activity');

@@ -1,6 +1,12 @@
 import { useState, useEffect } from 'react';
-import { getAlertPreferences, updateAlertPreferences, testWebhook } from '../services/api';
+import { getAlertPreferences, updateAlertPreferences, testWebhook, getLogStats } from '../services/api';
 import type { AlertPreferences } from '../types';
+
+interface LogStatsData {
+  total_logs: number;
+  oldest_log: string;
+  retention_days: number;
+}
 
 export default function Settings() {
   const [preferences, setPreferences] = useState<AlertPreferences>({
@@ -9,6 +15,7 @@ export default function Settings() {
     webhook_url: '',
     cooldown_minutes: null,
   });
+  const [logStats, setLogStats] = useState<LogStatsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -17,6 +24,7 @@ export default function Settings() {
 
   useEffect(() => {
     loadPreferences();
+    getLogStats().then(setLogStats).catch(() => {});
   }, []);
 
   const loadPreferences = async () => {
@@ -210,6 +218,34 @@ export default function Settings() {
           {saving ? 'Saving...' : 'Save Preferences'}
         </button>
       </div>
+
+      {/* Log Retention Stats */}
+      {logStats && (
+        <div className="bg-zinc-900 rounded-lg border border-zinc-800 overflow-hidden mt-6">
+          <div className="p-4 border-b border-zinc-800">
+            <h3 className="text-lg font-medium text-white">Sync Log Retention</h3>
+            <p className="text-sm text-gray-400 mt-1">Logs older than {logStats.retention_days} days are automatically purged daily</p>
+          </div>
+          <div className="p-4">
+            <div className="grid grid-cols-3 gap-4">
+              <div>
+                <p className="text-xs text-gray-500 uppercase">Total Logs</p>
+                <p className="text-lg font-medium text-white">{logStats.total_logs.toLocaleString()}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 uppercase">Oldest Log</p>
+                <p className="text-lg font-medium text-white">
+                  {new Date(logStats.oldest_log).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 uppercase">Retention</p>
+                <p className="text-lg font-medium text-white">{logStats.retention_days} days</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

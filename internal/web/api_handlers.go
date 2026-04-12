@@ -309,6 +309,29 @@ func (h *Handlers) APIGetVersion(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"version": version.Version})
 }
 
+// APIGetLogStats returns aggregate sync log statistics for the
+// Settings page. Shows total count, oldest log, and retention
+// period so operators can gauge log growth. (#136)
+func (h *Handlers) APIGetLogStats(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	count, oldest, err := h.db.GetSyncLogStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get log stats"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"total_logs":     count,
+		"oldest_log":     oldest.Format(time.RFC3339),
+		"retention_days": h.cfg.LogRetentionDays,
+	})
+}
+
 // APILogout logs out the user.
 func (h *Handlers) APILogout(c *gin.Context) {
 	if err := h.session.Clear(c.Writer, c.Request); err != nil {
