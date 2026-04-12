@@ -777,6 +777,10 @@ type SyncResult struct {
 	Errors            []string      `json:"errors,omitempty"`   // Critical errors that prevent sync
 	Warnings          []string      `json:"warnings,omitempty"` // Non-critical issues (individual event failures)
 	Duration          time.Duration `json:"duration"`
+	// ContentHash is the SHA-256 hex digest of the ICS feed body.
+	// Populated only for ICS source types. Used by the scheduler's
+	// adaptive polling logic to detect unchanged feeds. (#146)
+	ContentHash string `json:"content_hash,omitempty"`
 }
 
 // sanitizeLogDetails removes potentially sensitive information from sync log details.
@@ -2210,6 +2214,9 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 		se.finishSync(source.ID, result)
 		return result
 	}
+
+	// Capture content hash for adaptive polling (#146)
+	result.ContentHash = icsClient.LastFetchHash()
 
 	// Filter events by date if configured
 	if source.SyncDaysPast > 0 {

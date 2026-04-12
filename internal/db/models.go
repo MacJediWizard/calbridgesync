@@ -208,6 +208,11 @@ type Source struct {
 	LastSyncMessage    string           `json:"last_sync_message"`
 	CreatedAt          time.Time        `json:"created_at"`
 	UpdatedAt          time.Time        `json:"updated_at"`
+	// ICS adaptive polling (#146). LastContentHash is SHA-256 of the
+	// last fetched ICS feed body. AdaptiveInterval is the current
+	// polling interval in seconds (0 = use source.SyncInterval default).
+	LastContentHash  string `json:"-"`
+	AdaptiveInterval int    `json:"adaptive_interval,omitempty"`
 }
 
 // SyncState represents the synchronization state for a calendar.

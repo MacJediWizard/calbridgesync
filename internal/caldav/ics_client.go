@@ -2,6 +2,7 @@ package caldav
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -124,6 +125,18 @@ type ICSClient struct {
 	username   string
 	password   string
 	httpClient *http.Client
+	// lastFetchHash is the SHA-256 hex digest of the most recently
+	// fetched feed body. Set by FetchEvents, read by
+	// LastFetchHash(). Used by the scheduler's adaptive polling
+	// to detect unchanged content. (#146)
+	lastFetchHash string
+}
+
+// LastFetchHash returns the SHA-256 hex digest of the feed body
+// from the most recent FetchEvents call. Empty if FetchEvents
+// hasn't been called yet or failed before reading the body.
+func (c *ICSClient) LastFetchHash() string {
+	return c.lastFetchHash
 }
 
 // validateICSFeedURL rejects obviously unsafe ICS feed URLs. The
@@ -293,6 +306,10 @@ func (c *ICSClient) TestConnection(ctx context.Context) error {
 }
 
 // FetchEvents fetches and parses events from the ICS feed.
+// FetchEvents fetches and parses all events from the ICS feed.
+// Returns events + a SHA-256 hex digest of the raw feed body (for
+// adaptive polling content change detection). The hash is computed
+// before parsing so it captures the exact bytes received.
 func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCollector) ([]Event, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.feedURL, nil)
 	if err != nil {
@@ -321,6 +338,10 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 	}
 
 	log.Printf("ICS feed: fetched %d bytes from %s", len(body), c.feedURL)
+
+	// Compute content hash for adaptive polling (#146)
+	hash := sha256.Sum256(body)
+	c.lastFetchHash = fmt.Sprintf("%x", hash)
 
 	// Parse iCalendar data
 	dec := ical.NewDecoder(strings.NewReader(string(body)))
