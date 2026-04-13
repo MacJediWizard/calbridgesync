@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -1268,6 +1269,98 @@ type APITestWebhookRequest struct {
 }
 
 // APITestWebhook sends a test message to the specified webhook URL.
+// APIExportCalendars exports all the authenticated user's synced
+// calendar events as a single .ics file download. Connects to
+// each destination CalDAV server, fetches all events, and streams
+// the combined VCALENDAR output. Per-user ICS export for backup
+// or portability. (#148)
+func (h *Handlers) APIExportCalendars(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	sources, err := h.db.GetSourcesByUserID(session.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load sources"})
+		return
+	}
+
+	// Set response headers for ICS download
+	c.Header("Content-Type", "text/calendar; charset=utf-8")
+	c.Header("Content-Disposition", "attachment; filename=\"calbridgesync-export.ics\"")
+	c.Writer.WriteHeader(http.StatusOK)
+
+	// Write VCALENDAR envelope
+	c.Writer.Write([]byte("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//calbridgesync//export//EN\r\nCALSCALE:GREGORIAN\r\n"))
+
+	for _, source := range sources {
+		if !source.Enabled {
+			continue
+		}
+
+		// Decrypt dest credentials
+		destPassword, err := h.encryptor.Decrypt(source.DestPassword)
+		if err != nil {
+			log.Printf("Export: failed to decrypt dest password for source %s: %v", source.Name, err)
+			continue
+		}
+
+		// Connect to destination CalDAV
+		destClient, err := caldav.NewClient(source.DestURL, source.DestUsername, destPassword)
+		if err != nil {
+			log.Printf("Export: failed to connect to dest for source %s: %v", source.Name, err)
+			continue
+		}
+
+		// Find calendars
+		calendars, err := destClient.FindCalendars(c.Request.Context())
+		if err != nil {
+			log.Printf("Export: failed to find calendars for source %s: %v", source.Name, err)
+			continue
+		}
+
+		// Fetch events from each calendar
+		for _, cal := range calendars {
+			events, err := destClient.GetEvents(c.Request.Context(), cal.Path, nil)
+			if err != nil {
+				log.Printf("Export: failed to get events from %s/%s: %v", source.Name, cal.Name, err)
+				continue
+			}
+			// Write X-WR-CALNAME for context
+			c.Writer.Write([]byte(fmt.Sprintf("X-WR-CALNAME:%s - %s\r\n", source.Name, cal.Name)))
+
+			for _, event := range events {
+				if event.Data == "" {
+					continue
+				}
+				// Extract VEVENT blocks from the event data and write
+				// them directly — each event.Data is a full VCALENDAR
+				// envelope so we need to strip it and emit just the
+				// VEVENT blocks.
+				data := event.Data
+				for {
+					start := strings.Index(data, "BEGIN:VEVENT")
+					if start == -1 {
+						break
+					}
+					end := strings.Index(data[start:], "END:VEVENT")
+					if end == -1 {
+						break
+					}
+					end += start + len("END:VEVENT")
+					c.Writer.Write([]byte(data[start:end]))
+					c.Writer.Write([]byte("\r\n"))
+					data = data[end:]
+				}
+			}
+		}
+	}
+
+	c.Writer.Write([]byte("END:VCALENDAR\r\n"))
+}
+
 func (h *Handlers) APITestWebhook(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
 	if session == nil {
