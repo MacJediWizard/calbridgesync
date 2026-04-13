@@ -693,10 +693,20 @@ func (db *DB) GetAuditLogs(userID string, page, pageSize int) ([]*AuditLog, int,
 // total count and oldest log timestamp. Used by the Settings page to
 // show log retention status. (#136)
 func (db *DB) GetSyncLogStats() (count int64, oldest time.Time, err error) {
-	row := db.conn.QueryRow(`SELECT COUNT(*), COALESCE(MIN(created_at), CURRENT_TIMESTAMP) FROM sync_logs`)
-	err = row.Scan(&count, &oldest)
+	var oldestStr string
+	row := db.conn.QueryRow(`SELECT COUNT(*), COALESCE(MIN(created_at), datetime('now')) FROM sync_logs`)
+	err = row.Scan(&count, &oldestStr)
 	if err != nil {
 		return 0, time.Time{}, fmt.Errorf("failed to get sync log stats: %w", err)
+	}
+	// Parse the datetime string from SQLite
+	oldest, err = time.Parse("2006-01-02T15:04:05Z", oldestStr)
+	if err != nil {
+		// Try other common SQLite datetime formats
+		oldest, err = time.Parse("2006-01-02 15:04:05", oldestStr)
+		if err != nil {
+			oldest = time.Now()
+		}
 	}
 	return count, oldest, nil
 }

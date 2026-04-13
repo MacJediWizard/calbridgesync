@@ -14,6 +14,10 @@ RUN npm run build
 # Go build stage
 FROM golang:1.24-alpine AS builder
 
+# VERSION is passed via --build-arg from Komodo's build system.
+# Must be declared here so the RUN command can reference it.
+ARG VERSION=dev
+
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates tzdata
 
@@ -28,7 +32,7 @@ COPY . .
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-w -s -X github.com/macjediwizard/calbridgesync/internal/version.Version=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}" \
+    -ldflags="-w -s -X github.com/macjediwizard/calbridgesync/internal/version.Version=${VERSION}" \
     -o /app/calbridgesync \
     ./cmd/calbridgesync
 
