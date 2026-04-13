@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent, Calendar, AlertPreferences, ActivityData } from '../types';
+import type { Source, SyncLog, DashboardStats, SourceFormData, AuthStatus, SyncHistory, MalformedEvent, Calendar, AlertPreferences, ActivityData, Destination } from '../types';
 
 const api = axios.create({
   baseURL: '/api',
@@ -187,6 +187,21 @@ export const getLogStats = async (): Promise<{ total_logs: number; oldest_log: s
 export const getActivity = async (): Promise<ActivityData> => {
   const response = await api.get('/activity');
   return response.data;
+};
+
+// Destinations (multi-destination sync #156)
+export const getDestinations = async (sourceId: string): Promise<Destination[]> => {
+  const response = await api.get(`/sources/${sourceId}/destinations`);
+  return response.data;
+};
+
+export const createDestination = async (sourceId: string, data: { name: string; dest_url: string; dest_username: string; dest_password: string }): Promise<Destination> => {
+  const response = await api.post(`/sources/${sourceId}/destinations`, data);
+  return response.data;
+};
+
+export const deleteDestination = async (sourceId: string, destId: string): Promise<void> => {
+  await api.delete(`/sources/${sourceId}/destinations/${destId}`);
 };
 
 export default api;
