@@ -34,6 +34,28 @@ var (
 	ErrEventSkipped = errors.New("event skipped")
 )
 
+// dryRunContextKey is a context key that, when present, causes
+// PutEvent and DeleteEvent to return nil without actually calling
+// the CalDAV server. The sync engine runs the full computation
+// (determines what WOULD change) and populates SyncResult as if
+// the operations happened, but no data is actually written. (#150)
+type dryRunContextKeyType struct{}
+
+var dryRunContextKey = dryRunContextKeyType{}
+
+// WithDryRun returns a context that causes PutEvent and DeleteEvent
+// to be no-ops. The sync engine will still compute all deltas and
+// populate SyncResult, but no CalDAV writes will happen.
+func WithDryRun(ctx context.Context) context.Context {
+	return context.WithValue(ctx, dryRunContextKey, true)
+}
+
+// IsDryRun returns true if the context has the dry-run flag set.
+func IsDryRun(ctx context.Context) bool {
+	v, _ := ctx.Value(dryRunContextKey).(bool)
+	return v
+}
+
 const (
 	defaultTimeout = 300 * time.Second // 5 minutes default for slow CalDAV servers like iCloud
 	minTLSVersion  = tls.VersionTLS12
@@ -719,6 +741,16 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 //     write). Callers should surface these in result.Warnings or
 //     result.Errors as appropriate.
 func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event) error {
+	// Dry-run: return nil without writing. The caller's bookkeeping
+	// (result.Created++, result.Updated++) proceeds as normal,
+	// producing an accurate preview of what WOULD happen. (#150)
+	if IsDryRun(ctx) {
+		if event.Data == "" {
+			return ErrEventSkipped
+		}
+		return nil
+	}
+
 	// Skip events with empty data. This is NOT a success — we did not
 	// write anything. Previously this returned nil, which made the
 	// caller's `result.Created++` bookkeeping lie.
@@ -772,6 +804,10 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 
 // DeleteEvent deletes an event.
 func (c *Client) DeleteEvent(ctx context.Context, eventPath string) error {
+	// Dry-run: return nil without deleting. (#150)
+	if IsDryRun(ctx) {
+		return nil
+	}
 	err := c.caldavClient.RemoveAll(ctx, eventPath)
 	if err != nil {
 		return fmt.Errorf("%w: failed to delete event: %w", ErrConnectionFailed, err)

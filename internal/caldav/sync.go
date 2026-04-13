@@ -781,6 +781,9 @@ type SyncResult struct {
 	// Populated only for ICS source types. Used by the scheduler's
 	// adaptive polling logic to detect unchanged feeds. (#146)
 	ContentHash string `json:"content_hash,omitempty"`
+	// DryRun indicates this result was computed without actually
+	// writing to the CalDAV servers. Counts are what WOULD happen.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 // sanitizeLogDetails removes potentially sensitive information from sync log details.
@@ -896,13 +899,18 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),
+		DryRun:   IsDryRun(ctx),
 	}
 
-	// Update status to running (with retry for concurrent access)
-	if err := retryDBOperation(func() error {
-		return se.db.UpdateSourceSyncStatus(source.ID, db.SyncStatusRunning, "Sync in progress")
-	}, 5); err != nil {
-		log.Printf("Failed to update sync status after retries: %v", err)
+	// Skip status update in dry-run mode — we don't want to
+	// change the source's last_sync_status/last_sync_at. (#150)
+	if !result.DryRun {
+		// Update status to running (with retry for concurrent access)
+		if err := retryDBOperation(func() error {
+			return se.db.UpdateSourceSyncStatus(source.ID, db.SyncStatusRunning, "Sync in progress")
+		}, 5); err != nil {
+			log.Printf("Failed to update sync status after retries: %v", err)
+		}
 	}
 
 	// Branch for ICS sources (read-only feed, different sync path)
@@ -2287,6 +2295,12 @@ func (se *SyncEngine) TestICSConnection(ctx context.Context, url, username, pass
 const finishSyncPersistenceWarningPrefix = "sync persistence failure: "
 
 func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
+	// In dry-run mode, don't write status or sync log to DB —
+	// the sync didn't actually happen. (#150)
+	if result.DryRun {
+		return
+	}
+
 	// Determine status: error > partial > success
 	var status db.SyncStatus
 	if !result.Success {
