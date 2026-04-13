@@ -349,6 +349,101 @@ func (h *Handlers) APIGetAuditLogs(c *gin.Context) {
 	})
 }
 
+// APIListDestinations returns additional destinations for a source. (#154)
+func (h *Handlers) APIListDestinations(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	sourceID := c.Param("id")
+	if _, err := h.db.GetSourceByIDForUser(sourceID, session.UserID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+	dests, err := h.db.GetDestinationsBySourceID(sourceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load destinations"})
+		return
+	}
+	if dests == nil {
+		dests = []*db.Destination{}
+	}
+	c.JSON(http.StatusOK, dests)
+}
+
+// APICreateDestination adds an additional destination to a source. (#154)
+func (h *Handlers) APICreateDestination(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	sourceID := c.Param("id")
+	if _, err := h.db.GetSourceByIDForUser(sourceID, session.UserID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+
+	var req struct {
+		Name         string `json:"name"`
+		DestURL      string `json:"dest_url"`
+		DestUsername string `json:"dest_username"`
+		DestPassword string `json:"dest_password"`
+	}
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+	if req.DestURL == "" || req.DestUsername == "" || req.DestPassword == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Destination URL, username, and password are required"})
+		return
+	}
+
+	encPassword, err := h.encryptor.Encrypt(req.DestPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encrypt password"})
+		return
+	}
+
+	dest := &db.Destination{
+		SourceID:     sourceID,
+		Name:         req.Name,
+		DestURL:      req.DestURL,
+		DestUsername: req.DestUsername,
+		DestPassword: encPassword,
+		Enabled:      true,
+	}
+	if err := h.db.CreateDestination(dest); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create destination"})
+		return
+	}
+
+	h.audit(c, "destination.create", "destination", dest.ID, fmt.Sprintf("source=%s dest=%s", sourceID, req.DestURL))
+	c.JSON(http.StatusOK, dest)
+}
+
+// APIDeleteDestination removes an additional destination. (#154)
+func (h *Handlers) APIDeleteDestination(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	sourceID := c.Param("id")
+	if _, err := h.db.GetSourceByIDForUser(sourceID, session.UserID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+	destID := c.Param("destId")
+	if err := h.db.DeleteDestination(destID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Destination not found"})
+		return
+	}
+	h.audit(c, "destination.delete", "destination", destID, fmt.Sprintf("source=%s", sourceID))
+	c.JSON(http.StatusOK, gin.H{"message": "Destination deleted"})
+}
+
 // APIGetVersion returns the build version of the calbridgesync binary.
 // Unauthenticated — available on the public API group so the login
 // page and footer can display the version without a session.

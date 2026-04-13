@@ -582,6 +582,60 @@ func (db *DB) UpdateSourceAdaptiveState(sourceID, contentHash string, adaptiveIn
 	return nil
 }
 
+// CreateDestination adds an additional destination for a source. (#154)
+func (db *DB) CreateDestination(dest *Destination) error {
+	dest.ID = uuid.New().String()
+	now := time.Now().UTC()
+	dest.CreatedAt = now
+	dest.UpdatedAt = now
+	query := `INSERT INTO destinations (id, source_id, name, dest_url, dest_username, dest_password, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.conn.Exec(query, dest.ID, dest.SourceID, dest.Name, dest.DestURL, dest.DestUsername, dest.DestPassword, dest.Enabled, dest.CreatedAt, dest.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to create destination: %w", err)
+	}
+	return nil
+}
+
+// GetDestinationsBySourceID returns all destinations for a source. (#154)
+func (db *DB) GetDestinationsBySourceID(sourceID string) ([]*Destination, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, source_id, name, dest_url, dest_username, dest_password, enabled, created_at, updated_at
+		 FROM destinations WHERE source_id = ? ORDER BY created_at`,
+		sourceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query destinations: %w", err)
+	}
+	defer rows.Close()
+
+	var dests []*Destination
+	for rows.Next() {
+		var d Destination
+		if err := rows.Scan(&d.ID, &d.SourceID, &d.Name, &d.DestURL, &d.DestUsername, &d.DestPassword, &d.Enabled, &d.CreatedAt, &d.UpdatedAt); err != nil {
+			continue
+		}
+		dests = append(dests, &d)
+	}
+	return dests, nil
+}
+
+// DeleteDestination removes a destination by ID. (#154)
+func (db *DB) DeleteDestination(id string) error {
+	result, err := db.conn.Exec(`DELETE FROM destinations WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete destination: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // CreateAuditLog inserts an audit log entry. (#152)
 func (db *DB) CreateAuditLog(log *AuditLog) error {
 	log.ID = uuid.New().String()

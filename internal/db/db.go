@@ -265,6 +265,25 @@ func (db *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,
+
+		// Multi-destination support (#154). Each source can sync
+		// to additional destinations beyond the primary one stored
+		// on the source row. The primary dest_url/dest_username/
+		// dest_password columns on sources are kept for backward
+		// compatibility; this table holds ADDITIONAL destinations.
+		`CREATE TABLE IF NOT EXISTS destinations (
+			id TEXT PRIMARY KEY,
+			source_id TEXT NOT NULL,
+			name TEXT NOT NULL DEFAULT '',
+			dest_url TEXT NOT NULL,
+			dest_username TEXT NOT NULL,
+			dest_password TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_destinations_source_id ON destinations(source_id)`,
 	}
 
 	for _, migration := range migrations {
