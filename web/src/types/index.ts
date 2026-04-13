@@ -155,3 +155,14 @@ export interface ActivityData {
   active: SyncActivity[];
   recent: SyncActivity[];
 }
+
+export interface Destination {
+  id: string;
+  source_id: string;
+  name: string;
+  dest_url: string;
+  dest_username: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}

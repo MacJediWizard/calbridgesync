@@ -1080,6 +1080,54 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	}
 
 	result.CalendarsSynced = len(sourceCalendars)
+
+	// Multi-destination sync (#156): after syncing to the primary
+	// destination, check for additional destinations and sync to
+	// each one. The primary destination (dest_url on the source
+	// row) always syncs first — additional destinations are
+	// additive. A failure on one additional destination doesn't
+	// prevent others from being tried.
+	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
+	if err != nil {
+		log.Printf("Failed to load additional destinations for source %s: %v", source.Name, err)
+	}
+	for _, dest := range additionalDests {
+		if !dest.Enabled {
+			continue
+		}
+		log.Printf("Syncing to additional destination: %s (%s)", dest.Name, dest.DestURL)
+		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
+		if decErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to decrypt credentials for additional dest %q: %v", dest.Name, decErr))
+			continue
+		}
+		extraDestClient, connErr := NewClient(dest.DestURL, dest.DestUsername, extraDestPassword)
+		if connErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to connect to additional dest %q: %v", dest.Name, connErr))
+			continue
+		}
+		if testErr := extraDestClient.TestConnection(ctx); testErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Connection test failed for additional dest %q: %v", dest.Name, testErr))
+			continue
+		}
+		for i, cal := range sourceCalendars {
+			calResult := se.syncCalendar(ctx, source, sourceClient, extraDestClient, cal, i+1)
+			result.Created += calResult.Created
+			result.Updated += calResult.Updated
+			result.Deleted += calResult.Deleted
+			result.Skipped += calResult.Skipped
+			result.EventsProcessed += calResult.EventsProcessed
+			result.Warnings = append(result.Warnings, calResult.Warnings...)
+			// Errors from additional dests are downgraded to warnings
+			// so a failure on one extra dest doesn't mark the whole
+			// sync as failed.
+			for _, e := range calResult.Errors {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("[additional dest %q] %s", dest.Name, e))
+			}
+		}
+		log.Printf("Completed sync to additional destination: %s", dest.Name)
+	}
+
 	// Success if no critical errors (warnings are OK)
 	result.Success = len(result.Errors) == 0
 	if result.Success && len(result.Warnings) == 0 {
@@ -2261,6 +2309,45 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	result.Errors = append(result.Errors, syncResult.Errors...)
 	result.Warnings = append(result.Warnings, syncResult.Warnings...)
 	result.CalendarsSynced = 1
+
+	// Multi-destination sync (#156): after syncing to the primary
+	// destination, replicate the same ICS events to any additional
+	// destinations. Failures on one extra dest don't block others.
+	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
+	if err != nil {
+		log.Printf("Failed to load additional destinations for ICS source %s: %v", source.Name, err)
+	}
+	for _, dest := range additionalDests {
+		if !dest.Enabled {
+			continue
+		}
+		log.Printf("Syncing ICS feed to additional destination: %s (%s)", dest.Name, dest.DestURL)
+		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
+		if decErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to decrypt credentials for additional dest %q: %v", dest.Name, decErr))
+			continue
+		}
+		extraDestClient, connErr := NewClient(dest.DestURL, dest.DestUsername, extraDestPassword)
+		if connErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to connect to additional dest %q: %v", dest.Name, connErr))
+			continue
+		}
+		if testErr := extraDestClient.TestConnection(ctx); testErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Connection test failed for additional dest %q: %v", dest.Name, testErr))
+			continue
+		}
+		extraResult := se.syncEventsToDestination(ctx, source, nil, extraDestClient, sourceEvents, calendar, 1, db.SyncDirectionOneWay)
+		result.Created += extraResult.Created
+		result.Updated += extraResult.Updated
+		result.Deleted += extraResult.Deleted
+		result.Skipped += extraResult.Skipped
+		result.EventsProcessed += extraResult.EventsProcessed
+		result.Warnings = append(result.Warnings, extraResult.Warnings...)
+		for _, e := range extraResult.Errors {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("[additional dest %q] %s", dest.Name, e))
+		}
+		log.Printf("Completed ICS sync to additional destination: %s", dest.Name)
+	}
 
 	result.Success = len(result.Errors) == 0
 	if result.Success && len(result.Warnings) == 0 {

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
 import { getSource, updateSource, deleteSource, discoverCalendars } from '../services/api';
+import DestinationManager from '../components/DestinationManager';
 import type { Source, Calendar, CalendarConfig } from '../types';
 
 export default function SourceEdit() {
@@ -432,6 +433,13 @@ export default function SourceEdit() {
               </div>
             </div>
           </div>
+
+          {/* Additional Destinations (#156) */}
+          {id && (
+            <div className="border-t border-zinc-800 pt-6">
+              <DestinationManager sourceId={id} />
+            </div>
+          )}
 
           {/* Status Info */}
           {source && (
