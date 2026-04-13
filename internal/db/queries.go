@@ -582,6 +582,59 @@ func (db *DB) UpdateSourceAdaptiveState(sourceID, contentHash string, adaptiveIn
 	return nil
 }
 
+// CreateAuditLog inserts an audit log entry. (#152)
+func (db *DB) CreateAuditLog(log *AuditLog) error {
+	log.ID = uuid.New().String()
+	log.CreatedAt = time.Now().UTC()
+	query := `INSERT INTO audit_logs (id, user_id, action, resource_type, resource_id, details, ip_address, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := db.conn.Exec(query, log.ID, log.UserID, log.Action, log.ResourceType, log.ResourceID, log.Details, log.IPAddress, log.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to create audit log: %w", err)
+	}
+	return nil
+}
+
+// GetAuditLogs returns paginated audit logs for a user. (#152)
+func (db *DB) GetAuditLogs(userID string, page, pageSize int) ([]*AuditLog, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	// Count total
+	var total int
+	row := db.conn.QueryRow(`SELECT COUNT(*) FROM audit_logs WHERE user_id = ?`, userID)
+	if err := row.Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("failed to count audit logs: %w", err)
+	}
+
+	rows, err := db.conn.Query(
+		`SELECT id, user_id, action, resource_type, resource_id, details, ip_address, created_at
+		 FROM audit_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+		userID, pageSize, offset,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query audit logs: %w", err)
+	}
+	defer rows.Close()
+
+	var logs []*AuditLog
+	for rows.Next() {
+		var log AuditLog
+		if err := rows.Scan(&log.ID, &log.UserID, &log.Action, &log.ResourceType, &log.ResourceID, &log.Details, &log.IPAddress, &log.CreatedAt); err != nil {
+			continue
+		}
+		logs = append(logs, &log)
+	}
+
+	totalPages := (total + pageSize - 1) / pageSize
+	return logs, totalPages, nil
+}
+
 // GetSyncLogStats returns aggregate stats about the sync_logs table:
 // total count and oldest log timestamp. Used by the Settings page to
 // show log retention status. (#136)

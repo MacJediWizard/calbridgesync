@@ -249,6 +249,22 @@ func (db *DB) migrate() error {
 		// reduce polling frequency when feed hasn't changed.
 		`ALTER TABLE sources ADD COLUMN last_content_hash TEXT`,
 		`ALTER TABLE sources ADD COLUMN adaptive_interval INTEGER`,
+
+		// Audit log table (#152). Records user actions for
+		// accountability on multi-user instances.
+		`CREATE TABLE IF NOT EXISTS audit_logs (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			action TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_id TEXT,
+			details TEXT,
+			ip_address TEXT,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,
 	}
 
 	for _, migration := range migrations {

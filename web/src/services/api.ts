@@ -168,6 +168,11 @@ export const testWebhook = async (url: string): Promise<void> => {
   await api.post('/settings/alerts/test-webhook', { webhook_url: url });
 };
 
+export const getAuditLogs = async (page: number = 1): Promise<{ logs: { id: string; action: string; resource_type: string; resource_id: string; details: string; ip_address: string; created_at: string }[]; total_pages: number }> => {
+  const response = await api.get(`/audit-logs?page=${page}`);
+  return response.data;
+};
+
 export const exportCalendars = async (): Promise<Blob> => {
   const response = await api.get('/export/calendars', { responseType: 'blob' });
   return response.data;

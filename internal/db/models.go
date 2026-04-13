@@ -279,6 +279,18 @@ type MalformedEvent struct {
 	DiscoveredAt time.Time `json:"discovered_at"`
 }
 
+// AuditLog records a user action for accountability. (#152)
+type AuditLog struct {
+	ID           string    `json:"id"`
+	UserID       string    `json:"user_id"`
+	Action       string    `json:"action"`
+	ResourceType string    `json:"resource_type"`
+	ResourceID   string    `json:"resource_id"`
+	Details      string    `json:"details"`
+	IPAddress    string    `json:"ip_address"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
 // SourceStats holds per-source statistics for the dashboard. (#136)
 type SourceStats struct {
 	SyncedEventCount int           `json:"synced_event_count"`
