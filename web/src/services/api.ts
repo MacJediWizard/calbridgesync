@@ -100,6 +100,20 @@ export const triggerSync = async (id: string): Promise<void> => {
   await api.post(`/sources/${id}/sync`);
 };
 
+export const dryRunSync = async (id: string): Promise<{
+  success: boolean;
+  created: number;
+  updated: number;
+  deleted: number;
+  skipped: number;
+  dry_run: boolean;
+  message: string;
+  warnings?: string[];
+}> => {
+  const response = await api.post(`/sources/${id}/sync?dry_run=true`);
+  return response.data;
+};
+
 export const getSourceStats = async (id: string): Promise<{
   synced_event_count: number;
   malformed_count: number;

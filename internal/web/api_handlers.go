@@ -870,10 +870,20 @@ func (h *Handlers) APITriggerSync(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	// Use timing-safe query that combines ID and user check
-	_, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
+	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+
+	// Dry-run mode: run the sync synchronously with a dry-run
+	// context so PutEvent/DeleteEvent are no-ops. Returns the
+	// SyncResult as JSON so the user can preview what would
+	// happen without actually changing any data. (#150)
+	if c.Query("dry_run") == "true" {
+		ctx := caldav.WithDryRun(c.Request.Context())
+		result := h.syncEngine.SyncSource(ctx, source)
+		c.JSON(http.StatusOK, result)
 		return
 	}
 
