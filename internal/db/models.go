@@ -279,6 +279,22 @@ type MalformedEvent struct {
 	DiscoveredAt time.Time `json:"discovered_at"`
 }
 
+// Destination is an additional sync destination for a source.
+// The primary destination lives on the Source row (dest_url etc.);
+// entries in this table are ADDITIONAL destinations that the sync
+// engine can push to. (#154)
+type Destination struct {
+	ID           string    `json:"id"`
+	SourceID     string    `json:"source_id"`
+	Name         string    `json:"name"`
+	DestURL      string    `json:"dest_url"`
+	DestUsername string    `json:"dest_username"`
+	DestPassword string    `json:"-"`
+	Enabled      bool      `json:"enabled"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 // AuditLog records a user action for accountability. (#152)
 type AuditLog struct {
 	ID           string    `json:"id"`

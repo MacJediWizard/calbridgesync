@@ -78,6 +78,9 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		protectedAPI.PUT("/settings/alerts", h.APIUpdateAlertPreferences)
 		protectedAPI.GET("/settings/log-stats", h.APIGetLogStats)
 		protectedAPI.GET("/audit-logs", h.APIGetAuditLogs)
+		protectedAPI.GET("/sources/:id/destinations", h.APIListDestinations)
+		protectedAPI.POST("/sources/:id/destinations", h.APICreateDestination)
+		protectedAPI.DELETE("/sources/:id/destinations/:destId", h.APIDeleteDestination)
 		protectedAPI.GET("/activity", h.APIGetActivity)
 	}
 
