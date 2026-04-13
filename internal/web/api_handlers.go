@@ -304,6 +304,51 @@ func (h *Handlers) APIAuthStatus(c *gin.Context) {
 	})
 }
 
+// audit logs a user action for the audit trail. Best-effort —
+// a failed audit write doesn't block the user's operation. (#152)
+func (h *Handlers) audit(c *gin.Context, action, resourceType, resourceID, details string) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		return
+	}
+	if err := h.db.CreateAuditLog(&db.AuditLog{
+		UserID:       session.UserID,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Details:      details,
+		IPAddress:    c.ClientIP(),
+	}); err != nil {
+		log.Printf("Failed to create audit log: %v", err)
+	}
+}
+
+// APIGetAuditLogs returns paginated audit logs for the current
+// user. (#152)
+func (h *Handlers) APIGetAuditLogs(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	page := 1
+	if p := c.Query("page"); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	logs, totalPages, err := h.db.GetAuditLogs(session.UserID, page, 50)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load audit logs"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"logs":        logs,
+		"total_pages": totalPages,
+		"page":        page,
+	})
+}
+
 // APIGetVersion returns the build version of the calbridgesync binary.
 // Unauthenticated — available on the public API group so the login
 // page and footer can display the version without a session.
@@ -827,6 +872,7 @@ func (h *Handlers) APIDeleteSource(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, "source.delete", "source", sourceID, "")
 	c.JSON(http.StatusOK, gin.H{"message": "Source deleted"})
 }
 
@@ -889,6 +935,7 @@ func (h *Handlers) APITriggerSync(c *gin.Context) {
 
 	h.scheduler.TriggerSync(sourceID)
 
+	h.audit(c, "sync.trigger", "source", sourceID, "")
 	c.JSON(http.StatusOK, gin.H{"message": "Sync triggered"})
 }
 
