@@ -1007,13 +1007,24 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		return result
 	}
 
-	// Test connections
-	if err := sourceClient.TestConnection(ctx); err != nil {
-		result.Message = "Source connection test failed"
-		result.Errors = append(result.Errors, err.Error())
-		result.Duration = time.Since(start)
-		se.finishSync(source.ID, result)
-		return result
+	// Test connections — Google CalDAV doesn't support the standard
+	// FindCurrentUserPrincipal PROPFIND, so we use a different test. (#160)
+	if source.SourceType == db.SourceTypeGoogle {
+		if err := sourceClient.TestConnectionGoogle(ctx); err != nil {
+			result.Message = "Source connection test failed"
+			result.Errors = append(result.Errors, err.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+	} else {
+		if err := sourceClient.TestConnection(ctx); err != nil {
+			result.Message = "Source connection test failed"
+			result.Errors = append(result.Errors, err.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
 	}
 
 	if err := destClient.TestConnection(ctx); err != nil {
@@ -1024,8 +1035,13 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		return result
 	}
 
-	// Find calendars on source
-	sourceCalendars, err := sourceClient.FindCalendars(ctx)
+	// Find calendars on source — Google needs a different discovery path. (#160)
+	var sourceCalendars []Calendar
+	if source.SourceType == db.SourceTypeGoogle {
+		sourceCalendars, err = sourceClient.FindCalendarsGoogle(ctx)
+	} else {
+		sourceCalendars, err = sourceClient.FindCalendars(ctx)
+	}
 	if err != nil {
 		result.Message = "Failed to find source calendars"
 		result.Errors = append(result.Errors, err.Error())
