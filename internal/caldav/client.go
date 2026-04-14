@@ -227,36 +227,25 @@ func (c *Client) FindCalendars(ctx context.Context) ([]Calendar, error) {
 	return calendars, nil
 }
 
-// FindCalendarsGoogle discovers calendars on Google CalDAV by skipping
-// principal discovery (which Google doesn't support) and going directly
-// to the calendar home set. Google's CalDAV structure is:
+// FindCalendarsGoogle returns the known calendar for a Google CalDAV source.
+// Google doesn't support standard CalDAV discovery (neither principal nor
+// calendar home set PROPFIND), so we construct the calendar path directly.
+// Google's primary calendar is always at /caldav/v2/{email}/events/.
 //
-//	/caldav/v2/{email}/         — calendar home set
-//	/caldav/v2/{email}/events/  — primary calendar
+// The baseURL is expected to be:
 //
-// The baseURL is expected to be https://apidata.googleusercontent.com/caldav/v2/{email}/user
-// so we derive the home set by stripping "/user". (#160)
+//	https://apidata.googleusercontent.com/caldav/v2/{email}/user
+//
+// We derive the events path by replacing "/user" with "/events/". (#160)
 func (c *Client) FindCalendarsGoogle(ctx context.Context) ([]Calendar, error) {
-	// Derive calendar home set from baseURL: strip "/user" suffix
-	homeSet := strings.TrimSuffix(c.baseURL, "/user")
-	homeSet = strings.TrimSuffix(homeSet, "/")
-	homeSet += "/"
+	eventsPath := strings.TrimSuffix(c.baseURL, "/user")
+	eventsPath = strings.TrimSuffix(eventsPath, "/")
+	eventsPath += "/events/"
 
-	cals, err := c.caldavClient.FindCalendars(ctx, homeSet)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to find Google calendars at %s: %w", ErrConnectionFailed, homeSet, err)
-	}
-
-	calendars := make([]Calendar, 0, len(cals))
-	for _, cal := range cals {
-		calendars = append(calendars, Calendar{
-			Path:        cal.Path,
-			Name:        cal.Name,
-			Description: cal.Description,
-		})
-	}
-
-	return calendars, nil
+	return []Calendar{{
+		Path: eventsPath,
+		Name: "Google Calendar",
+	}}, nil
 }
 
 // GetEvents retrieves all events from a calendar.
