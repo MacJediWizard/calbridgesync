@@ -62,20 +62,5 @@ services:
       retries: 3
       start_period: 10s
 
-  caldav-proxy:
-    image: caldav-proxy:latest
-    container_name: caldav-proxy
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8687:8080"
-    environment:
-      - CALDAV_PROXY_LISTEN=:8080
-      - CALDAV_PROXY_BACKEND=${CALDAV_PROXY_BACKEND:-https://mail.macjediwizard.com}
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
 volumes:
   calbridgesync_data:
