@@ -238,7 +238,14 @@ func (c *Client) FindCalendars(ctx context.Context) ([]Calendar, error) {
 //
 // We derive the events path by replacing "/user" with "/events/". (#160)
 func (c *Client) FindCalendarsGoogle(ctx context.Context) ([]Calendar, error) {
-	eventsPath := strings.TrimSuffix(c.baseURL, "/user")
+	// Extract just the path portion from the full base URL.
+	// baseURL: https://apidata.googleusercontent.com/caldav/v2/{email}/user
+	// We need: /caldav/v2/{email}/events/
+	parsed, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to parse base URL: %w", ErrConnectionFailed, err)
+	}
+	eventsPath := strings.TrimSuffix(parsed.Path, "/user")
 	eventsPath = strings.TrimSuffix(eventsPath, "/")
 	eventsPath += "/events/"
 
