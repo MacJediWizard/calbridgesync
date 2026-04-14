@@ -28,6 +28,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	authRateLimiter := RateLimiter(5, 10)
 	authGroup := r.Group("/auth")
 	authGroup.Use(authRateLimiter)
+	authGroup.Use(auth.OptionalAuth(sm)) // Hydrate session context so Google OAuth callback can read the user (#160)
 	{
 		authGroup.GET("/login", h.Login)
 		authGroup.POST("/login", h.Login)
