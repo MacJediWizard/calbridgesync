@@ -326,11 +326,8 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 
 	// Read back the pending form data BEFORE exchanging the code, so
 	// we have the per-source client_id and client_secret to build the
-	// oauth2.Config that the exchange call needs. As of #79 these
-	// credentials live on each source, not in global env vars, so the
-	// pending session cookie is the only place they exist between the
-	// prepare step and this callback. GetPendingGoogleSource also
-	// clears the cookie.
+	// oauth2.Config that the exchange call needs. GetPendingGoogleSource
+	// also clears the cookie (consume-once semantics).
 	pending, err := h.session.GetPendingGoogleSource(c.Writer, c.Request)
 	if err != nil {
 		log.Printf("Google OAuth callback: no pending source in session: %v", err)
@@ -398,7 +395,8 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 
 	session := auth.GetCurrentUser(c)
 	if session == nil {
-		c.Redirect(http.StatusFound, "/auth/login")
+		log.Printf("Google OAuth callback: no authenticated session; redirecting to /auth/login")
+		c.Redirect(http.StatusFound, "/auth/login?error=session_lost")
 		return
 	}
 
