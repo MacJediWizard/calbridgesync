@@ -190,6 +190,14 @@ func (c *Client) TestConnection(ctx context.Context) error {
 	return nil
 }
 
+// TestConnectionGoogle tests a Google CalDAV connection by listing
+// calendars directly, since Google doesn't support the standard
+// FindCurrentUserPrincipal PROPFIND. (#160)
+func (c *Client) TestConnectionGoogle(ctx context.Context) error {
+	_, err := c.FindCalendarsGoogle(ctx)
+	return err
+}
+
 // FindCalendars discovers all calendars for the current user.
 func (c *Client) FindCalendars(ctx context.Context) ([]Calendar, error) {
 	principal, err := c.caldavClient.FindCurrentUserPrincipal(ctx)
@@ -205,6 +213,38 @@ func (c *Client) FindCalendars(ctx context.Context) ([]Calendar, error) {
 	cals, err := c.caldavClient.FindCalendars(ctx, homeSet)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to find calendars: %w", ErrConnectionFailed, err)
+	}
+
+	calendars := make([]Calendar, 0, len(cals))
+	for _, cal := range cals {
+		calendars = append(calendars, Calendar{
+			Path:        cal.Path,
+			Name:        cal.Name,
+			Description: cal.Description,
+		})
+	}
+
+	return calendars, nil
+}
+
+// FindCalendarsGoogle discovers calendars on Google CalDAV by skipping
+// principal discovery (which Google doesn't support) and going directly
+// to the calendar home set. Google's CalDAV structure is:
+//
+//	/caldav/v2/{email}/         — calendar home set
+//	/caldav/v2/{email}/events/  — primary calendar
+//
+// The baseURL is expected to be https://apidata.googleusercontent.com/caldav/v2/{email}/user
+// so we derive the home set by stripping "/user". (#160)
+func (c *Client) FindCalendarsGoogle(ctx context.Context) ([]Calendar, error) {
+	// Derive calendar home set from baseURL: strip "/user" suffix
+	homeSet := strings.TrimSuffix(c.baseURL, "/user")
+	homeSet = strings.TrimSuffix(homeSet, "/")
+	homeSet += "/"
+
+	cals, err := c.caldavClient.FindCalendars(ctx, homeSet)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to find Google calendars at %s: %w", ErrConnectionFailed, homeSet, err)
 	}
 
 	calendars := make([]Calendar, 0, len(cals))
