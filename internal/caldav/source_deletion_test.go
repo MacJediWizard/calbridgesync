@@ -291,3 +291,58 @@ func TestPlanTwoWaySourceDeletion_SymmetricWithDestDeletion(t *testing.T) {
 		})
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Rule 4 (source direction): prev.DestETag must be non-empty to qualify as
+// a source-deletion candidate. Symmetric to the planTwoWayDeletion gate
+// added in #171.
+// -----------------------------------------------------------------------------
+
+// TestPlanTwoWaySourceDeletion_ForwardCreateOnlyPriorIsSkipped locks
+// in the symmetric source-side gate. A synced_events row with
+// SourceETag set but empty DestETag represents "forward-create wrote
+// this UID to dest but we never observed it coming back on the next
+// cycle's PROPFIND." Without a confirmed DestETag, the source side
+// of this sync has no authority to propagate a delete back to source
+// just because dest no longer returns the UID.
+//
+// Without this gate, a flaky dest PROPFIND response that dropped
+// specific UIDs would cause us to delete them from source on the
+// next cycle — a different flavor of the #171 fight loop but in
+// the reverse direction.
+func TestPlanTwoWaySourceDeletion_ForwardCreateOnlyPriorIsSkipped(t *testing.T) {
+	source := newEventMap("a", "b", "fc1", "fc2") // all four still on source
+	dest := newEventMap("a", "b")                 // "fc1" and "fc2" missing from dest
+	prior := newPriorMap("a", "b")
+	fc := newPriorMapForwardCreateOnly("fc1", "fc2")
+	for k, v := range fc {
+		prior[k] = v
+	}
+
+	toDelete, warning := planTwoWaySourceDeletion(source, dest, prior, 0.5)
+
+	if warning != "" {
+		t.Errorf("no guard should fire; got warning: %q", warning)
+	}
+	if len(toDelete) != 0 {
+		t.Errorf("forward-create-only priors must NOT be source-delete candidates; got %v - this is the symmetric #171 regression",
+			toDelete)
+	}
+}
+
+// TestPlanTwoWaySourceDeletion_ConfirmedDestETagStillDeletes: the
+// over-blocking sanity check for the source direction.
+func TestPlanTwoWaySourceDeletion_ConfirmedDestETagStillDeletes(t *testing.T) {
+	source := newEventMap("a", "b", "c") // all three still on source
+	dest := newEventMap("a", "b")        // "c" deleted from dest
+	prior := newPriorMap("a", "b", "c")  // all three have confirmed both ETags
+
+	toDelete, warning := planTwoWaySourceDeletion(source, dest, prior, 0.5)
+
+	if warning != "" {
+		t.Errorf("no guard should fire; got: %q", warning)
+	}
+	if len(toDelete) != 1 || toDelete[0] != "c" {
+		t.Errorf("expected ['c'] (confirmed dest deletion), got %v", toDelete)
+	}
+}

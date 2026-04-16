@@ -311,11 +311,23 @@ func planTwoWayDeletion(
 	}
 	// Build candidate list: previously-synced UIDs that no longer
 	// exist on source but still exist on destination.
+	//
+	// Rule 4 (#171): require prev.SourceETag != "" on the candidate.
+	// A synced_events row with an empty SourceETag means "we wrote a
+	// tracking entry but never observed this UID on the source side"
+	// — the exact shape reverse-create leaves behind when the PUT
+	// "succeeded" but the source server didn't persist it in a way
+	// we can read back (e.g., Google CalDAV silently dropping
+	// non-conforming writes). Treating that row as evidence of
+	// source ownership then fires a spurious delete-from-dest every
+	// cycle, which is the fight loop that chewed up William's
+	// Google→SOGo sync. Without a confirmed SourceETag, this source
+	// has no authority to propagate a delete for this UID.
 	candidates := make([]string, 0)
-	for uid := range previouslySyncedMap {
+	for uid, prev := range previouslySyncedMap {
 		_, existsOnSource := sourceEventMap[uid]
 		_, existsOnDest := destEventMap[uid]
-		if !existsOnSource && existsOnDest {
+		if !existsOnSource && existsOnDest && prev.SourceETag != "" {
 			candidates = append(candidates, uid)
 		}
 	}
@@ -396,11 +408,19 @@ func planTwoWaySourceDeletion(
 	}
 	// Build candidate list: previously-synced UIDs that still exist
 	// on source but no longer exist on destination.
+	//
+	// Rule 4 (#171): require prev.DestETag != "" on the candidate —
+	// symmetric to the gate in planTwoWayDeletion. A synced_events
+	// row with an empty DestETag means "we wrote a tracking entry
+	// but never observed this UID on the destination side." Without
+	// a confirmed DestETag we cannot claim this source ever owned
+	// the dest copy, so we have no authority to propagate a delete
+	// back to source just because dest no longer returns the UID.
 	candidates := make([]string, 0)
-	for uid := range previouslySyncedMap {
+	for uid, prev := range previouslySyncedMap {
 		_, existsOnSource := sourceEventMap[uid]
 		_, existsOnDest := destEventMap[uid]
-		if existsOnSource && !existsOnDest {
+		if existsOnSource && !existsOnDest && prev.DestETag != "" {
 			candidates = append(candidates, uid)
 		}
 	}
