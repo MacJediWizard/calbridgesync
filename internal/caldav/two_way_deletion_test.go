@@ -31,10 +31,61 @@ import (
 // Helpers
 // -----------------------------------------------------------------------------
 
+// newPriorMap builds a map of realistic steady-state synced_events
+// rows — both SourceETag and DestETag populated. This matches what
+// the upsert path writes after a forward-created (or forward-updated)
+// event has completed one full sync cycle. The deletion-planning
+// helpers (#171) require a non-empty "other side" ETag to classify
+// a UID as a deletion candidate, so tests that want deletion
+// behavior MUST start from a prior map with both ETags set.
+//
+// For the bug scenario where a reverse-create wrote a tracking row
+// with only DestETag (because the source PUT returned no ETag to
+// read), use newPriorMapReverseCreateOnly.
 func newPriorMap(uids ...string) map[string]*db.SyncedEvent {
 	m := make(map[string]*db.SyncedEvent, len(uids))
 	for _, uid := range uids {
-		m[uid] = &db.SyncedEvent{EventUID: uid}
+		m[uid] = &db.SyncedEvent{
+			EventUID:   uid,
+			SourceETag: "src-" + uid,
+			DestETag:   "dest-" + uid,
+		}
+	}
+	return m
+}
+
+// newPriorMapReverseCreateOnly builds rows that represent a
+// reverse-create whose source-side landing was never verified — only
+// DestETag is set, SourceETag is empty. This is the exact shape of
+// the synced_events rows that triggered the Google→SOGo fight loop
+// in #171: Google's reaper saw these as "in prior map, not on source,
+// on dest → delete" and deleted iCloud-origin events from SOGo every
+// cycle, which iCloud then recreated.
+func newPriorMapReverseCreateOnly(uids ...string) map[string]*db.SyncedEvent {
+	m := make(map[string]*db.SyncedEvent, len(uids))
+	for _, uid := range uids {
+		m[uid] = &db.SyncedEvent{
+			EventUID: uid,
+			DestETag: "dest-" + uid,
+			// SourceETag intentionally empty
+		}
+	}
+	return m
+}
+
+// newPriorMapForwardCreateOnly is the symmetric shape for the other
+// deletion direction: SourceETag set, DestETag empty. Would be the
+// output of a forward-create whose dest ETag was never observed
+// (PutEvent does not return dest ETag, and we cannot read it back
+// before cycle 2). Used by planTwoWaySourceDeletion tests.
+func newPriorMapForwardCreateOnly(uids ...string) map[string]*db.SyncedEvent {
+	m := make(map[string]*db.SyncedEvent, len(uids))
+	for _, uid := range uids {
+		m[uid] = &db.SyncedEvent{
+			EventUID:   uid,
+			SourceETag: "src-" + uid,
+			// DestETag intentionally empty
+		}
 	}
 	return m
 }
@@ -332,4 +383,88 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// -----------------------------------------------------------------------------
+// Rule 4: prev.SourceETag must be non-empty to qualify as a delete candidate
+// (#171 — the Google→SOGo fight-loop fix)
+// -----------------------------------------------------------------------------
+
+// TestPlanTwoWayDeletion_ReverseCreateOnlyPriorIsSkipped is the
+// direct regression test for the fight loop in #171.
+//
+// Setup: two UIDs, both with only DestETag recorded (reverse-create
+// shape — we wrote a tracking row when the source PUT returned 200,
+// but never observed the source side of this UID). Both are missing
+// from source now and still present on dest. Without the gate, the
+// old code classified these as "deleted from source, propagate to
+// dest," which fired a DELETE to SOGo. iCloud's next cycle then
+// recreated them in SOGo. Repeat every ~15 minutes forever.
+//
+// With the gate, prev.SourceETag == "" disqualifies them from the
+// candidate list. Dest keeps the events. iCloud remains the
+// authoritative writer. No fight loop.
+func TestPlanTwoWayDeletion_ReverseCreateOnlyPriorIsSkipped(t *testing.T) {
+	source := newEventMap("kept-by-other-source-1", "kept-by-other-source-2")
+	// Source does NOT have the two reverse-created UIDs.
+	dest := newEventMap("kept-by-other-source-1", "kept-by-other-source-2", "icloud-uid-a", "icloud-uid-b")
+	// Prior map has realistic rows for the two source-owned UIDs and
+	// reverse-create-only rows for the two iCloud-origin UIDs.
+	prior := newPriorMap("kept-by-other-source-1", "kept-by-other-source-2")
+	rc := newPriorMapReverseCreateOnly("icloud-uid-a", "icloud-uid-b")
+	for k, v := range rc {
+		prior[k] = v
+	}
+
+	toDelete, warning := planTwoWayDeletion(source, dest, prior, 0.5)
+
+	if warning != "" {
+		t.Errorf("no guard should fire in this scenario; got warning: %q", warning)
+	}
+	if len(toDelete) != 0 {
+		t.Errorf("reverse-create-only priors must NOT be delete candidates; got %d candidates: %v - this is the #171 regression",
+			len(toDelete), toDelete)
+	}
+}
+
+// TestPlanTwoWayDeletion_ConfirmedSourceETagStillDeletes verifies
+// that the gate does not over-block — legitimate source-deletions
+// (prior rows with confirmed SourceETag) still get propagated to
+// dest as before.
+func TestPlanTwoWayDeletion_ConfirmedSourceETagStillDeletes(t *testing.T) {
+	source := newEventMap("a", "b") // "c" was deleted from source
+	dest := newEventMap("a", "b", "c")
+	prior := newPriorMap("a", "b", "c") // all three have both ETags
+
+	toDelete, warning := planTwoWayDeletion(source, dest, prior, 0.5)
+
+	if warning != "" {
+		t.Errorf("no guard should fire; got: %q", warning)
+	}
+	if len(toDelete) != 1 || toDelete[0] != "c" {
+		t.Errorf("expected ['c'] as delete candidate (confirmed source deletion), got %v", toDelete)
+	}
+}
+
+// TestPlanTwoWayDeletion_MixedPriorsDeletesOnlyConfirmed exercises
+// the fix in the realistic scenario where a single cycle sees both
+// legitimate source-deletions AND reverse-create-only tracking
+// rows. Only the former should land in the delete list.
+func TestPlanTwoWayDeletion_MixedPriorsDeletesOnlyConfirmed(t *testing.T) {
+	source := newEventMap("a") // "b" deleted from source; reverse-create UIDs never in source
+	dest := newEventMap("a", "b", "rc1", "rc2")
+	prior := newPriorMap("a", "b")
+	rc := newPriorMapReverseCreateOnly("rc1", "rc2")
+	for k, v := range rc {
+		prior[k] = v
+	}
+
+	toDelete, warning := planTwoWayDeletion(source, dest, prior, 0.5)
+
+	if warning != "" {
+		t.Errorf("no guard should fire; got: %q", warning)
+	}
+	if len(toDelete) != 1 || toDelete[0] != "b" {
+		t.Errorf("expected only ['b'] (confirmed source deletion) — 'rc1' and 'rc2' must be gated out; got %v", toDelete)
+	}
 }
