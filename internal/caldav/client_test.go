@@ -1916,3 +1916,21 @@ func TestClientWithTestServer(t *testing.T) {
 		}
 	})
 }
+
+func TestIsGoogleURL(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{"https://apidata.googleusercontent.com/caldav/v2/user@gmail.com/user", true},
+		{"https://apidata.googleusercontent.com/caldav/v2/user@gmail.com/events/", true},
+		{"https://caldav.icloud.com/12345/calendars/home/", false},
+		{"https://sogo.example.com/SOGo/dav/user/Calendar/personal/", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := IsGoogleURL(tt.url); got != tt.want {
+			t.Errorf("IsGoogleURL(%q) = %v, want %v", tt.url, got, tt.want)
+		}
+	}
+}
