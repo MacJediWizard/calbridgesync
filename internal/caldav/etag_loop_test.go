@@ -246,3 +246,107 @@ func TestEtagHelpers_BothSidesUnchangedTable(t *testing.T) {
 		})
 	}
 }
+
+// -----------------------------------------------------------------------------
+// isRealConflictSourceWins / isRealConflictDestWins — #169 refinement
+// -----------------------------------------------------------------------------
+//
+// Prior to #169 the CONFLICT:source_wins log line fired on EVERY
+// successful source→dest update in two-way mode. For the Google→SOGo
+// sync that was landing via PR #168, that produced one CONFLICT
+// warning per event per cycle — 14 on the first post-fix cycle —
+// which drowned the UI warnings list in false-positive "conflicts"
+// that were in fact just routine source-to-dest propagation.
+//
+// These tests lock in the refined definition: a CONFLICT is logged
+// ONLY when both sides moved independently since the last sync,
+// detected by comparing the "other side's" current ETag against the
+// one recorded on the previous cycle.
+
+// TestIsRealConflictSourceWins_NilPrevReturnsFalse: no prior sync
+// record means we cannot tell whether dest moved independently.
+// Default to "not a conflict" to keep the warnings list clean.
+// First-time syncs never log CONFLICT.
+func TestIsRealConflictSourceWins_NilPrevReturnsFalse(t *testing.T) {
+	if isRealConflictSourceWins(nil, "any-dest-etag") {
+		t.Error("nil prev must not be treated as a real conflict")
+	}
+}
+
+// TestIsRealConflictSourceWins_EmptyStoredDestETagReturnsFalse: prev
+// exists but we never recorded a DestETag (e.g., first cycle after
+// create, or legacy record migration). Cannot compare — not a
+// conflict until next cycle has a reference point.
+func TestIsRealConflictSourceWins_EmptyStoredDestETagReturnsFalse(t *testing.T) {
+	prev := &db.SyncedEvent{SourceETag: "src-v1", DestETag: ""}
+	if isRealConflictSourceWins(prev, "dest-v1") {
+		t.Error("empty stored DestETag must not be treated as a real conflict")
+	}
+}
+
+// TestIsRealConflictSourceWins_DestUnchangedReturnsFalse: the steady-
+// state no-conflict case. Dest ETag matches what we recorded last
+// cycle, meaning dest did NOT move independently. Source moved
+// (we're only called from the forward-update branch), so this is a
+// routine propagation, not a conflict. This is the 99% case the
+// #169 refinement is targeting.
+func TestIsRealConflictSourceWins_DestUnchangedReturnsFalse(t *testing.T) {
+	prev := &db.SyncedEvent{SourceETag: "src-v1", DestETag: "dest-v1"}
+	if isRealConflictSourceWins(prev, "dest-v1") {
+		t.Error("unchanged dest ETag must not be treated as a conflict — it's a routine update")
+	}
+}
+
+// TestIsRealConflictSourceWins_DestMovedReturnsTrue: the real-
+// conflict case. Between our last sync and this one, dest's ETag
+// changed — someone edited it independently (SOGo web UI, iPhone,
+// email invite). We're now overwriting that edit per source_wins.
+// This is the scenario the CONFLICT log line is designed to surface.
+func TestIsRealConflictSourceWins_DestMovedReturnsTrue(t *testing.T) {
+	prev := &db.SyncedEvent{SourceETag: "src-v1", DestETag: "dest-v1"}
+	if !isRealConflictSourceWins(prev, "dest-v2-independently-edited") {
+		t.Error("changed dest ETag with a recorded prior value must be treated as a real conflict")
+	}
+}
+
+// TestIsRealConflictDestWins_NilPrevReturnsFalse: symmetric to the
+// source_wins nil-prev case. Reverse path is only reached when
+// shouldUpdateSourceFromDest returned true, which itself returns
+// false for nil prev, so in practice this branch won't be called
+// with nil — but the helper is defensive and returns false anyway.
+func TestIsRealConflictDestWins_NilPrevReturnsFalse(t *testing.T) {
+	if isRealConflictDestWins(nil, "any-source-etag") {
+		t.Error("nil prev must not be treated as a real conflict")
+	}
+}
+
+// TestIsRealConflictDestWins_EmptyStoredSourceETagReturnsFalse: prev
+// exists but we never recorded a SourceETag. Cannot compare — not a
+// conflict.
+func TestIsRealConflictDestWins_EmptyStoredSourceETagReturnsFalse(t *testing.T) {
+	prev := &db.SyncedEvent{SourceETag: "", DestETag: "dest-v1"}
+	if isRealConflictDestWins(prev, "src-v1") {
+		t.Error("empty stored SourceETag must not be treated as a real conflict")
+	}
+}
+
+// TestIsRealConflictDestWins_SourceUnchangedReturnsFalse: steady-
+// state reverse update. Dest moved (loop guard proved it), source
+// did not. Routine dest→source propagation, not a conflict.
+func TestIsRealConflictDestWins_SourceUnchangedReturnsFalse(t *testing.T) {
+	prev := &db.SyncedEvent{SourceETag: "src-v1", DestETag: "dest-v1"}
+	if isRealConflictDestWins(prev, "src-v1") {
+		t.Error("unchanged source ETag must not be treated as a conflict")
+	}
+}
+
+// TestIsRealConflictDestWins_SourceMovedReturnsTrue: real reverse-
+// direction conflict. Dest moved (loop guard), source ALSO moved
+// since last sync. Dest_wins policy overwrites source's independent
+// edit — surface as a conflict.
+func TestIsRealConflictDestWins_SourceMovedReturnsTrue(t *testing.T) {
+	prev := &db.SyncedEvent{SourceETag: "src-v1", DestETag: "dest-v1"}
+	if !isRealConflictDestWins(prev, "src-v2-independently-edited") {
+		t.Error("changed source ETag with a recorded prior value must be treated as a real conflict")
+	}
+}

@@ -221,6 +221,39 @@ func shouldUpdateSourceFromDest(destETag string, prev *db.SyncedEvent) bool {
 	return prev.DestETag != destETag
 }
 
+// isRealConflictSourceWins reports whether a successful source→dest
+// update should be surfaced to the UI as a conflict. A routine
+// propagation where only source moved is NOT a conflict — it's just
+// an update. A real conflict requires dest to also have moved
+// independently since our last recorded sync, detected by the
+// destination's current ETag differing from the one we stored on
+// the previous cycle.
+//
+// Returns false if prev is nil or prev.DestETag is empty — we cannot
+// tell whether dest moved if we don't have a reference point, so we
+// default to "not a conflict" to keep the warnings list clean. The
+// next cycle will have a recorded dest ETag to compare against.
+// (#136, refined in #169)
+func isRealConflictSourceWins(prev *db.SyncedEvent, currentDestETag string) bool {
+	if prev == nil || prev.DestETag == "" {
+		return false
+	}
+	return currentDestETag != prev.DestETag
+}
+
+// isRealConflictDestWins is the reverse-path mirror: a real conflict
+// requires source to also have moved since our last recorded sync.
+// Reaching the dest→source update branch already proves dest moved
+// (shouldUpdateSourceFromDest is the loop guard), so the only extra
+// check needed here is "did source also move independently".
+// (#136, refined in #169)
+func isRealConflictDestWins(prev *db.SyncedEvent, currentSourceETag string) bool {
+	if prev == nil || prev.SourceETag == "" {
+		return false
+	}
+	return currentSourceETag != prev.SourceETag
+}
+
 // planTwoWayDeletion determines which destination events should be
 // deleted because they were removed from source during a two-way sync.
 // It is the dest-deletion mirror of planOrphanDeletion (one-way) and
@@ -1844,10 +1877,27 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				}
 			} else {
 				result.Updated++
-				// Log conflict resolution for the UI (#136).
-				// In two-way mode, pushing source → dest means source
-				// won this conflict (or it's source_wins default).
-				if syncDirection == db.SyncDirectionTwoWay {
+				// Log conflict resolution for the UI (#136, refined in #169).
+				//
+				// A routine source→dest update is NOT a conflict — it's
+				// just source moving forward while dest stayed put. A
+				// real conflict requires BOTH sides to have moved
+				// independently since our last recorded sync. We detect
+				// that by checking whether the current dest ETag differs
+				// from the one we stored at the previous cycle. If it
+				// does, dest was edited independently (by the SOGo web
+				// UI, an iPhone, an email invite, etc.) between cycles,
+				// and this PUT is overwriting that independent edit per
+				// the source_wins strategy — a real conflict worth
+				// surfacing to the user.
+				//
+				// Prior to #169 this log fired on every successful
+				// source→dest update in two-way mode, producing one
+				// CONFLICT line per event per cycle and drowning the
+				// warnings list in false-positive "conflicts" that were
+				// in fact just routine propagation.
+				if syncDirection == db.SyncDirectionTwoWay &&
+					isRealConflictSourceWins(previouslySyncedMap[sourceEvent.UID], destEvent.ETag) {
 					result.Warnings = append(result.Warnings, fmt.Sprintf(
 						"CONFLICT:{\"uid\":%q,\"winner\":\"source\",\"summary\":%q,\"strategy\":%q}",
 						sourceEvent.UID, sourceEvent.Summary, source.ConflictStrategy))
@@ -2042,11 +2092,20 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					}
 				} else {
 					result.Updated++
-					// Log conflict resolution for the UI (#136).
-					// Pushing dest → source means dest won this conflict.
-					result.Warnings = append(result.Warnings, fmt.Sprintf(
-						"CONFLICT:{\"uid\":%q,\"winner\":\"dest\",\"summary\":%q,\"strategy\":%q}",
-						destEvent.UID, destEvent.Summary, source.ConflictStrategy))
+					// Log conflict resolution for the UI (#136, refined in #169).
+					// Symmetric to the forward path: only log a real
+					// conflict when BOTH sides moved since our last
+					// sync. Reaching this branch already proves dest
+					// moved (shouldUpdateSourceFromDest returned true
+					// at the loop guard above). Additionally require
+					// that source also moved since its previously
+					// tracked ETag — otherwise this is a routine
+					// dest→source update, not a conflict.
+					if isRealConflictDestWins(previouslySyncedMap[destEvent.UID], sourceEvent.ETag) {
+						result.Warnings = append(result.Warnings, fmt.Sprintf(
+							"CONFLICT:{\"uid\":%q,\"winner\":\"dest\",\"summary\":%q,\"strategy\":%q}",
+							destEvent.UID, destEvent.Summary, source.ConflictStrategy))
+					}
 					// Record the dest ETag we just propagated back
 					// to source so the next cycle can detect another
 					// dest-side change. We don't know the new source
