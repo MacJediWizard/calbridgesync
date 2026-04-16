@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -840,10 +841,130 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 	log.Printf("PutEvent: putting to path %s", path)
 	_, err = c.caldavClient.PutCalendarObject(ctx, path, cal)
 	if err != nil {
+		// SOGo (and other RFC-5546-strict servers) reject a PUT when the
+		// incoming SEQUENCE is lower than what they already have stored
+		// for this UID, returning 403 with body `<D:error>sequences don't
+		// match</D:error>`. Google Calendar emits SEQUENCE:0 for nearly
+		// every event, so any event that was previously written to the
+		// destination at SEQUENCE >= 1 (by another client or an earlier
+		// calbridgesync run) will be refused every cycle forever.
+		//
+		// On 403 we try once to recover: GET the existing event at the
+		// same path, extract its SEQUENCE, rewrite our outbound payload
+		// to SEQUENCE = existing + 1, and retry the PUT. If the retry
+		// succeeds we return nil; if it doesn't, we surface the original
+		// error so real auth/ACL 403s still bubble up. (#167)
+		if strings.Contains(err.Error(), "403") {
+			if retryErr := c.retryPutWithBumpedSequence(ctx, path, cal); retryErr == nil {
+				log.Printf("PutEvent: recovered from 403 via SEQUENCE bump on %s", path)
+				return nil
+			}
+		}
 		return fmt.Errorf("%w: failed to put event: %w", ErrConnectionFailed, err)
 	}
 
 	return nil
+}
+
+// retryPutWithBumpedSequence attempts a second PUT after a 403 by reading
+// the destination's current SEQUENCE for this UID and bumping the outbound
+// payload to be strictly greater. Returns nil on successful retry, non-nil
+// if the retry cannot be attempted (cannot read existing, no SEQUENCE to
+// compare against) or the retry itself fails.
+func (c *Client) retryPutWithBumpedSequence(ctx context.Context, path string, cal *ical.Calendar) error {
+	existingData, err := c.fetchRawEvent(ctx, path)
+	if err != nil {
+		return err
+	}
+	existingSeq := extractSequenceFromICS(existingData)
+	if existingSeq < 0 {
+		return fmt.Errorf("no SEQUENCE on existing event at %s", path)
+	}
+	newSeq := existingSeq + 1
+	if our := extractSequenceFromCalendar(cal); our > newSeq {
+		newSeq = our + 1
+	}
+	rewriteSequenceInCalendar(cal, newSeq)
+	_, err = c.caldavClient.PutCalendarObject(ctx, path, cal)
+	return err
+}
+
+// fetchRawEvent does a plain HTTP GET against an event path and returns
+// the raw iCalendar body. Used by retryPutWithBumpedSequence to read the
+// current SEQUENCE without paying for a full MULTIGET.
+func (c *Client) fetchRawEvent(ctx context.Context, path string) (string, error) {
+	fullURL := c.buildURL(path)
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.SetBasicAuth(c.username, c.password)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status %d fetching %s", resp.StatusCode, path)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCalDAVResponseSize))
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// extractSequenceFromICS parses the SEQUENCE value from raw iCalendar data.
+// Returns -1 if no SEQUENCE line is present. Only the first SEQUENCE found
+// in the first VEVENT is used — master + overrides would all share the
+// same SEQUENCE under RFC 5545 in practice.
+func extractSequenceFromICS(data string) int {
+	// Scan line-by-line so we don't allocate a full parse when the
+	// caller only needs a single integer. Lines are CRLF or LF; handle
+	// both.
+	for _, line := range strings.Split(strings.ReplaceAll(data, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "SEQUENCE:") {
+			v := strings.TrimSpace(strings.TrimPrefix(line, "SEQUENCE:"))
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return -1
+			}
+			return n
+		}
+	}
+	return -1
+}
+
+// extractSequenceFromCalendar reads the SEQUENCE property from the first
+// VEVENT in a parsed calendar. Returns -1 if absent or unparseable.
+func extractSequenceFromCalendar(cal *ical.Calendar) int {
+	for _, evt := range cal.Events() {
+		if prop := evt.Props.Get("SEQUENCE"); prop != nil {
+			n, err := strconv.Atoi(strings.TrimSpace(prop.Value))
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return -1
+}
+
+// rewriteSequenceInCalendar sets SEQUENCE=newSeq on every VEVENT in the
+// calendar, creating the property if it was absent. Used by the retry
+// path so the retried PUT carries a SEQUENCE that SOGo will accept as
+// "newer" than what it has stored.
+//
+// We build the Prop directly instead of calling Props.SetText — SetText
+// attaches a VALUE=TEXT parameter, which would emit `SEQUENCE;VALUE=TEXT:N`.
+// RFC 5545 defines SEQUENCE as an INTEGER, and SOGo's parser rejects the
+// VALUE=TEXT variant. Building the Prop bare produces the canonical
+// `SEQUENCE:N` form.
+func rewriteSequenceInCalendar(cal *ical.Calendar, newSeq int) {
+	for _, evt := range cal.Events() {
+		prop := ical.NewProp("SEQUENCE")
+		prop.Value = strconv.Itoa(newSeq)
+		evt.Props.Set(prop)
+	}
 }
 
 // DeleteEvent deletes an event.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1932,5 +1933,182 @@ func TestIsGoogleURL(t *testing.T) {
 		if got := IsGoogleURL(tt.url); got != tt.want {
 			t.Errorf("IsGoogleURL(%q) = %v, want %v", tt.url, got, tt.want)
 		}
+	}
+}
+
+func TestExtractSequenceFromICS(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want int
+	}{
+		{
+			name: "CRLF line endings, SEQUENCE:0",
+			data: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\nSEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: 0,
+		},
+		{
+			name: "LF line endings, SEQUENCE:5",
+			data: "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:x\nSEQUENCE:5\nEND:VEVENT\nEND:VCALENDAR\n",
+			want: 5,
+		},
+		{
+			name: "no SEQUENCE line",
+			data: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+			want: -1,
+		},
+		{
+			name: "malformed SEQUENCE",
+			data: "BEGIN:VCALENDAR\r\nSEQUENCE:not-a-number\r\nEND:VCALENDAR\r\n",
+			want: -1,
+		},
+		{
+			name: "empty string",
+			data: "",
+			want: -1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractSequenceFromICS(tt.data); got != tt.want {
+				t.Errorf("extractSequenceFromICS() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRewriteSequenceInCalendar(t *testing.T) {
+	// Start with a calendar at SEQUENCE:0, rewrite to 7, verify encode
+	// emits SEQUENCE:7.
+	data := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:abc\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSEQUENCE:0\r\nSUMMARY:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	cal, err := parseICalendar(data)
+	if err != nil {
+		t.Fatalf("parseICalendar: %v", err)
+	}
+	rewriteSequenceInCalendar(cal, 7)
+	if got := extractSequenceFromCalendar(cal); got != 7 {
+		t.Errorf("after rewrite, extractSequenceFromCalendar() = %d, want 7", got)
+	}
+	// Also verify via re-encode that the emitted body carries SEQUENCE:7.
+	out, err := encodeCalendar(cal)
+	if err != nil {
+		t.Fatalf("encodeCalendar: %v", err)
+	}
+	if !strings.Contains(out, "SEQUENCE:7") {
+		t.Errorf("re-encoded body missing SEQUENCE:7, got:\n%s", out)
+	}
+	if strings.Contains(out, "SEQUENCE:0") {
+		t.Errorf("re-encoded body still has old SEQUENCE:0, got:\n%s", out)
+	}
+}
+
+func TestRewriteSequenceInCalendar_NoExistingSequence(t *testing.T) {
+	// VEVENT with no SEQUENCE — rewrite should add one.
+	data := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:abc\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSUMMARY:test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	cal, err := parseICalendar(data)
+	if err != nil {
+		t.Fatalf("parseICalendar: %v", err)
+	}
+	rewriteSequenceInCalendar(cal, 3)
+	if got := extractSequenceFromCalendar(cal); got != 3 {
+		t.Errorf("after rewrite with no prior SEQUENCE, got %d, want 3", got)
+	}
+}
+
+// TestPutEventSequenceRetry exercises the SOGo "sequences don't match" 403
+// recovery path: first PUT returns 403, client GETs existing event, bumps
+// SEQUENCE, retries, retry succeeds. Covers the real-world Google→SOGo
+// scenario that motivated the fix.
+func TestPutEventSequenceRetry(t *testing.T) {
+	const existingUID = "61D367D8-CDA7-4540-AD11-5E49264A71D2"
+	existingBody := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//SOGo//EN\r\nBEGIN:VEVENT\r\nUID:" + existingUID + "\r\nSEQUENCE:3\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSUMMARY:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	var putCount int
+	var lastPutBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PUT":
+			putCount++
+			body, _ := io.ReadAll(r.Body)
+			lastPutBody = string(body)
+			// First PUT returns 403 (sequences don't match). Retry PUT
+			// succeeds with 201. We use the body's SEQUENCE value to
+			// decide — anything <= 3 is rejected as stale.
+			if seq := extractSequenceFromICS(lastPutBody); seq <= 3 {
+				w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:">sequences don't match</D:error>`))
+				return
+			}
+			w.Header().Set("ETag", `"bumped"`)
+			w.WriteHeader(http.StatusCreated)
+		case "GET":
+			w.Header().Set("Content-Type", "text/calendar")
+			_, _ = w.Write([]byte(existingBody))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(srv.URL+"/cal", "user", "pass")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Simulate a Google-originated event (SEQUENCE:0, as Google emits).
+	// Server already has SEQUENCE:3 for this UID, so first PUT will 403.
+	googleBody := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Google Inc//Google Calendar 70.9054//EN\r\nBEGIN:VEVENT\r\nUID:" + existingUID + "\r\nSEQUENCE:0\r\nDTSTAMP:20260115T000000Z\r\nDTSTART:20260115T120000Z\r\nDTEND:20260115T130000Z\r\nSUMMARY:google version\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	event := &Event{
+		UID:  existingUID,
+		Path: "/cal/" + existingUID + ".ics",
+		Data: googleBody,
+	}
+	if err := client.PutEvent(context.Background(), "/cal", event); err != nil {
+		t.Fatalf("PutEvent should have recovered via retry, got error: %v", err)
+	}
+	if putCount != 2 {
+		t.Errorf("expected 2 PUT attempts (first 403, retry 201), got %d", putCount)
+	}
+	// The final PUT body must carry SEQUENCE > 3 (existing).
+	retrySeq := extractSequenceFromICS(lastPutBody)
+	if retrySeq <= 3 {
+		t.Errorf("retry PUT body had SEQUENCE:%d, want > 3", retrySeq)
+	}
+}
+
+// TestPutEventSequenceRetry_NoExistingEvent covers the case where the 403
+// is real (not a SEQUENCE issue) — the GET of the existing event fails
+// with 404, so we cannot recover and the original error propagates.
+func TestPutEventSequenceRetry_NoExistingEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PUT":
+			w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:">forbidden</D:error>`))
+		case "GET":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(srv.URL+"/cal", "user", "pass")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	body := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\nSEQUENCE:0\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSUMMARY:t\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	err = client.PutEvent(context.Background(), "/cal", &Event{
+		UID:  "x",
+		Path: "/cal/x.ics",
+		Data: body,
+	})
+	if err == nil {
+		t.Fatal("expected error when retry GET returns 404 and PUT stays 403")
+	}
+	if !errors.Is(err, ErrConnectionFailed) {
+		t.Errorf("expected ErrConnectionFailed, got %v", err)
 	}
 }
