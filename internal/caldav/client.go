@@ -667,6 +667,14 @@ func parseEventPaths(body []byte, basePath string) []string {
 	return paths
 }
 
+// IsGoogleURL reports whether a CalDAV base URL points at Google's
+// CalDAV endpoint. Google uses a non-standard discovery flow and a
+// different write path (/events/ instead of /user), so callers must
+// branch on this.
+func IsGoogleURL(baseURL string) bool {
+	return strings.Contains(baseURL, "googleusercontent.com/caldav/")
+}
+
 // GetCalendarPath returns the path portion of the client's base URL.
 // This is useful when the client is configured for a specific calendar.
 func (c *Client) GetCalendarPath() string {

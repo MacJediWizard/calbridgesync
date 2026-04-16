@@ -1027,12 +1027,24 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		}
 	}
 
-	if err := destClient.TestConnection(ctx); err != nil {
-		result.Message = "Destination connection test failed"
-		result.Errors = append(result.Errors, err.Error())
-		result.Duration = time.Since(start)
-		se.finishSync(source.ID, result)
-		return result
+	// Destination connection test — Google destinations need the same
+	// non-standard path as Google sources. (#165)
+	if IsGoogleURL(source.DestURL) {
+		if err := destClient.TestConnectionGoogle(ctx); err != nil {
+			result.Message = "Destination connection test failed"
+			result.Errors = append(result.Errors, err.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
+	} else {
+		if err := destClient.TestConnection(ctx); err != nil {
+			result.Message = "Destination connection test failed"
+			result.Errors = append(result.Errors, err.Error())
+			result.Duration = time.Since(start)
+			se.finishSync(source.ID, result)
+			return result
+		}
 	}
 
 	// Find calendars on source — Google needs a different discovery path. (#160)
@@ -1182,8 +1194,16 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 
 	// Discover destination calendar path using the same logic as fullSync
 	// to ensure both code paths target the same calendar.
+	// Google destinations need FindCalendarsGoogle — standard discovery
+	// fails and the URL-path fallback yields /user which is read-only. (#165)
 	destCalendarPath := ""
-	destCalendars, discoverErr := destClient.FindCalendars(ctx)
+	var destCalendars []Calendar
+	var discoverErr error
+	if IsGoogleURL(source.DestURL) {
+		destCalendars, discoverErr = destClient.FindCalendarsGoogle(ctx)
+	} else {
+		destCalendars, discoverErr = destClient.FindCalendars(ctx)
+	}
 	if discoverErr != nil {
 		log.Printf("Failed to discover destination calendars, falling back to URL path: %v", discoverErr)
 		destCalendarPath = destClient.GetCalendarPath()
@@ -1475,11 +1495,19 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		se.tracker.UpdateCalendar(source.ID, fmt.Sprintf("%s (%s)", calendar.Name, status), calendarIndex)
 	}
 
-	// Discover destination calendar path - try calendar discovery first, then fall back to URL path
+	// Discover destination calendar path - try calendar discovery first, then fall back to URL path.
+	// Google destinations need FindCalendarsGoogle — standard discovery
+	// fails and the URL-path fallback yields /user which is read-only. (#165)
 	destCalendarPath := ""
-	destCalendars, err := destClient.FindCalendars(ctx)
-	if err != nil {
-		log.Printf("Failed to discover destination calendars, falling back to URL path: %v", err)
+	var destCalendars []Calendar
+	var destDiscoverErr error
+	if IsGoogleURL(source.DestURL) {
+		destCalendars, destDiscoverErr = destClient.FindCalendarsGoogle(ctx)
+	} else {
+		destCalendars, destDiscoverErr = destClient.FindCalendars(ctx)
+	}
+	if destDiscoverErr != nil {
+		log.Printf("Failed to discover destination calendars, falling back to URL path: %v", destDiscoverErr)
 		destCalendarPath = destClient.GetCalendarPath()
 	} else if len(destCalendars) == 0 {
 		log.Printf("No calendars found on destination, using URL path as fallback")
