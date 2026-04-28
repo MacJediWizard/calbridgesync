@@ -19,6 +19,7 @@ export interface Source {
   conflict_strategy: string;
   selected_calendars: CalendarConfig[];
   enabled: boolean;
+  strip_alarms: boolean;
   sync_status: string;
   last_sync_at: string | null;
   next_sync_at: string | null;
@@ -76,6 +77,7 @@ export interface SourceFormData {
   sync_direction: 'one_way' | 'two_way';
   conflict_strategy: string;
   selected_calendars: CalendarConfig[];
+  strip_alarms: boolean;
   // Per-source Google OAuth credentials (#79). Only populated when
   // source_type === 'google'. Empty for all other source types.
   google_client_id?: string;

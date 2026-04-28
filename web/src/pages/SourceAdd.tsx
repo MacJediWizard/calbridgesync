@@ -43,6 +43,7 @@ export default function SourceAdd() {
     sync_direction: 'one_way',
     conflict_strategy: 'source_wins',
     selected_calendars: [],
+    strip_alarms: false,
     google_client_id: '',
     google_client_secret: '',
   });
@@ -119,11 +120,18 @@ export default function SourceAdd() {
   const isGoogleOAuth = form.source_type === 'google';
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-    const { name, value } = e.target;
+    const { name, value, type } = e.target;
+    const isCheckbox = type === 'checkbox';
+    const checked = isCheckbox ? (e.target as HTMLInputElement).checked : undefined;
     setForm((prev) => {
+      const nextValue: string | number | boolean = isCheckbox
+        ? Boolean(checked)
+        : (name === 'sync_interval' || name === 'sync_days_past')
+          ? parseInt(value)
+          : value;
       const updated = {
         ...prev,
-        [name]: (name === 'sync_interval' || name === 'sync_days_past') ? parseInt(value) : value,
+        [name]: nextValue,
       };
       // Force one-way + source_wins for ICS
       if (name === 'source_type' && value === 'ics') {
@@ -161,6 +169,7 @@ export default function SourceAdd() {
           dest_url: form.dest_url,
           dest_username: form.dest_username,
           dest_password: form.dest_password,
+          strip_alarms: form.strip_alarms,
           google_client_id: form.google_client_id,
           google_client_secret: form.google_client_secret,
         });
@@ -283,6 +292,24 @@ export default function SourceAdd() {
                       <option value="latest_wins">Newest wins</option>
                     </select>
                   </div>
+                </div>
+                <div className="flex items-start gap-2 pt-1">
+                  <input
+                    type="checkbox"
+                    name="strip_alarms"
+                    id="strip_alarms"
+                    checked={form.strip_alarms}
+                    onChange={handleChange}
+                    className="mt-0.5"
+                  />
+                  <label htmlFor="strip_alarms" className="text-sm text-gray-300 select-none cursor-pointer">
+                    Ignore alarms
+                    <span className="block text-xs text-gray-500">
+                      Strip VALARM blocks from this source's events before writing to the destination.
+                      Useful for subscribed feeds (payroll, billing, sports) where the source's alarms
+                      shouldn't fire on your calendar.
+                    </span>
+                  </label>
                 </div>
               </div>
 

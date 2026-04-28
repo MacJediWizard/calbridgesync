@@ -213,6 +213,12 @@ type Source struct {
 	// polling interval in seconds (0 = use source.SyncInterval default).
 	LastContentHash  string `json:"-"`
 	AdaptiveInterval int    `json:"adaptive_interval,omitempty"`
+	// StripAlarms removes every VALARM block from this source's events
+	// before writing them to the destination. Useful for subscribed
+	// publish feeds where the source-side alarms shouldn't fire on the
+	// destination calendar. Malformed VALARMs (missing TRIGGER) are
+	// always stripped regardless of this flag.
+	StripAlarms bool `json:"strip_alarms"`
 }
 
 // SyncState represents the synchronization state for a calendar.

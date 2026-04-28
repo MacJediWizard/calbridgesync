@@ -1538,6 +1538,17 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		Warnings: make([]string, 0),
 	}
 
+	// Sanitize VALARM blocks before comparison/PUT. Always strip malformed
+	// alarms (missing the RFC-required TRIGGER) so RFC-strict destinations
+	// like SOGo don't 501 the whole calendar object. When the user has
+	// flipped "Ignore alarms" for this source, strip every VALARM.
+	for i := range sourceEvents {
+		if sourceEvents[i].Data == "" {
+			continue
+		}
+		sourceEvents[i].Data = sanitizeAlarms(sourceEvents[i].Data, source.StripAlarms)
+	}
+
 	// Helper to update activity tracker with current progress
 	updateProgress := func() {
 		se.tracker.UpdateProgress(source.ID, result.Created, result.Updated, result.Deleted, result.Skipped, result.EventsProcessed)
