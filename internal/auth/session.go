@@ -49,6 +49,9 @@ type PendingGoogleSource struct {
 	// The callback decrypts it just long enough to call cfg.Exchange,
 	// then re-encrypts it for storage on the Source row. (#79)
 	GoogleClientSecretEnc string `json:"google_client_secret_enc"`
+	// StripAlarms is the per-source "Ignore alarms" flag; carried
+	// through OAuth so the callback writes it onto the created source.
+	StripAlarms bool `json:"strip_alarms"`
 }
 
 var (

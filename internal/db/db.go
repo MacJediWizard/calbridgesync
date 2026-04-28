@@ -284,6 +284,16 @@ func (db *DB) migrate() error {
 			FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_destinations_source_id ON destinations(source_id)`,
+
+		// Strip-alarms toggle. When true, the sync engine removes every
+		// VALARM block from this source's events before writing them to
+		// the destination. Useful for subscribed publish feeds (Gusto
+		// payroll reminders, billing deadlines, etc.) where the alarms
+		// would surface as notifications on the destination calendar.
+		// Malformed VALARMs (no TRIGGER per RFC 5545 §3.6.6) are always
+		// stripped regardless of this flag — they cause RFC-strict
+		// servers like SOGo to 501 the whole calendar object.
+		`ALTER TABLE sources ADD COLUMN strip_alarms INTEGER NOT NULL DEFAULT 0`,
 	}
 
 	for _, migration := range migrations {

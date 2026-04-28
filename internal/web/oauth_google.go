@@ -101,6 +101,7 @@ type APIPrepareGoogleSourceRequest struct {
 	DestPassword       string `json:"dest_password"`
 	GoogleClientID     string `json:"google_client_id"`
 	GoogleClientSecret string `json:"google_client_secret"`
+	StripAlarms        bool   `json:"strip_alarms"`
 }
 
 // APIPrepareGoogleSourceResponse tells the SPA where to send the user
@@ -236,6 +237,7 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 		DestPasswordEnc:       encDestPwd,
 		GoogleClientID:        req.GoogleClientID,
 		GoogleClientSecretEnc: encGoogleClientSecret,
+		StripAlarms:           req.StripAlarms,
 	}
 	if err := h.session.SetPendingGoogleSource(c.Writer, c.Request, pending); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending source"})
@@ -462,6 +464,7 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		SyncDirection:      syncDirection,
 		ConflictStrategy:   conflictStrategy,
 		Enabled:            true,
+		StripAlarms:        pending.StripAlarms,
 	}
 
 	if err := h.db.CreateSource(source); err != nil {

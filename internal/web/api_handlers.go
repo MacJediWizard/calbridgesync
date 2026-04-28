@@ -113,6 +113,7 @@ type APISource struct {
 	ConflictStrategy  string              `json:"conflict_strategy"`
 	SelectedCalendars []APICalendarConfig `json:"selected_calendars"`
 	Enabled           bool                `json:"enabled"`
+	StripAlarms       bool                `json:"strip_alarms"`
 	SyncStatus        string              `json:"sync_status"`
 	LastSyncAt        *string             `json:"last_sync_at"`
 	NextSyncAt        *string             `json:"next_sync_at"`
@@ -226,6 +227,7 @@ func sourceToAPI(s *db.Source) *APISource {
 		ConflictStrategy:  string(s.ConflictStrategy),
 		SelectedCalendars: apiCalendars,
 		Enabled:           s.Enabled,
+		StripAlarms:       s.StripAlarms,
 		SyncStatus:        string(s.LastSyncStatus),
 		CreatedAt:         s.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:         s.UpdatedAt.Format(time.RFC3339),
@@ -698,6 +700,7 @@ type APICreateSourceRequest struct {
 	SyncDirection     string              `json:"sync_direction"`
 	ConflictStrategy  string              `json:"conflict_strategy"`
 	SelectedCalendars []APICalendarConfig `json:"selected_calendars"`
+	StripAlarms       bool                `json:"strip_alarms"`
 }
 
 // APICreateSource creates a new source.
@@ -822,6 +825,7 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		ConflictStrategy:  db.ConflictStrategy(req.ConflictStrategy),
 		SelectedCalendars: dbCalendars,
 		Enabled:           true,
+		StripAlarms:       req.StripAlarms,
 	}
 
 	if err := h.db.CreateSource(source); err != nil {
@@ -849,6 +853,7 @@ type APIUpdateSourceRequest struct {
 	SyncDirection     string              `json:"sync_direction"`
 	ConflictStrategy  string              `json:"conflict_strategy"`
 	SelectedCalendars []APICalendarConfig `json:"selected_calendars"`
+	StripAlarms       bool                `json:"strip_alarms"`
 }
 
 // APIUpdateSource updates an existing source.
@@ -908,6 +913,7 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	source.SyncDirection = db.SyncDirection(req.SyncDirection)
 	source.ConflictStrategy = db.ConflictStrategy(req.ConflictStrategy)
 	source.SelectedCalendars = dbCalendars
+	source.StripAlarms = req.StripAlarms
 	if req.SyncInterval > 0 {
 		source.SyncInterval = req.SyncInterval
 	}

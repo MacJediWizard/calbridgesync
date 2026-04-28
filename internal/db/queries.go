@@ -125,8 +125,8 @@ func (db *DB) CreateSource(source *Source) error {
 		id, user_id, name, source_type, source_url, source_username, source_password,
 		dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 		selected_calendars, enabled, last_sync_status, oauth_refresh_token,
-		google_client_id, google_client_secret, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		google_client_id, google_client_secret, strip_alarms, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := db.conn.Exec(query,
 		source.ID, source.UserID, source.Name, source.SourceType,
@@ -135,7 +135,7 @@ func (db *DB) CreateSource(source *Source) error {
 		source.SyncInterval, source.SyncDaysPast, source.SyncDirection, source.ConflictStrategy,
 		selectedCalendarsJSON, source.Enabled,
 		source.LastSyncStatus, oauthRefreshToken,
-		googleClientID, googleClientSecret,
+		googleClientID, googleClientSecret, source.StripAlarms,
 		source.CreatedAt, source.UpdatedAt,
 	)
 	if err != nil {
@@ -153,7 +153,7 @@ func (db *DB) CreateSource(source *Source) error {
 const sourceSelectColumns = `id, user_id, name, source_type, source_url, source_username, source_password,
 	dest_url, dest_username, dest_password, sync_interval, sync_days_past, sync_direction, conflict_strategy,
 	selected_calendars, enabled, last_sync_at, last_sync_status, last_sync_message, created_at, updated_at,
-	oauth_refresh_token, google_client_id, google_client_secret`
+	oauth_refresh_token, google_client_id, google_client_secret, strip_alarms`
 
 // GetSourceByID returns a source by its ID.
 func (db *DB) GetSourceByID(id string) (*Source, error) {
@@ -276,6 +276,7 @@ func (db *DB) UpdateSource(source *Source) error {
 		oauth_refresh_token = COALESCE(?, oauth_refresh_token),
 		google_client_id = COALESCE(?, google_client_id),
 		google_client_secret = COALESCE(?, google_client_secret),
+		strip_alarms = ?,
 		updated_at = ?
 		WHERE id = ?`
 
@@ -284,6 +285,7 @@ func (db *DB) UpdateSource(source *Source) error {
 		source.DestURL, source.DestUsername, source.DestPassword, source.SyncInterval, source.SyncDaysPast,
 		source.SyncDirection, source.ConflictStrategy, selectedCalendarsJSON, source.Enabled,
 		oauthRefreshToken, googleClientID, googleClientSecret,
+		source.StripAlarms,
 		source.UpdatedAt, source.ID,
 	)
 	if err != nil {
@@ -762,7 +764,7 @@ func scanSource(row *sql.Row) (*Source, error) {
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
 		&source.CreatedAt, &source.UpdatedAt,
-		&oauthRefreshToken, &googleClientID, &googleClientSecret,
+		&oauthRefreshToken, &googleClientID, &googleClientSecret, &source.StripAlarms,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -816,7 +818,7 @@ func scanSourceFromRows(rows *sql.Rows) (*Source, error) {
 		&selectedCalendarsJSON, &source.Enabled,
 		&lastSyncAt, &source.LastSyncStatus, &lastSyncMessage,
 		&source.CreatedAt, &source.UpdatedAt,
-		&oauthRefreshToken, &googleClientID, &googleClientSecret,
+		&oauthRefreshToken, &googleClientID, &googleClientSecret, &source.StripAlarms,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan source: %w", err)
