@@ -278,8 +278,11 @@ func (c *ICSClient) TestConnection(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	// Some servers don't support HEAD, fall back to GET
-	if resp.StatusCode == http.StatusMethodNotAllowed {
+	// Some servers don't support HEAD, fall back to GET. 405 is the
+	// strict-correct response, but presigned URLs (e.g. Gusto → S3,
+	// where the redirect target is signed only for GET) and some CDNs
+	// reject HEAD with 403 instead — fall back in both cases.
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusForbidden {
 		req2, err := http.NewRequestWithContext(ctx, http.MethodGet, c.feedURL, nil)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrConnectionFailed, err)
