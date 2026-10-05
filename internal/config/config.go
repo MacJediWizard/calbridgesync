@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -114,6 +115,10 @@ type ServerConfig struct {
 	Port        int
 	BaseURL     string
 	Environment Environment
+	// TrustedProxies lists the IPs/CIDRs whose X-Forwarded-For header
+	// is honoured when resolving the client IP. Empty means trust no
+	// proxy. Set via TRUSTED_PROXIES (comma-separated). (#199)
+	TrustedProxies []string
 }
 
 // OIDCConfig holds OIDC authentication configuration.
@@ -171,6 +176,18 @@ func Load() (*Config, error) {
 	cfg.Server.Port = port
 	cfg.Server.BaseURL = getEnvRequired("BASE_URL")
 	cfg.Server.Environment = Environment(strings.ToLower(getEnv("ENVIRONMENT", "production")))
+	for _, p := range strings.Split(getEnv("TRUSTED_PROXIES", ""), ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if net.ParseIP(p) == nil {
+			if _, _, err := net.ParseCIDR(p); err != nil {
+				return nil, fmt.Errorf("%w: TRUSTED_PROXIES: %q is not an IP or CIDR", ErrInvalidConfig, p)
+			}
+		}
+		cfg.Server.TrustedProxies = append(cfg.Server.TrustedProxies, p)
+	}
 
 	// OIDC configuration
 	cfg.OIDC.Issuer = getEnvRequired("OIDC_ISSUER")

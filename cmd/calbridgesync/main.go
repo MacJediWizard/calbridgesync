@@ -170,6 +170,9 @@ func main() {
 
 	// Setup Gin router
 	router := gin.New()
+	if err := web.ConfigureTrustedProxies(router, cfg.Server.TrustedProxies); err != nil {
+		log.Fatalf("Invalid TRUSTED_PROXIES: %v", err)
+	}
 	router.Use(gin.Recovery())
 	router.Use(web.RequestLogger())
 	router.Use(web.SecurityHeaders())

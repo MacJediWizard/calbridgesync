@@ -52,6 +52,17 @@ func SecurityHeaders() gin.HandlerFunc {
 	}
 }
 
+// ConfigureTrustedProxies restricts which TCP peers gin will accept
+// X-Forwarded-For / X-Real-IP from when computing c.ClientIP().
+//
+// Gin's default trusts every peer (0.0.0.0/0 and ::/0), so any client
+// could forge X-Forwarded-For to get a fresh rate-limit bucket per
+// request or falsify the IP recorded in the audit log. An empty list
+// trusts no proxy, making ClientIP() the TCP peer address. (#199)
+func ConfigureTrustedProxies(engine *gin.Engine, proxies []string) error {
+	return engine.SetTrustedProxies(proxies)
+}
+
 // ipLimiterEntry tracks a per-client rate limiter and when it was
 // last touched so the cleanup sweep can evict idle entries.
 type ipLimiterEntry struct {
