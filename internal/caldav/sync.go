@@ -976,6 +976,44 @@ func (se *SyncEngine) GetActivityTracker() *activity.Tracker {
 	return se.tracker
 }
 
+// multiDestinationPaused gates syncing to additional destinations (#183).
+// synced_events and sync_states have no destination_id, so an extra
+// destination reads and writes the primary destination's tracking rows:
+// its upserts overwrite the primary's dest_etag/dest_path and its orphan
+// deletes act on the primary's rows. Forcing it to one-way is not enough.
+// Stays true until the remove-or-finish decision (audit PR-35) lands.
+const multiDestinationPaused = true
+
+// activeAdditionalDestinations returns the additional destinations that
+// should be synced this cycle. It returns nil while multi-destination is
+// paused (#183), even when destinations are enabled.
+func activeAdditionalDestinations(dests []*db.Destination) []*db.Destination {
+	if multiDestinationPaused {
+		return nil
+	}
+	var active []*db.Destination
+	for _, d := range dests {
+		if d.Enabled {
+			active = append(active, d)
+		}
+	}
+	return active
+}
+
+// logPausedDestinations logs once per sync how many enabled additional
+// destinations were skipped because multi-destination is paused (#183).
+func logPausedDestinations(sourceName string, all, active []*db.Destination) {
+	enabled := 0
+	for _, d := range all {
+		if d.Enabled {
+			enabled++
+		}
+	}
+	if paused := enabled - len(active); paused > 0 {
+		log.Printf("%d additional destination(s) paused for source %s: multi-destination sync is disabled until destinations get their own tracking state (#183)", paused, sourceName)
+	}
+}
+
 // SyncSource performs synchronization for a single source.
 func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncResult {
 	start := time.Now()
@@ -1198,14 +1236,16 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	// row) always syncs first — additional destinations are
 	// additive. A failure on one additional destination doesn't
 	// prevent others from being tried.
+	//
+	// Paused (#183): activeAdditionalDestinations returns nil until
+	// extra destinations get their own tracking rows.
 	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
 	if err != nil {
 		log.Printf("Failed to load additional destinations for source %s: %v", source.Name, err)
 	}
-	for _, dest := range additionalDests {
-		if !dest.Enabled {
-			continue
-		}
+	activeDests := activeAdditionalDestinations(additionalDests)
+	logPausedDestinations(source.Name, additionalDests, activeDests)
+	for _, dest := range activeDests {
 		log.Printf("Syncing to additional destination: %s (%s)", dest.Name, dest.DestURL)
 		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
 		if decErr != nil {
@@ -2478,14 +2518,16 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	// Multi-destination sync (#156): after syncing to the primary
 	// destination, replicate the same ICS events to any additional
 	// destinations. Failures on one extra dest don't block others.
+	//
+	// Paused (#183): activeAdditionalDestinations returns nil until
+	// extra destinations get their own tracking rows.
 	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
 	if err != nil {
 		log.Printf("Failed to load additional destinations for ICS source %s: %v", source.Name, err)
 	}
-	for _, dest := range additionalDests {
-		if !dest.Enabled {
-			continue
-		}
+	activeDests := activeAdditionalDestinations(additionalDests)
+	logPausedDestinations(source.Name, additionalDests, activeDests)
+	for _, dest := range activeDests {
 		log.Printf("Syncing ICS feed to additional destination: %s (%s)", dest.Name, dest.DestURL)
 		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
 		if decErr != nil {

@@ -82,6 +82,10 @@ export default function DestinationManager({ sourceId }: Props) {
         </button>
       </div>
 
+      <div role="status" className="p-3 rounded border border-yellow-700 bg-yellow-900/30 text-xs text-yellow-300">
+        Additional destinations are paused. Events sync only to the primary destination above, even when an additional destination shows as Active.
+      </div>
+
       {error && <p className="text-sm text-red-400">{error}</p>}
 
       {destinations.length === 0 && !showForm && (
