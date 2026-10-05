@@ -1086,6 +1086,37 @@ func TestAPITriggerSync(t *testing.T) {
 			t.Fatalf("expected status 401, got %d", w.Code)
 		}
 	})
+
+	// dry_run was removed (#186): it ran SyncSource outside the
+	// scheduler lock and still wrote tracking state. The query
+	// parameter must now be ignored and behave as a normal trigger.
+	for _, target := range []string{"/sync", "/sync?dry_run=true"} {
+		t.Run("normal trigger for "+target, func(t *testing.T) {
+			th := setupTestHandlers(t)
+			defer th.cleanup()
+
+			userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/sources/"+source.ID+target, nil)
+			c.Params = gin.Params{{Key: "id", Value: source.ID}}
+			setAuthContext(c, userID, "test@example.com")
+
+			th.handlers.APITriggerSync(c)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected status 200, got %d", w.Code)
+			}
+			var resp map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if len(resp) != 1 || resp["message"] != "Sync triggered" {
+				t.Fatalf(`expected {"message":"Sync triggered"}, got %s`, w.Body.String())
+			}
+		})
+	}
 }
 
 func TestAPIGetSourceLogs(t *testing.T) {
