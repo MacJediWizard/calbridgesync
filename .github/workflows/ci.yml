@@ -9,14 +9,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # Only cancel superseded PR runs; every push to main gets a completed run.
+  # PRs share a group per ref so a new push cancels the superseded run.
+  # Pushes to main get a unique group per commit: GitHub keeps only one
+  # pending run per group and cancels it when a newer run is queued, so a
+  # shared main group would drop runs when several PRs merge back to back.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   go:
     name: Go build, vet, test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -32,6 +36,7 @@ jobs:
   web:
     name: Web build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
@@ -49,6 +54,7 @@ jobs:
   govulncheck:
     name: govulncheck (advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -67,6 +73,7 @@ jobs:
   golangci-lint:
     name: golangci-lint (advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
