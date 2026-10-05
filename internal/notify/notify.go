@@ -635,24 +635,15 @@ func (n *Notifier) sendEmail(ctx context.Context, alert Alert, recipients []stri
 		auth = smtp.PlainAuth("", n.cfg.SMTPUsername, n.cfg.SMTPPassword, n.cfg.SMTPHost)
 	}
 
-	// Retry transient SMTP failures. SMTP errors are mostly transient
-	// (connection drops, TLS hiccups, temporary server rejection) and
-	// the isTransientSMTPError classifier is intentionally permissive —
-	// the outer cooldown loop (PR #34) will eventually give up on
-	// persistently broken destinations by not retrying for another
-	// full cooldown window.
+	// Retry transient SMTP failures (connection drops, timeouts, 4xx
+	// replies). isTransientSMTPError treats 5xx replies as permanent so
+	// a rejected recipient or bad credentials fail fast; the outer
+	// cooldown loop (PR #34) retries those on a later cycle.
 	//
-	// Context is honored during backoff sleeps via retryTransient.
-	// Note: the stdlib smtp.SendMail itself does not take a context,
-	// so a mid-attempt cancellation only affects the sleep between
-	// attempts, not the send in progress.
+	// Each attempt is bounded by smtpTimeout and by ctx (sendEmailOnce
+	// closes the connection when ctx is cancelled).
 	return retryTransient(ctx, n.maxSendAttempts(), n.initialBackoff(), func(ctx context.Context) error {
-		var err error
-		if n.cfg.SMTPTLS {
-			err = n.sendEmailTLS(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
-		} else {
-			err = smtp.SendMail(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
-		}
+		err := n.sendEmailOnce(ctx, addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
 		if err != nil {
 			return fmt.Errorf("send email: %w", err)
 		}
@@ -661,24 +652,65 @@ func (n *Notifier) sendEmail(ctx context.Context, alert Alert, recipients []stri
 	}, isTransientSMTPError)
 }
 
-// sendEmailTLS sends email over TLS (for port 465).
-func (n *Notifier) sendEmailTLS(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+// smtpTimeout bounds a single SMTP send attempt: dial plus the whole
+// conversation. Without it a server that accepts the connection but
+// never answers hangs the send forever. A var so tests can shorten it.
+var smtpTimeout = 30 * time.Second
+
+// sendEmailOnce performs one SMTP send. With SMTPTLS it dials implicit
+// TLS (port 465); otherwise it dials plain TCP and upgrades with
+// STARTTLS when the server offers it, matching smtp.SendMail. The dial
+// and the whole conversation share one deadline of smtpTimeout (or
+// ctx's deadline, if sooner), and the connection is closed if ctx is
+// cancelled, so a silent or stalled server cannot hang the caller.
+func (n *Notifier) sendEmailOnce(ctx context.Context, addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	deadline := time.Now().Add(smtpTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	dialCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	tlsConfig := &tls.Config{
 		ServerName: n.cfg.SMTPHost,
 		MinVersion: tls.VersionTLS12, // Require TLS 1.2 or higher for security
 	}
+	netDialer := &net.Dialer{}
 
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
-	if err != nil {
-		return fmt.Errorf("dial TLS: %w", err)
+	var conn net.Conn
+	var err error
+	if n.cfg.SMTPTLS {
+		conn, err = (&tls.Dialer{NetDialer: netDialer, Config: tlsConfig}).DialContext(dialCtx, "tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dial TLS: %w", err)
+		}
+	} else {
+		conn, err = netDialer.DialContext(dialCtx, "tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dial: %w", err)
+		}
 	}
 	defer conn.Close()
+
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	client, err := smtp.NewClient(conn, n.cfg.SMTPHost)
 	if err != nil {
 		return fmt.Errorf("create SMTP client: %w", err)
 	}
 	defer client.Close()
+
+	if !n.cfg.SMTPTLS {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(tlsConfig); err != nil {
+				return fmt.Errorf("starttls: %w", err)
+			}
+		}
+	}
 
 	if auth != nil {
 		if err := client.Auth(auth); err != nil {
