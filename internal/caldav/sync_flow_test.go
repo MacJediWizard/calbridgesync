@@ -420,3 +420,32 @@ func TestSyncEventsToDestination_TypedNilSourceClientIsTreatedAsNil(t *testing.T
 	assertPaths(t, "typed-nil", "source DELETEs", h.src.deleteLog())
 	assertPaths(t, "typed-nil", "source PUTs", h.src.putLog())
 }
+
+// TestFlow_TrackingReadErrorAbortsCalendar: when the synced_events rows
+// can't be read, the calendar pass must fail before any write. Running
+// on with an empty prior state would reverse-create every
+// destination-only event on the source, re-PUT every source event, and
+// disable the ratio guards (they key off len(previouslySynced)).
+func TestFlow_TrackingReadErrorAbortsCalendar(t *testing.T) {
+	h := newFlowHarness(t, db.SyncDirectionTwoWay, db.ConflictSourceWins, 60)
+	h.src.seed(flowSrcCal, "A", "Source A", flowStart)
+	h.dst.seed(flowDestCal, "B", "Dest only B", "20300202T100000Z")
+
+	if err := h.db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1)
+
+	if len(res.Errors) == 0 {
+		t.Fatalf("expected an error when tracking rows can't be read, got none (warnings: %v)", res.Warnings)
+	}
+	if !strings.Contains(strings.Join(res.Errors, "\n"), "synced events") {
+		t.Errorf("errors = %v, want one naming the synced-events read", res.Errors)
+	}
+	assertPaths(t, "tracking read error", "source PUTs", h.src.putLog())
+	assertPaths(t, "tracking read error", "source DELETEs", h.src.deleteLog())
+	assertPaths(t, "tracking read error", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "tracking read error", "dest DELETEs", h.dst.deleteLog())
+	assertCounts(t, "tracking read error", res, counts{})
+}
