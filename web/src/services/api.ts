@@ -8,6 +8,17 @@ const api = axios.create({
   },
 });
 
+// Every 401 from the API means the session is gone (expired or logged
+// out in another tab). Start a fresh login instead of leaving each page
+// showing request errors. /auth/status is public and is how App.tsx
+// decides to show the login page, so it is left to the caller. (#241)
+api.interceptors.response.use(undefined, (error) => {
+  if (axios.isAxiosError(error) && error.response?.status === 401 && error.config?.url !== '/auth/status') {
+    window.location.href = '/auth/login';
+  }
+  return Promise.reject(error);
+});
+
 // Auth
 export const getAuthStatus = async (): Promise<AuthStatus> => {
   const response = await api.get('/auth/status');
