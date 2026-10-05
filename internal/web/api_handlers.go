@@ -34,6 +34,18 @@ func categorizeConnectionError(err error) string {
 	if err == nil {
 		return "Connection failed"
 	}
+	// Blocked dials and dial failures against non-public addresses all
+	// get one message, so refused/timeout/unreachable differences can't
+	// be used to tell live private hosts from dead ones. (#200)
+	//
+	// Known residual (accepted trade-off): a private host:port that
+	// accepts the TCP connection still falls through to the TLS / 401 /
+	// 404 / default messages below, so an open private port remains
+	// distinguishable from a closed one. Collapsing those too would hide
+	// the auth and URL errors LAN CalDAV users (SOGo, Nextcloud) need.
+	if caldav.IsInternalDialFailure(err) {
+		return "Could not connect to the server. Please check the URL."
+	}
 	errStr := strings.ToLower(err.Error())
 
 	// Categorize without exposing internal details

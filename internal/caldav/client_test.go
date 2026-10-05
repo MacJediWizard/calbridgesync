@@ -1464,6 +1464,7 @@ func TestCalendarStructJSON(t *testing.T) {
 }
 
 func TestObjectsToEvents(t *testing.T) {
+	allowLoopbackDial(t)
 	// Create a minimal test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1566,6 +1567,7 @@ func TestObjectsToEvents(t *testing.T) {
 }
 
 func TestClientWithTestServer(t *testing.T) {
+	allowLoopbackDial(t)
 	t.Run("TestConnection returns error for server returning 401", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -1720,6 +1722,7 @@ func TestRewriteSequenceInCalendar_NoExistingSequence(t *testing.T) {
 // SEQUENCE, retries, retry succeeds. Covers the real-world Google→SOGo
 // scenario that motivated the fix.
 func TestPutEventSequenceRetry(t *testing.T) {
+	allowLoopbackDial(t)
 	const existingUID = "61D367D8-CDA7-4540-AD11-5E49264A71D2"
 	existingBody := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//SOGo//EN\r\nBEGIN:VEVENT\r\nUID:" + existingUID + "\r\nSEQUENCE:3\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260101T120000Z\r\nDTEND:20260101T130000Z\r\nSUMMARY:existing\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 
@@ -1781,6 +1784,7 @@ func TestPutEventSequenceRetry(t *testing.T) {
 // is real (not a SEQUENCE issue) — the GET of the existing event fails
 // with 404, so we cannot recover and the original error propagates.
 func TestPutEventSequenceRetry_NoExistingEvent(t *testing.T) {
+	allowLoopbackDial(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "PUT":
