@@ -1529,10 +1529,10 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// Update status to show processing phase
 	updateStatus(fmt.Sprintf("processing %d events", len(sourceEvents)))
 
-	// Handle deletions first (for two-way sync). Both safety guards
-	// below are extracted as pure helpers (Issue #68) so they can be
-	// unit-tested directly — see shouldSkipTwoWayDeletion and
-	// isWithinSyncSafetyThreshold in this file.
+	// Handle deletions first (for two-way sync). The deletion planners
+	// (planTwoWayDeletion, planTwoWaySourceDeletion) and the per-event
+	// isWithinSyncSafetyThreshold check are pure helpers so they can be
+	// unit-tested directly. (#68, #80, #82)
 	sourceInterval := time.Duration(source.SyncInterval) * time.Second
 	now := time.Now()
 
@@ -1548,13 +1548,13 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	//     events. (William lost 748 events to this exact bug.)
 	//
 	//   - Source-deletion: events that were removed from destination
-	//     must be removed from source. Still inline because each
-	//     candidate has its own per-event safety threshold
-	//     (isWithinSyncSafetyThreshold) protecting recently-synced
-	//     events; ratio-based protection for this direction is
-	//     deferred to a follow-up. The shouldSkipTwoWayDeletion
-	//     guard is still consulted to short-circuit when the dest
-	//     query failed entirely.
+	//     must be removed from source. Delegated to
+	//     planTwoWaySourceDeletion, which enforces empty-source,
+	//     empty-dest, and mass-delete ratio guards (#82); each
+	//     candidate is then also checked against the per-event
+	//     safety threshold (isWithinSyncSafetyThreshold). A UID
+	//     deleted here is removed from sourceEventMap, and the
+	//     forward loop skips it so it is not re-created on dest. (#220)
 	//
 	// deferredSourceDelete holds UIDs whose source delete the safety
 	// threshold postponed this cycle. The forward pass must not
@@ -1706,6 +1706,13 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// Sync source events to destination
 	for _, sourceEvent := range sourceEvents {
 		if sourceEvent.UID == "" {
+			continue
+		}
+		// The source-deletion pass above removes a UID from
+		// sourceEventMap but not from this slice. Without this guard
+		// the event is deleted from source and then re-created on
+		// dest in the same cycle. (#220)
+		if _, ok := sourceEventMap[sourceEvent.UID]; !ok {
 			continue
 		}
 

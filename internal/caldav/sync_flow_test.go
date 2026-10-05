@@ -301,44 +301,30 @@ func TestSyncFlow_TwoWay_CreateReverseCreateAndDeletes(t *testing.T) {
 	assertPaths(t, "cycle3", "source PUTs", h.src.putLog())
 	assertRowUIDs(t, "cycle3", h.rows(), "B", "C", "D", "X")
 
-	// Cycle 4: deleted on dest -> deleted from source.
-	//
-	// TODAY (audit 2026-10-03, remediation PR-08): the forward loop
-	// iterates the sourceEvents slice, not sourceEventMap, so B is
-	// deleted from source and then re-created on dest in the same
-	// cycle. Its tracking row survives through the forward-pass upsert.
+	// Cycle 4: deleted on dest -> deleted from source. The forward
+	// loop must not re-create B on dest in the same cycle (#220): dest
+	// sees zero PUTs and B's tracking row is gone.
 	h.dst.remove(destPath("B"))
 	r = h.cycle()
 	assertNoWarnings(t, "cycle4", r)
-	assertCounts(t, "cycle4", r, counts{Created: 1, Deleted: 1, EventsProcessed: 4})
+	assertCounts(t, "cycle4", r, counts{Deleted: 1, EventsProcessed: 3})
 	assertPaths(t, "cycle4", "source DELETEs", h.src.deleteLog(), srcPath("B"))
 	assertPaths(t, "cycle4", "dest DELETEs", h.dst.deleteLog())
-	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog(), destPath("B"))
+	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle4", "source PUTs", h.src.putLog())
-	assertRowUIDs(t, "cycle4", h.rows(), "B", "C", "D", "X")
+	assertRowUIDs(t, "cycle4", h.rows(), "C", "D", "X")
 	assertPaths(t, "cycle4", "source contents", h.src.paths(), srcPath("C"), srcPath("D"), srcPath("X"))
-	assertPaths(t, "cycle4", "dest contents", h.dst.paths(), destPath("B"), destPath("C"), destPath("D"), destPath("X"))
+	assertPaths(t, "cycle4", "dest contents", h.dst.paths(), destPath("C"), destPath("D"), destPath("X"))
 
-	// Cycle 5: TODAY the re-created dest copy of B is now "deleted on
-	// source", so the dest-deletion pass removes it and the row goes.
+	// Cycle 5: steady; there is no re-created copy to undo.
 	r = h.cycle()
 	assertNoWarnings(t, "cycle5", r)
-	assertCounts(t, "cycle5", r, counts{Deleted: 1, EventsProcessed: 3})
-	assertPaths(t, "cycle5", "dest DELETEs", h.dst.deleteLog(), destPath("B"))
-	assertPaths(t, "cycle5", "source DELETEs", h.src.deleteLog())
+	assertCounts(t, "cycle5", r, counts{EventsProcessed: 3})
 	assertPaths(t, "cycle5", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle5", "source PUTs", h.src.putLog())
+	assertPaths(t, "cycle5", "dest DELETEs", h.dst.deleteLog())
+	assertPaths(t, "cycle5", "source DELETEs", h.src.deleteLog())
 	assertRowUIDs(t, "cycle5", h.rows(), "C", "D", "X")
-	assertPaths(t, "cycle5", "dest contents", h.dst.paths(), destPath("C"), destPath("D"), destPath("X"))
-
-	// Cycle 6: steady.
-	r = h.cycle()
-	assertNoWarnings(t, "cycle6", r)
-	assertCounts(t, "cycle6", r, counts{EventsProcessed: 3})
-	assertPaths(t, "cycle6", "dest PUTs", h.dst.putLog())
-	assertPaths(t, "cycle6", "source PUTs", h.src.putLog())
-	assertPaths(t, "cycle6", "dest DELETEs", h.dst.deleteLog())
-	assertPaths(t, "cycle6", "source DELETEs", h.src.deleteLog())
 }
 
 func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
@@ -364,9 +350,8 @@ func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
 		t.Errorf("cycle3: dest B was re-created while its source delete was deferred")
 	}
 
-	// Cycle 4: outside the window, the deferred source delete happens.
-	// (Whether the forward loop then re-PUTs B from the stale slice is
-	// remediation PR-08, pinned in its own test.)
+	// Cycle 4: outside the window, the deferred source delete happens
+	// and the forward loop does not re-PUT B to dest (#220).
 	h.source.SyncInterval = 0
 	r = h.cycle()
 	assertNoWarnings(t, "cycle4", r)
@@ -374,8 +359,12 @@ func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
 		t.Errorf("cycle4: Deleted = %d, want 1", r.Deleted)
 	}
 	assertPaths(t, "cycle4", "source DELETEs", h.src.deleteLog(), srcPath("B"))
+	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
 	if _, ok := h.src.get(srcPath("B")); ok {
 		t.Errorf("cycle4: source B still present after the window passed")
+	}
+	if _, ok := h.dst.get(destPath("B")); ok {
+		t.Errorf("cycle4: dest B was re-created after its source delete")
 	}
 }
 
