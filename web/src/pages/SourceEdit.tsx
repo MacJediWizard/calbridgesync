@@ -2,7 +2,9 @@ import { useState, useEffect } from 'react';
 import { useNavigate, useParams, Link, useSearchParams } from 'react-router-dom';
 import { getSource, updateSource, deleteSource, discoverCalendars, reconnectGoogleSource } from '../services/api';
 import { GOOGLE_OAUTH_ERRORS } from '../services/googleOAuthErrors';
+import { stripAlarmsScope } from '../services/stripAlarms';
 import DestinationManager from '../components/DestinationManager';
+import SyncIntervalSelect from '../components/SyncIntervalSelect';
 import type { Source, Calendar, CalendarConfig } from '../types';
 
 export default function SourceEdit() {
@@ -82,7 +84,7 @@ export default function SourceEdit() {
         dest_username: data.dest_username,
         dest_password: '',
         sync_interval: data.sync_interval,
-        sync_days_past: data.sync_days_past || 30,
+        sync_days_past: data.sync_days_past,
         sync_direction: data.sync_direction || 'one_way',
         conflict_strategy: data.conflict_strategy,
         selected_calendars: data.selected_calendars || [],
@@ -161,6 +163,12 @@ export default function SourceEdit() {
   };
 
   const isICS = form.source_type === 'ics';
+  // "Ignore alarms" only takes effect on one-way calendars (#217). When no
+  // calendar is one-way the box is shown unchecked, but the saved value is
+  // submitted unchanged: on a two-way calendar the flag drives the one-time
+  // re-PUT that restores alarms stripped before #217, so clearing it on
+  // save could skip that repair. It has no stripping effect there.
+  const stripScope = stripAlarmsScope(form.sync_direction, form.selected_calendars);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value, type } = e.target;
@@ -323,15 +331,10 @@ export default function SourceEdit() {
                 <label htmlFor="sync_interval" className="block text-sm font-medium text-gray-300 mb-1">
                   Interval
                 </label>
-                <select name="sync_interval" id="sync_interval" value={form.sync_interval} onChange={handleChange} required className="w-full">
-                  <option value={300}>5 min</option>
-                  <option value={900}>15 min</option>
-                  <option value={1800}>30 min</option>
-                  <option value={3600}>1 hour</option>
-                  <option value={7200}>2 hours</option>
-                  <option value={21600}>6 hours</option>
-                  <option value={86400}>24 hours</option>
-                </select>
+                <SyncIntervalSelect
+                  value={form.sync_interval}
+                  onChange={v => setForm(prev => ({ ...prev, sync_interval: v }))}
+                />
               </div>
               <div>
                 <label htmlFor="sync_days_past" className="block text-sm font-medium text-gray-300 mb-1">
@@ -343,15 +346,10 @@ export default function SourceEdit() {
                   <option value={30}>30 days</option>
                   <option value={60}>60 days</option>
                   <option value={90}>90 days</option>
-                  <option value={0}>Unlimited</option>
                 </select>
-                {form.sync_days_past > 0 ? (
-                  <p className="text-xs text-gray-500 mt-1">
-                    Syncing events from {new Date(Date.now() - form.sync_days_past * 86400000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} to today
-                  </p>
-                ) : (
-                  <p className="text-xs text-gray-500 mt-1">Syncing all events regardless of date</p>
-                )}
+                <p className="text-xs text-gray-500 mt-1">
+                  Syncing events from {new Date(Date.now() - form.sync_days_past * 86400000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} to today
+                </p>
               </div>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -381,8 +379,9 @@ export default function SourceEdit() {
                 type="checkbox"
                 name="strip_alarms"
                 id="strip_alarms"
-                checked={form.strip_alarms}
+                checked={form.strip_alarms && stripScope.applies}
                 onChange={handleChange}
+                disabled={!stripScope.applies}
                 className="mt-0.5"
               />
               <label htmlFor="strip_alarms" className="text-sm text-gray-300 select-none cursor-pointer">
@@ -390,7 +389,9 @@ export default function SourceEdit() {
                 <span className="block text-xs text-gray-500">
                   Strip VALARM blocks from this source's events before writing to the destination.
                   Useful for subscribed feeds (payroll, billing, sports) where the source's alarms
-                  shouldn't fire on your calendar.
+                  shouldn't fire on your calendar. Applies to one-way sync only: in two-way sync
+                  the alarm-less copy would be written back and erase the alarms on the source.
+                  {stripScope.partial && ' Calendars set to two-way keep their alarms.'}
                 </span>
               </label>
             </div>

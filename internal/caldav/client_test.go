@@ -1477,7 +1477,7 @@ func TestObjectsToEvents(t *testing.T) {
 	}
 
 	t.Run("converts empty objects slice", func(t *testing.T) {
-		events := client.objectsToEvents(nil)
+		events := client.objectsToEvents(nil, nil)
 		if len(events) != 0 {
 			t.Errorf("expected 0 events, got %d", len(events))
 		}
@@ -1498,7 +1498,7 @@ func TestObjectsToEvents(t *testing.T) {
 			},
 		}
 
-		events := client.objectsToEvents(objects)
+		events := client.objectsToEvents(objects, nil)
 		if len(events) != 0 {
 			t.Fatalf("expected nil-data object to be skipped, got %d events", len(events))
 		}
@@ -1520,7 +1520,7 @@ func TestObjectsToEvents(t *testing.T) {
 			},
 		}
 
-		events := client.objectsToEvents(objects)
+		events := client.objectsToEvents(objects, nil)
 		if len(events) != 1 {
 			t.Fatalf("expected 1 event, got %d", len(events))
 		}
@@ -1552,7 +1552,7 @@ func TestObjectsToEvents(t *testing.T) {
 			{Path: "/event2.ics", ETag: "e2", Data: cal2},
 		}
 
-		events := client.objectsToEvents(objects)
+		events := client.objectsToEvents(objects, nil)
 		if len(events) != 2 {
 			t.Fatalf("expected 2 events, got %d", len(events))
 		}

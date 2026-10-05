@@ -81,7 +81,7 @@ func (h *flowHarness) cycle() *SyncResult {
 	h.t.Helper()
 	h.src.resetLog()
 	h.dst.resetLog()
-	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1)
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1, false)
 	if len(res.Errors) > 0 {
 		h.t.Fatalf("fullSync returned errors: %v", res.Errors)
 	}
@@ -413,7 +413,7 @@ func TestSyncEventsToDestination_TypedNilSourceClientIsTreatedAsNil(t *testing.T
 			t.Fatalf("syncEventsToDestination panicked with a typed-nil source client: %v", p)
 		}
 	}()
-	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, h.cal, 1, db.SyncDirectionTwoWay)
+	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, FetchReport{}, h.cal, 1, db.SyncDirectionTwoWay, false)
 	if len(r.Errors) > 0 {
 		t.Fatalf("errors: %v", r.Errors)
 	}
@@ -435,7 +435,7 @@ func TestFlow_TrackingReadErrorAbortsCalendar(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1)
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1, false)
 
 	if len(res.Errors) == 0 {
 		t.Fatalf("expected an error when tracking rows can't be read, got none (warnings: %v)", res.Warnings)
@@ -467,7 +467,7 @@ func TestFlow_DestFetchErrorAbortsCalendar(t *testing.T) {
 
 	h.src.resetLog()
 	h.dst.resetLog()
-	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1)
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1, false)
 
 	if len(res.Errors) == 0 {
 		t.Fatalf("expected an error when destination events can't be fetched, got none (warnings: %v)", res.Warnings)
