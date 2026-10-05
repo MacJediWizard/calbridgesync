@@ -363,66 +363,6 @@ func (db *DB) DeleteSource(id string) error {
 	return nil
 }
 
-// GetSyncState returns the sync state for a source and calendar.
-func (db *DB) GetSyncState(sourceID, calendarHref string) (*SyncState, error) {
-	query := `SELECT id, source_id, calendar_href, sync_token, ctag, updated_at
-		FROM sync_states WHERE source_id = ? AND calendar_href = ?`
-
-	row := db.conn.QueryRow(query, sourceID, calendarHref)
-
-	state := &SyncState{}
-	var syncToken, ctag sql.NullString
-	err := row.Scan(&state.ID, &state.SourceID, &state.CalendarHref, &syncToken, &ctag, &state.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get sync state: %w", err)
-	}
-
-	state.SyncToken = syncToken.String
-	state.CTag = ctag.String
-
-	return state, nil
-}
-
-// UpsertSyncState creates or updates a sync state.
-func (db *DB) UpsertSyncState(state *SyncState) error {
-	now := time.Now().UTC()
-
-	// Try to update first
-	query := `UPDATE sync_states SET sync_token = ?, ctag = ?, updated_at = ?
-		WHERE source_id = ? AND calendar_href = ?`
-
-	result, err := db.conn.Exec(query, state.SyncToken, state.CTag, now, state.SourceID, state.CalendarHref)
-	if err != nil {
-		return fmt.Errorf("failed to update sync state: %w", err)
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	if affected == 0 {
-		// Insert new record
-		if state.ID == "" {
-			state.ID = uuid.New().String()
-		}
-		state.UpdatedAt = now
-
-		insertQuery := `INSERT INTO sync_states (id, source_id, calendar_href, sync_token, ctag, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)`
-
-		_, err = db.conn.Exec(insertQuery, state.ID, state.SourceID, state.CalendarHref, state.SyncToken, state.CTag, state.UpdatedAt)
-		if err != nil {
-			return fmt.Errorf("failed to insert sync state: %w", err)
-		}
-	}
-
-	return nil
-}
-
 // CreateSyncLog creates a new sync log entry.
 func (db *DB) CreateSyncLog(log *SyncLog) error {
 	if log.ID == "" {
