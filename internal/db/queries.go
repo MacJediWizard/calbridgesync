@@ -38,38 +38,108 @@ func (db *DB) GetOrCreateUser(email, name string) (*User, error) {
 	return user, nil
 }
 
-// GetUserByEmail returns a user by their email address.
-func (db *DB) GetUserByEmail(email string) (*User, error) {
-	query := `SELECT id, email, name, created_at, updated_at FROM users WHERE email = ?`
-	row := db.conn.QueryRow(query, email)
+// GetOrBindUserBySubject returns the user bound to the OIDC subject. When no
+// user is bound to it yet, it binds the subject to the existing user with
+// this email (the first login after the binding migration), or creates a new
+// bound user. An email already bound to a different subject is rejected with
+// ErrSubjectMismatch, so a second IdP identity presenting the same email
+// cannot take over the account.
+func (db *DB) GetOrBindUserBySubject(subject, email, name string) (*User, error) {
+	if subject == "" {
+		return nil, ErrMissingSubject
+	}
 
+	user, err := db.getUserBySubject(subject)
+	if err == nil {
+		return user, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	user, err = db.GetUserByEmail(email)
+	switch {
+	case err == nil:
+		if user.OIDCSubject != "" {
+			return nil, ErrSubjectMismatch
+		}
+		res, err := db.conn.Exec(
+			`UPDATE users SET oidc_subject = ?, updated_at = ? WHERE id = ? AND oidc_subject IS NULL`,
+			subject, now, user.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to bind OIDC subject: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("failed to bind OIDC subject: %w", err)
+		} else if n == 0 {
+			// A concurrent login bound this row first. Accept it only if
+			// it bound the same subject.
+			if bound, err := db.getUserBySubject(subject); err == nil && bound.ID == user.ID {
+				return bound, nil
+			}
+			return nil, ErrSubjectMismatch
+		}
+		user.OIDCSubject = subject
+		user.UpdatedAt = now
+		return user, nil
+
+	case errors.Is(err, ErrNotFound):
+		user = &User{
+			ID:          uuid.New().String(),
+			Email:       email,
+			Name:        name,
+			OIDCSubject: subject,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		_, err = db.conn.Exec(
+			`INSERT INTO users (id, email, name, oidc_subject, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			user.ID, user.Email, user.Name, user.OIDCSubject, user.CreatedAt, user.UpdatedAt)
+		if err != nil {
+			// A concurrent first login with the same subject may have won.
+			if bound, lookupErr := db.getUserBySubject(subject); lookupErr == nil {
+				return bound, nil
+			}
+			return nil, fmt.Errorf("failed to create user: %w", err)
+		}
+		return user, nil
+
+	default:
+		return nil, err
+	}
+}
+
+const userColumns = `id, email, name, oidc_subject, created_at, updated_at`
+
+// scanUser reads one user row selected with userColumns.
+func scanUser(row *sql.Row, by string) (*User, error) {
 	user := &User{}
-	err := row.Scan(&user.ID, &user.Email, &user.Name, &user.CreatedAt, &user.UpdatedAt)
+	var subject sql.NullString
+	err := row.Scan(&user.ID, &user.Email, &user.Name, &subject, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user by email: %w", err)
+		return nil, fmt.Errorf("failed to get user by %s: %w", by, err)
 	}
-
+	user.OIDCSubject = subject.String
 	return user, nil
+}
+
+// getUserBySubject returns the user bound to an OIDC subject.
+func (db *DB) getUserBySubject(subject string) (*User, error) {
+	return scanUser(db.conn.QueryRow(`SELECT `+userColumns+` FROM users WHERE oidc_subject = ?`, subject), "OIDC subject")
+}
+
+// GetUserByEmail returns a user by their email address.
+func (db *DB) GetUserByEmail(email string) (*User, error) {
+	return scanUser(db.conn.QueryRow(`SELECT `+userColumns+` FROM users WHERE email = ?`, email), "email")
 }
 
 // GetUserByID returns a user by their ID.
 func (db *DB) GetUserByID(id string) (*User, error) {
-	query := `SELECT id, email, name, created_at, updated_at FROM users WHERE id = ?`
-	row := db.conn.QueryRow(query, id)
-
-	user := &User{}
-	err := row.Scan(&user.ID, &user.Email, &user.Name, &user.CreatedAt, &user.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user by ID: %w", err)
-	}
-
-	return user, nil
+	return scanUser(db.conn.QueryRow(`SELECT `+userColumns+` FROM users WHERE id = ?`, id), "ID")
 }
 
 // CreateSource creates a new source.

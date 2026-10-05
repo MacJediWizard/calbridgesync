@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -159,8 +160,16 @@ func (h *Handlers) Callback(c *gin.Context) {
 		return
 	}
 
-	// Get or create user
-	user, err := h.db.GetOrCreateUser(claims.Email, claims.Name)
+	// Look the user up by OIDC subject, binding it to the existing
+	// account with this email on first login.
+	user, err := h.db.GetOrBindUserBySubject(claims.Subject, claims.Email, claims.Name)
+	if errors.Is(err, db.ErrSubjectMismatch) {
+		log.Printf("OIDC login rejected: email %q is bound to a different subject", claims.Email)
+		c.HTML(http.StatusForbidden, "error.html", gin.H{
+			"error": "This email is linked to a different sign-in identity. Contact the administrator.",
+		})
+		return
+	}
 	if err != nil {
 		c.HTML(http.StatusInternalServerError, "error.html", gin.H{
 			"error": "Failed to create user",

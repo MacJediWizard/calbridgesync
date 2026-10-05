@@ -240,6 +240,95 @@ func TestGetOrCreateUser(t *testing.T) {
 	})
 }
 
+func TestGetOrBindUserBySubject(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	t.Run("creates new user bound to subject", func(t *testing.T) {
+		user, err := db.GetOrBindUserBySubject("sub-new", "fresh@example.com", "Fresh")
+		if err != nil {
+			t.Fatalf("GetOrBindUserBySubject: %v", err)
+		}
+		if user.Email != "fresh@example.com" || user.OIDCSubject != "sub-new" {
+			t.Errorf("got email %q subject %q", user.Email, user.OIDCSubject)
+		}
+
+		again, err := db.GetOrBindUserBySubject("sub-new", "fresh@example.com", "Fresh")
+		if err != nil {
+			t.Fatalf("second login: %v", err)
+		}
+		if again.ID != user.ID {
+			t.Errorf("second login returned user %q, want %q", again.ID, user.ID)
+		}
+	})
+
+	t.Run("binds existing email user once, then rejects a different subject", func(t *testing.T) {
+		// A user created before this migration has no subject.
+		legacy, err := db.GetOrCreateUser("legacy@example.com", "Legacy")
+		if err != nil {
+			t.Fatalf("GetOrCreateUser: %v", err)
+		}
+
+		bound, err := db.GetOrBindUserBySubject("sub-legacy", "legacy@example.com", "Legacy")
+		if err != nil {
+			t.Fatalf("first login: %v", err)
+		}
+		if bound.ID != legacy.ID {
+			t.Fatalf("bind created a new user %q, want existing %q", bound.ID, legacy.ID)
+		}
+		if bound.OIDCSubject != "sub-legacy" {
+			t.Errorf("subject = %q, want sub-legacy", bound.OIDCSubject)
+		}
+
+		stored, err := db.GetUserByID(legacy.ID)
+		if err != nil {
+			t.Fatalf("GetUserByID: %v", err)
+		}
+		if stored.OIDCSubject != "sub-legacy" {
+			t.Errorf("stored subject = %q, want sub-legacy", stored.OIDCSubject)
+		}
+
+		// Same subject logs in again: same user, no rebinding.
+		again, err := db.GetOrBindUserBySubject("sub-legacy", "legacy@example.com", "Legacy")
+		if err != nil || again.ID != legacy.ID {
+			t.Fatalf("repeat login: user %v err %v", again, err)
+		}
+
+		// A different subject presenting the same email is rejected.
+		_, err = db.GetOrBindUserBySubject("sub-attacker", "legacy@example.com", "Mallory")
+		if !errors.Is(err, ErrSubjectMismatch) {
+			t.Fatalf("different subject, same email: err = %v, want ErrSubjectMismatch", err)
+		}
+		stored, _ = db.GetUserByID(legacy.ID)
+		if stored.OIDCSubject != "sub-legacy" {
+			t.Errorf("subject was overwritten to %q", stored.OIDCSubject)
+		}
+	})
+
+	t.Run("bound user keeps access after the IdP email changes", func(t *testing.T) {
+		user, err := db.GetOrBindUserBySubject("sub-mover", "old@example.com", "Mover")
+		if err != nil {
+			t.Fatalf("first login: %v", err)
+		}
+		moved, err := db.GetOrBindUserBySubject("sub-mover", "new@example.com", "Mover")
+		if err != nil {
+			t.Fatalf("login with new email: %v", err)
+		}
+		if moved.ID != user.ID {
+			t.Errorf("email change created user %q, want %q", moved.ID, user.ID)
+		}
+	})
+
+	t.Run("empty subject is rejected", func(t *testing.T) {
+		if _, err := db.GetOrBindUserBySubject("", "nosub@example.com", "No Sub"); err == nil {
+			t.Fatal("expected error for empty subject")
+		}
+		if _, err := db.GetUserByEmail("nosub@example.com"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("user was created despite empty subject: err = %v", err)
+		}
+	})
+}
+
 func TestGetUserByEmail(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()

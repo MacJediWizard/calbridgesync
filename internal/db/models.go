@@ -148,11 +148,14 @@ var SourcePresets = map[SourceType]SourcePreset{
 
 // User represents a user in the system.
 type User struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	// OIDCSubject is the IdP "sub" this user is bound to. Empty until the
+	// user's first login after the binding migration.
+	OIDCSubject string    `json:"-"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // UserAlertPreferences stores per-user alert notification preferences.
