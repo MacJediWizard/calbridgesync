@@ -28,6 +28,10 @@ type fakeCalendarClient struct {
 	puts    []string         // resolved paths of successful PUTs, in order
 	deletes []string         // paths of successful DELETEs, in order
 	errOn   map[string]error // path (event or calendar) -> injected error
+
+	// Read-side failures reported by GetEventsWithReport (#206).
+	readErrOn map[string]error  // stored event path -> fetch error (object is listed but unreadable)
+	malformed map[string]string // listed path -> raw UID ("" if none) of a malformed object
 }
 
 func newFakeCalendarClient(calendarPath string) *fakeCalendarClient {
@@ -36,6 +40,8 @@ func newFakeCalendarClient(calendarPath string) *fakeCalendarClient {
 		calendarPath: calendarPath,
 		events:       make(map[string]Event),
 		errOn:        make(map[string]error),
+		readErrOn:    make(map[string]error),
+		malformed:    make(map[string]string),
 	}
 }
 
@@ -53,6 +59,23 @@ func (f *fakeCalendarClient) seed(calendarPath, uid, summary, start string) Even
 	defer f.mu.Unlock()
 	e := Event{
 		Path:      strings.TrimSuffix(calendarPath, "/") + "/" + uid + ".ics",
+		ETag:      f.nextETag(),
+		Data:      testICS(uid, summary, start),
+		UID:       uid,
+		Summary:   summary,
+		StartTime: start,
+	}
+	f.events[e.Path] = e
+	return e
+}
+
+// seedAt stores an event at an explicit path, for servers whose object
+// names are not <UID>.ics.
+func (f *fakeCalendarClient) seedAt(path, uid, summary, start string) Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := Event{
+		Path:      path,
 		ETag:      f.nextETag(),
 		Data:      testICS(uid, summary, start),
 		UID:       uid,
@@ -90,6 +113,22 @@ func (f *fakeCalendarClient) failOn(path string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.errOn[path] = err
+}
+
+// failReadOn makes a stored event unreadable: listings report it as
+// an unreadable object instead of returning it.
+func (f *fakeCalendarClient) failReadOn(path string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readErrOn[path] = err
+}
+
+// addMalformed lists a malformed object at path. rawUID is what a raw
+// "UID:" line would yield ("" when the object has none).
+func (f *fakeCalendarClient) addMalformed(path, rawUID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.malformed[path] = rawUID
 }
 
 func (f *fakeCalendarClient) resetLog() {
@@ -151,21 +190,49 @@ func (f *fakeCalendarClient) GetCalendarPath() string {
 	return f.calendarPath
 }
 
-func (f *fakeCalendarClient) GetEvents(_ context.Context, calendarPath string, _ *MalformedEventCollector) ([]Event, error) {
+func (f *fakeCalendarClient) GetEvents(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
+	events, _, err := f.GetEventsWithReport(ctx, calendarPath, collector)
+	return events, err
+}
+
+// GetEventsWithReport mirrors (*Client).GetEventsWithReport: objects
+// injected with failReadOn are reported as transient (or malformed if
+// the error looks malformed), objects added with addMalformed are
+// reported as malformed with their raw UID.
+func (f *fakeCalendarClient) GetEventsWithReport(_ context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, FetchReport, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.errOn[calendarPath]; err != nil {
-		return nil, err
+		return nil, FetchReport{}, err
 	}
 	prefix := strings.TrimSuffix(calendarPath, "/") + "/"
+	var report FetchReport
 	out := make([]Event, 0)
 	for p, e := range f.events {
+		if !strings.HasPrefix(p, prefix) {
+			continue
+		}
+		if err := f.readErrOn[p]; err != nil {
+			kind := UnreadableTransient
+			if IsMalformedError(err) {
+				kind = UnreadableMalformed
+			}
+			report.Unreadable = append(report.Unreadable, UnreadableObject{Path: p, Kind: kind, Err: err.Error()})
+			continue
+		}
+		out = append(out, e)
+	}
+	for p, uid := range f.malformed {
 		if strings.HasPrefix(p, prefix) {
-			out = append(out, e)
+			if collector != nil {
+				collector.Add(p, "malformed (fake)")
+			}
+			report.Unreadable = append(report.Unreadable, UnreadableObject{Path: p, Kind: UnreadableMalformed, UID: uid, Err: "malformed (fake)"})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out, nil
+	sort.Slice(report.Unreadable, func(i, j int) bool { return report.Unreadable[i].Path < report.Unreadable[j].Path })
+	return out, report, nil
 }
 
 func (f *fakeCalendarClient) GetEvent(_ context.Context, eventPath string) (*Event, error) {
