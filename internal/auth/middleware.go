@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -57,65 +56,6 @@ func GetCurrentUser(c *gin.Context) *SessionData {
 	}
 
 	return sessionData
-}
-
-// ValidateCSRF is a middleware that validates CSRF tokens for non-safe methods.
-// It skips validation for GET, HEAD, OPTIONS methods and HTMX requests.
-func ValidateCSRF(sm *SessionManager) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Skip for safe methods
-		if c.Request.Method == http.MethodGet ||
-			c.Request.Method == http.MethodHead ||
-			c.Request.Method == http.MethodOptions {
-			c.Next()
-			return
-		}
-
-		// Skip for HTMX requests (they include their own CSRF protection via headers)
-		if c.GetHeader("HX-Request") == "true" {
-			c.Next()
-			return
-		}
-
-		// Get session
-		session, err := sm.Get(c.Request)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "session required"})
-			return
-		}
-
-		// Get CSRF token from request
-		csrfToken := c.PostForm("csrf_token")
-		if csrfToken == "" {
-			csrfToken = c.GetHeader("X-CSRF-Token")
-		}
-
-		// Validate token with a constant-time comparison so the
-		// comparison loop's timing does not reveal the token
-		// byte-by-byte. Go's default `!=` on strings short-circuits
-		// on the first mismatching byte, which in theory lets an
-		// attacker measure response latency and deduce prefix
-		// length. In practice the CSRF token is 32 random bytes
-		// behind HTTPS and the network jitter swamps any timing
-		// signal, so this fix is defense-in-depth rather than a
-		// practical exploit fix — but subtle.ConstantTimeCompare
-		// is free and the wrong default is the kind of thing that
-		// will come up in a security audit or the next static
-		// analyzer pass. Matches the standard library guidance
-		// for comparing MACs and tokens. (#111)
-		//
-		// subtle.ConstantTimeCompare requires equal-length inputs
-		// and panics on nil; the csrfToken == "" short-circuit
-		// handles the zero-length case, and we convert to []byte
-		// so the comparison operates on raw bytes rather than
-		// Go's string-interning fast path.
-		if csrfToken == "" || subtle.ConstantTimeCompare([]byte(csrfToken), []byte(session.CSRFToken)) != 1 {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "invalid CSRF token"})
-			return
-		}
-
-		c.Next()
-	}
 }
 
 // OptionalAuth is a middleware that loads session data if available but doesn't require it.
