@@ -7,30 +7,30 @@ import (
 
 // SyncActivity represents the current state of a sync operation.
 type SyncActivity struct {
-	SourceID        string    `json:"source_id"`
-	SourceName      string    `json:"source_name"`
-	Status          string    `json:"status"` // "running", "completed", "error"
-	CurrentCalendar string    `json:"current_calendar,omitempty"`
-	TotalCalendars  int       `json:"total_calendars"`
-	Calendarssynced int       `json:"calendars_synced"`
-	EventsProcessed int       `json:"events_processed"`
-	EventsCreated   int       `json:"events_created"`
-	EventsUpdated   int       `json:"events_updated"`
-	EventsDeleted   int       `json:"events_deleted"`
-	EventsSkipped   int       `json:"events_skipped"`
-	StartedAt       time.Time `json:"started_at"`
+	SourceID        string     `json:"source_id"`
+	SourceName      string     `json:"source_name"`
+	Status          string     `json:"status"` // "running", "completed", "error"
+	CurrentCalendar string     `json:"current_calendar,omitempty"`
+	TotalCalendars  int        `json:"total_calendars"`
+	Calendarssynced int        `json:"calendars_synced"`
+	EventsProcessed int        `json:"events_processed"`
+	EventsCreated   int        `json:"events_created"`
+	EventsUpdated   int        `json:"events_updated"`
+	EventsDeleted   int        `json:"events_deleted"`
+	EventsSkipped   int        `json:"events_skipped"`
+	StartedAt       time.Time  `json:"started_at"`
 	CompletedAt     *time.Time `json:"completed_at,omitempty"`
-	Duration        string    `json:"duration,omitempty"`
-	Message         string    `json:"message,omitempty"`
-	Errors          []string  `json:"errors,omitempty"`
+	Duration        string     `json:"duration,omitempty"`
+	Message         string     `json:"message,omitempty"`
+	Errors          []string   `json:"errors,omitempty"`
 }
 
 // Tracker tracks sync activity across all sources.
 type Tracker struct {
-	mu              sync.RWMutex
-	active          map[string]*SyncActivity // sourceID -> activity
-	recent          []*SyncActivity          // Recently completed syncs
-	maxRecentSyncs  int
+	mu             sync.RWMutex
+	active         map[string]*SyncActivity // sourceID -> activity
+	recent         []*SyncActivity          // Recently completed syncs
+	maxRecentSyncs int
 }
 
 // NewTracker creates a new activity tracker.
