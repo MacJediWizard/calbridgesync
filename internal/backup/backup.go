@@ -21,6 +21,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
 
 // Manager handles automated database backups.
@@ -60,54 +62,29 @@ func New(dbPath, backupDir string, retentionCount int) (*Manager, error) {
 // open and being written to (it takes a snapshot of the current
 // state including WAL contents). Requires SQLite 3.27+.
 func (m *Manager) RunBackup() (string, error) {
+	// Without this check, opening a missing path creates an empty
+	// database and VACUUM INTO "succeeds" with an empty backup.
+	if _, err := os.Stat(m.dbPath); err != nil {
+		return "", fmt.Errorf("database not readable for backup: %w", err)
+	}
+
 	timestamp := time.Now().UTC().Format("20060102-150405Z")
 	backupName := fmt.Sprintf("calbridgesync-%s.db.gz", timestamp)
 	backupPath := filepath.Join(m.backupDir, backupName)
-
-	// VACUUM INTO creates a clean copy of the database at the
-	// specified path. It's atomic and WAL-safe.
 	tempPath := backupPath + ".tmp"
 	tempDBPath := tempPath + ".db"
 
-	db, err := sql.Open("sqlite3", m.dbPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to open database for backup: %w", err)
-	}
-	defer db.Close()
-
-	_, err = db.Exec(fmt.Sprintf("VACUUM INTO '%s'", tempDBPath))
-	if err != nil {
-		return "", fmt.Errorf("VACUUM INTO failed: %w", err)
-	}
-
-	// Compress with gzip
-	srcFile, err := os.Open(tempDBPath)
-	if err != nil {
+	if err := m.vacuumInto(tempDBPath); err != nil {
 		os.Remove(tempDBPath)
-		return "", fmt.Errorf("failed to open temp backup: %w", err)
+		return "", err
 	}
-	defer srcFile.Close()
-
-	dstFile, err := os.Create(tempPath)
-	if err != nil {
-		os.Remove(tempDBPath)
-		return "", fmt.Errorf("failed to create gzip file: %w", err)
-	}
-
-	gzWriter := gzip.NewWriter(dstFile)
-	if _, err := io.Copy(gzWriter, srcFile); err != nil {
-		gzWriter.Close()
-		dstFile.Close()
-		os.Remove(tempDBPath)
-		os.Remove(tempPath)
-		return "", fmt.Errorf("gzip compression failed: %w", err)
-	}
-	gzWriter.Close()
-	dstFile.Close()
-	srcFile.Close()
+	err := gzipFile(tempDBPath, tempPath)
 	os.Remove(tempDBPath)
+	if err != nil {
+		os.Remove(tempPath)
+		return "", err
+	}
 
-	// Atomic rename
 	if err := os.Rename(tempPath, backupPath); err != nil {
 		os.Remove(tempPath)
 		return "", fmt.Errorf("failed to finalize backup: %w", err)
@@ -119,6 +96,52 @@ func (m *Manager) RunBackup() (string, error) {
 	}
 
 	return backupPath, nil
+}
+
+// vacuumInto writes an uncompressed snapshot of the database to dest
+// and restricts it to owner-only access.
+func (m *Manager) vacuumInto(dest string) error {
+	db, err := sql.Open("sqlite", m.dbPath+"?_pragma=busy_timeout(30000)")
+	if err != nil {
+		return fmt.Errorf("failed to open database for backup: %w", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("VACUUM INTO ?", dest); err != nil {
+		return fmt.Errorf("VACUUM INTO failed: %w", err)
+	}
+	if err := os.Chmod(dest, 0600); err != nil {
+		return fmt.Errorf("failed to restrict snapshot permissions: %w", err)
+	}
+	return nil
+}
+
+// gzipFile compresses src into a new owner-only file at dest.
+func gzipFile(src, dest string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open snapshot: %w", err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip file: %w", err)
+	}
+	zw := gzip.NewWriter(out)
+	if _, err := io.Copy(zw, in); err != nil {
+		zw.Close()
+		out.Close()
+		return fmt.Errorf("gzip compression failed: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		out.Close()
+		return fmt.Errorf("gzip compression failed: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("failed to write gzip file: %w", err)
+	}
+	return nil
 }
 
 // PurgeOldBackups deletes the oldest backups beyond the retention

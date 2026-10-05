@@ -5,6 +5,8 @@ services:
     image: calbridgesync:latest
     container_name: calbridgesync
     restart: unless-stopped
+    # Give in-flight syncs time to finish before SIGKILL on stop/redeploy.
+    stop_grace_period: 60s
     ports:
       - "127.0.0.1:8686:8080"
     volumes:
