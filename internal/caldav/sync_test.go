@@ -479,3 +479,22 @@ func TestExtractUIDFromEventPath_RoundTripWithRewrite(t *testing.T) {
 			sourcePath, rewritten, got, uid)
 	}
 }
+
+// TestActiveAdditionalDestinations_PausedReturnsNone pins the PR-04 pause
+// (#183): additional destinations share synced_events/sync_states rows with
+// the primary destination, so even enabled ones must not be synced until they
+// have their own tracking state.
+func TestActiveAdditionalDestinations_PausedReturnsNone(t *testing.T) {
+	dests := []*db.Destination{
+		{ID: "d1", Name: "extra-1", DestURL: "https://dav.example.com/1", Enabled: true},
+		{ID: "d2", Name: "extra-2", DestURL: "https://dav.example.com/2", Enabled: true},
+		{ID: "d3", Name: "disabled", DestURL: "https://dav.example.com/3", Enabled: false},
+	}
+
+	if got := activeAdditionalDestinations(dests); len(got) != 0 {
+		t.Fatalf("activeAdditionalDestinations returned %d destination(s) while paused, want 0", len(got))
+	}
+	if got := activeAdditionalDestinations(nil); len(got) != 0 {
+		t.Fatalf("activeAdditionalDestinations(nil) returned %d destination(s), want 0", len(got))
+	}
+}

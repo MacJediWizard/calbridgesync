@@ -757,6 +757,36 @@ type caldavEventDeleter interface {
 	DeleteEvent(ctx context.Context, eventPath string) error
 }
 
+// calendarClient is the CalDAV client surface that fullSync,
+// syncEventsToDestination and cleanupDuplicates use. It exists so the
+// sync flow can be driven against an in-memory fake in tests (#177);
+// production always passes a *Client.
+//
+// Callers that have no source client (the ICS path) pass nil. A typed
+// nil *Client would compare non-nil inside the interface, so
+// syncEventsToDestination normalizes it with nilIfTypedNil before its
+// "sourceClient != nil" checks.
+type calendarClient interface {
+	FindCalendars(ctx context.Context) ([]Calendar, error)
+	FindCalendarsGoogle(ctx context.Context) ([]Calendar, error)
+	GetCalendarPath() string
+	GetEvents(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error)
+	GetEvent(ctx context.Context, eventPath string) (*Event, error)
+	PutEvent(ctx context.Context, calendarPath string, event *Event) error
+	DeleteEvent(ctx context.Context, eventPath string) error
+}
+
+var _ calendarClient = (*Client)(nil)
+
+// nilIfTypedNil turns a calendarClient holding a nil *Client into an
+// untyped nil, so "c != nil" means "there is a client to call".
+func nilIfTypedNil(c calendarClient) calendarClient {
+	if cc, ok := c.(*Client); ok && cc == nil {
+		return nil
+	}
+	return c
+}
+
 // syncedEventTrackingDeleter is the narrow DB surface that
 // performDeletionAndCleanup needs. Same rationale as
 // caldavEventDeleter — keeping the mock small by depending only
@@ -944,6 +974,44 @@ func (se *SyncEngine) buildPerSourceGoogleOAuthConfig(source *db.Source, redirec
 // GetActivityTracker returns the activity tracker for external use.
 func (se *SyncEngine) GetActivityTracker() *activity.Tracker {
 	return se.tracker
+}
+
+// multiDestinationPaused gates syncing to additional destinations (#183).
+// synced_events and sync_states have no destination_id, so an extra
+// destination reads and writes the primary destination's tracking rows:
+// its upserts overwrite the primary's dest_etag/dest_path and its orphan
+// deletes act on the primary's rows. Forcing it to one-way is not enough.
+// Stays true until the remove-or-finish decision (audit PR-35) lands.
+const multiDestinationPaused = true
+
+// activeAdditionalDestinations returns the additional destinations that
+// should be synced this cycle. It returns nil while multi-destination is
+// paused (#183), even when destinations are enabled.
+func activeAdditionalDestinations(dests []*db.Destination) []*db.Destination {
+	if multiDestinationPaused {
+		return nil
+	}
+	var active []*db.Destination
+	for _, d := range dests {
+		if d.Enabled {
+			active = append(active, d)
+		}
+	}
+	return active
+}
+
+// logPausedDestinations logs once per sync how many enabled additional
+// destinations were skipped because multi-destination is paused (#183).
+func logPausedDestinations(sourceName string, all, active []*db.Destination) {
+	enabled := 0
+	for _, d := range all {
+		if d.Enabled {
+			enabled++
+		}
+	}
+	if paused := enabled - len(active); paused > 0 {
+		log.Printf("%d additional destination(s) paused for source %s: multi-destination sync is disabled until destinations get their own tracking state (#183)", paused, sourceName)
+	}
 }
 
 // SyncSource performs synchronization for a single source.
@@ -1168,14 +1236,16 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	// row) always syncs first — additional destinations are
 	// additive. A failure on one additional destination doesn't
 	// prevent others from being tried.
+	//
+	// Paused (#183): activeAdditionalDestinations returns nil until
+	// extra destinations get their own tracking rows.
 	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
 	if err != nil {
 		log.Printf("Failed to load additional destinations for source %s: %v", source.Name, err)
 	}
-	for _, dest := range additionalDests {
-		if !dest.Enabled {
-			continue
-		}
+	activeDests := activeAdditionalDestinations(additionalDests)
+	logPausedDestinations(source.Name, additionalDests, activeDests)
+	for _, dest := range activeDests {
 		log.Printf("Syncing to additional destination: %s (%s)", dest.Name, dest.DestURL)
 		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
 		if decErr != nil {
@@ -1442,7 +1512,7 @@ func filterEventsByDate(events []Event, cutoffDate time.Time) []Event {
 	return filtered
 }
 
-func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int) *SyncResult {
+func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, calendar Calendar, calendarIndex int) *SyncResult {
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),
@@ -1532,7 +1602,8 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 // syncEventsToDestination handles the comparison, creation, update, and deletion of events
 // between source events and a destination CalDAV calendar. This is shared by both CalDAV
 // full sync and ICS feed sync paths.
-func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient *Client, destClient *Client, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+	sourceClient = nilIfTypedNil(sourceClient)
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),
@@ -2249,7 +2320,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 // be lower, and individual failures were invisible to users. Issue #55
 // changed the signature to pass *SyncResult through so failures are
 // observable.
-func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client, destCalendarPath string, sourceEventMap map[string]Event, result *SyncResult) {
+func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient calendarClient, destCalendarPath string, sourceEventMap map[string]Event, result *SyncResult) {
 	log.Printf("Starting duplicate cleanup for destination: %s", destCalendarPath)
 
 	// Re-fetch destination events to get current state
@@ -2447,14 +2518,16 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	// Multi-destination sync (#156): after syncing to the primary
 	// destination, replicate the same ICS events to any additional
 	// destinations. Failures on one extra dest don't block others.
+	//
+	// Paused (#183): activeAdditionalDestinations returns nil until
+	// extra destinations get their own tracking rows.
 	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
 	if err != nil {
 		log.Printf("Failed to load additional destinations for ICS source %s: %v", source.Name, err)
 	}
-	for _, dest := range additionalDests {
-		if !dest.Enabled {
-			continue
-		}
+	activeDests := activeAdditionalDestinations(additionalDests)
+	logPausedDestinations(source.Name, additionalDests, activeDests)
+	for _, dest := range activeDests {
 		log.Printf("Syncing ICS feed to additional destination: %s (%s)", dest.Name, dest.DestURL)
 		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
 		if decErr != nil {
