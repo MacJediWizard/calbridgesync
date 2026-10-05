@@ -1453,24 +1453,16 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	updateStatus("fetching destination events")
 	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
 	if err != nil {
-		// Previously this failure only logged and then proceeded with
-		// an empty destEvents slice. That silently masked a real
-		// destination failure — the rest of the sync would compute
-		// deltas against "zero destination events" and either mass-
-		// delete tracked UIDs (caught by the ratio guards from #80/#82)
-		// or mass-create them as if the destination was empty.
-		//
-		// Append to Warnings so operators actually see the failure
-		// surfaced in the sync result. Not escalated to result.Errors
-		// because one-way source_wins semantics can tolerate an
-		// empty-destination view — the ratio guards still protect
-		// against cascading deletions, and escalating to Errors would
-		// flip every transient destination fetch failure into a hard
-		// sync failure. Operator design call to tighten this further. (#93)
-		msg := fmt.Sprintf("Failed to get destination events (path: %s): %v - proceeding with empty destination view, ratio guards will protect against cascades", destCalendarPath, err)
+		// Abort this calendar before any planner or write. Proceeding
+		// with an empty destination view (the #93 behavior) re-PUTs
+		// every source event, runs the deletion planners against a
+		// destination that only looks empty, and leans on the
+		// empty-destination guards to avoid a cascade. A failed fetch
+		// is a failed cycle; the next interval retries.
+		msg := fmt.Sprintf("Failed to get destination events (path: %s): %v - skipping calendar, no changes made", destCalendarPath, err)
 		log.Printf("%s", msg)
-		result.Warnings = append(result.Warnings, msg)
-		destEvents = []Event{}
+		result.Errors = append(result.Errors, msg)
+		return result
 	}
 	log.Printf("Fetched %d events from destination calendar", len(destEvents))
 

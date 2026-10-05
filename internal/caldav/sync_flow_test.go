@@ -449,3 +449,38 @@ func TestFlow_TrackingReadErrorAbortsCalendar(t *testing.T) {
 	assertPaths(t, "tracking read error", "dest DELETEs", h.dst.deleteLog())
 	assertCounts(t, "tracking read error", res, counts{})
 }
+
+// TestFlow_DestFetchErrorAbortsCalendar: when the destination
+// GetEvents call fails, the calendar pass must fail before any planner
+// or write. Proceeding with an empty destination view re-PUTs every
+// source event to the destination and runs the deletion planners
+// against a destination that only looks empty.
+func TestFlow_DestFetchErrorAbortsCalendar(t *testing.T) {
+	h := twoWaySetup(t, 0)
+	// A source edit that would otherwise be pushed forward, and a
+	// tracked event gone from the source that would otherwise be
+	// deleted from the destination.
+	h.src.edit(srcPath("A"), "Event A edited")
+	h.src.remove(srcPath("B"))
+	h.dst.failOn(flowDestCal, fakeErr("500 Internal Server Error"))
+	rowsBefore := h.rows()
+
+	h.src.resetLog()
+	h.dst.resetLog()
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1)
+
+	if len(res.Errors) == 0 {
+		t.Fatalf("expected an error when destination events can't be fetched, got none (warnings: %v)", res.Warnings)
+	}
+	if !strings.Contains(strings.Join(res.Errors, "\n"), "destination events") {
+		t.Errorf("errors = %v, want one naming the destination fetch", res.Errors)
+	}
+	assertPaths(t, "dest fetch error", "source PUTs", h.src.putLog())
+	assertPaths(t, "dest fetch error", "source DELETEs", h.src.deleteLog())
+	assertPaths(t, "dest fetch error", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "dest fetch error", "dest DELETEs", h.dst.deleteLog())
+	assertCounts(t, "dest fetch error", res, counts{})
+	if rowsAfter := h.rows(); !reflect.DeepEqual(rowsAfter, rowsBefore) {
+		t.Errorf("dest fetch error: synced_events changed: before %v, after %v", rowsBefore, rowsAfter)
+	}
+}
