@@ -386,6 +386,22 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		}
 	}
 
+	// Index the feed's VTIMEZONEs in feed order (first definition of a
+	// TZID wins) so each per-UID object can carry the ones it references.
+	var feedTimezones []*ical.Component
+	seenTZID := make(map[string]bool)
+	for _, child := range cal.Children {
+		if child.Name != ical.CompTimezone {
+			continue
+		}
+		tzid, _ := child.Props.Text(ical.PropTimezoneID)
+		if tzid == "" || seenTZID[tzid] {
+			continue
+		}
+		seenTZID[tzid] = true
+		feedTimezones = append(feedTimezones, child)
+	}
+
 	// Build events from groups
 	var events []Event
 	for _, uid := range groupOrder {
@@ -394,6 +410,22 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		singleCal := ical.NewCalendar()
 		singleCal.Props.SetText(ical.PropVersion, "2.0")
 		singleCal.Props.SetText(ical.PropProductID, "-//CalBridgeSync//EN")
+
+		// Copy referenced VTIMEZONEs ahead of the VEVENTs; without them
+		// TZID parameters dangle and the event is mis-timed or rejected
+		// by strict servers. (#248)
+		if len(feedTimezones) > 0 {
+			used := make(map[string]bool)
+			for _, vevent := range g.vevents {
+				collectTZIDs(vevent, used)
+			}
+			for _, tz := range feedTimezones {
+				if tzid, _ := tz.Props.Text(ical.PropTimezoneID); used[tzid] {
+					singleCal.Children = append(singleCal.Children, tz)
+				}
+			}
+		}
+
 		for _, vevent := range g.vevents {
 			singleCal.Children = append(singleCal.Children, vevent)
 		}
@@ -418,6 +450,21 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 
 	log.Printf("ICS feed: parsed %d events (%d UIDs grouped from %d VEVENTs)", len(events), len(groups), len(cal.Events()))
 	return events, nil
+}
+
+// collectTZIDs records every TZID parameter used by comp's properties
+// and those of its sub-components (e.g. VALARM) into used.
+func collectTZIDs(comp *ical.Component, used map[string]bool) {
+	for _, props := range comp.Props {
+		for _, p := range props {
+			if tzid := p.Params.Get(ical.ParamTimezoneID); tzid != "" {
+				used[tzid] = true
+			}
+		}
+	}
+	for _, child := range comp.Children {
+		collectTZIDs(child, used)
+	}
 }
 
 // icsSyntheticETag derives a stable ETag for one encoded UID group.
