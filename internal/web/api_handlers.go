@@ -115,11 +115,16 @@ type APISource struct {
 	Enabled           bool                `json:"enabled"`
 	StripAlarms       bool                `json:"strip_alarms"`
 	SyncStatus        string              `json:"sync_status"`
-	LastSyncAt        *string             `json:"last_sync_at"`
-	NextSyncAt        *string             `json:"next_sync_at"`
-	IsStale           bool                `json:"is_stale"`
-	CreatedAt         string              `json:"created_at"`
-	UpdatedAt         string              `json:"updated_at"`
+	LastSyncMessage   string              `json:"last_sync_message"`
+	// NeedsReauth is true for a Google source whose last sync failed
+	// because its OAuth grant expired or was revoked; the SPA shows a
+	// "Reconnect Google account" prompt. (#192)
+	NeedsReauth bool    `json:"needs_reauth"`
+	LastSyncAt  *string `json:"last_sync_at"`
+	NextSyncAt  *string `json:"next_sync_at"`
+	IsStale     bool    `json:"is_stale"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
 }
 
 // APICalendar represents a calendar discovered on a CalDAV server.
@@ -229,6 +234,8 @@ func sourceToAPI(s *db.Source) *APISource {
 		Enabled:           s.Enabled,
 		StripAlarms:       s.StripAlarms,
 		SyncStatus:        string(s.LastSyncStatus),
+		LastSyncMessage:   s.LastSyncMessage,
+		NeedsReauth:       s.SourceType == db.SourceTypeGoogle && s.LastSyncMessage == caldav.GoogleAuthExpiredMessage,
 		CreatedAt:         s.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:         s.UpdatedAt.Format(time.RFC3339),
 	}

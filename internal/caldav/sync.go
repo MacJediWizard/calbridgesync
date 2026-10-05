@@ -1125,6 +1125,9 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	if source.SourceType == db.SourceTypeGoogle {
 		if err := sourceClient.TestConnectionGoogle(ctx); err != nil {
 			result.Message = "Source connection test failed"
+			if IsOAuthGrantRevoked(err) {
+				result.Message = GoogleAuthExpiredMessage // (#192)
+			}
 			result.Errors = append(result.Errors, err.Error())
 			result.Duration = time.Since(start)
 			se.finishSync(source.ID, result)
@@ -1280,13 +1283,28 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 		result.Message = fmt.Sprintf("Synced %d calendar(s) with %d warnings: %d created, %d updated, %d deleted, %d skipped",
 			len(sourceCalendars), len(result.Warnings), result.Created, result.Updated, result.Deleted, result.Skipped)
 	} else {
-		result.Message = fmt.Sprintf("Sync failed with %d errors", len(result.Errors))
+		result.Message = syncFailureMessage(source, result.Errors)
 	}
 
 	result.Duration = time.Since(start)
 	se.finishSync(source.ID, result)
 
 	return result
+}
+
+// syncFailureMessage builds the source status message for a failed
+// CalDAV sync. A Google source whose refresh token was rejected
+// (invalid_grant) mid-sync gets the actionable reconnect message;
+// everything else keeps the generic error count. (#192)
+func syncFailureMessage(source *db.Source, errs []string) string {
+	if source.SourceType == db.SourceTypeGoogle {
+		for _, e := range errs {
+			if ErrorTextIsOAuthGrantRevoked(e) {
+				return GoogleAuthExpiredMessage
+			}
+		}
+	}
+	return fmt.Sprintf("Sync failed with %d errors", len(errs))
 }
 
 func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int) *SyncResult {

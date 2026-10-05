@@ -3,8 +3,10 @@ package caldav
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-webdav/caldav"
@@ -79,5 +81,47 @@ func NewOAuthClient(ctx context.Context, baseURL string, oauthConfig *oauth2.Con
 		password:     "",
 		httpClient:   httpClient,
 		caldavClient: caldavClient,
+		tokenSource:  tokenSource,
 	}, nil
+}
+
+// GoogleAuthExpiredMessage is the source status message recorded when
+// Google rejects the stored refresh token (invalid_grant). It tells the
+// user exactly what to do; the SPA also keys its "Reconnect" prompt off
+// this message. (#192)
+const GoogleAuthExpiredMessage = "Google authorization expired or was revoked. Reconnect the Google account (Edit source > Reconnect Google account)."
+
+// oauthGrantRevokedCode is the RFC 6749 §5.2 error code Google returns
+// when a refresh token is expired, revoked, or was issued to an OAuth
+// app whose consent screen is still in "Testing" mode (7-day expiry).
+const oauthGrantRevokedCode = "invalid_grant"
+
+// classifyTokenError wraps an error from an OAuth2 token refresh. A 4xx
+// response from the provider's token endpoint means the provider
+// rejected our credentials (revoked grant, deleted client, ...), which
+// is an ErrAuthFailed. Anything else (network error, 5xx) is a
+// transient ErrConnectionFailed so a provider outage is not reported
+// as expired credentials. (#192)
+func classifyTokenError(err error) error {
+	var re *oauth2.RetrieveError
+	if errors.As(err, &re) && re.Response != nil &&
+		re.Response.StatusCode >= 400 && re.Response.StatusCode < 500 {
+		return fmt.Errorf("%w: %w", ErrAuthFailed, err)
+	}
+	return fmt.Errorf("%w: %w", ErrConnectionFailed, err)
+}
+
+// IsOAuthGrantRevoked reports whether err is the OAuth2 token endpoint
+// rejecting the refresh token with invalid_grant. That condition only
+// clears when the user re-authorizes the source. (#192)
+func IsOAuthGrantRevoked(err error) bool {
+	var re *oauth2.RetrieveError
+	return errors.As(err, &re) && re.ErrorCode == oauthGrantRevokedCode
+}
+
+// ErrorTextIsOAuthGrantRevoked is the string form of IsOAuthGrantRevoked
+// for errors that have already been flattened into SyncResult.Errors.
+// oauth2.RetrieveError renders as `oauth2: "invalid_grant" "..."`. (#192)
+func ErrorTextIsOAuthGrantRevoked(text string) bool {
+	return strings.Contains(text, `"`+oauthGrantRevokedCode+`"`)
 }

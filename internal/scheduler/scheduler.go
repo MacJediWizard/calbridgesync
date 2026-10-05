@@ -198,9 +198,15 @@ func (s *Scheduler) resetAuthFailCount(sourceID string) {
 // isAuthError returns true if the sync result looks like it failed
 // due to an authentication or authorization problem. Uses substring
 // matching against the error strings because CalDAV servers report
-// auth failures inconsistently.
+// auth failures inconsistently. OAuth2 token-endpoint rejections
+// (Google's `oauth2: "invalid_grant" ...`) come back as HTTP 400 and
+// match none of the generic markers, so they are checked explicitly.
+// (#192)
 func (s *Scheduler) isAuthError(result *caldav.SyncResult) bool {
 	check := func(text string) bool {
+		if caldav.ErrorTextIsOAuthGrantRevoked(text) {
+			return true
+		}
 		lower := strings.ToLower(text)
 		return strings.Contains(lower, "401") ||
 			strings.Contains(lower, "403") ||
@@ -236,9 +242,17 @@ func (s *Scheduler) sendCredentialExpiryAlert(source *db.Source, consecutiveFail
 	userPrefs := s.getUserAlertPrefs(source.UserID)
 	msg := fmt.Sprintf("Credentials may be expired for source '%s' — %d consecutive authentication failures. Re-enter credentials in the web UI.",
 		source.Name, consecutiveFailures)
+	details := "Check if the app password or OAuth token was revoked."
+	if source.SourceType == db.SourceTypeGoogle {
+		// Google sources have no password to re-enter; the fix is
+		// re-running OAuth for the existing source. (#192)
+		msg = fmt.Sprintf("Google authorization expired or was revoked for source '%s' — %d consecutive authentication failures. Open the source in the web UI and click \"Reconnect Google account\".",
+			source.Name, consecutiveFailures)
+		details = "If this keeps happening, make sure the Google Cloud OAuth consent screen is published (\"In production\"); apps in Testing mode get refresh tokens that expire after 7 days."
+	}
 	s.notifier.SendSyncFailureAlertWithPrefs(
 		s.ctx, source.ID, source.Name, userEmail,
-		msg, "Check if the app password or OAuth token was revoked.", userPrefs,
+		msg, details, userPrefs,
 	)
 }
 

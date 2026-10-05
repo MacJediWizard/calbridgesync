@@ -303,6 +303,35 @@ func (db *DB) UpdateSource(source *Source) error {
 	return nil
 }
 
+// UpdateSourceOAuthRefreshToken replaces the stored (already encrypted)
+// OAuth refresh token of a Google source. Scoped by id AND user_id AND
+// source_type so a reconnect can only ever touch the caller's own
+// Google source; returns ErrNotFound otherwise. Every other column is
+// left alone, so the source id, tracking rows and settings survive a
+// re-authorization. (#192)
+func (db *DB) UpdateSourceOAuthRefreshToken(id, userID, encryptedRefreshToken string) error {
+	if encryptedRefreshToken == "" {
+		return fmt.Errorf("refresh token is required")
+	}
+	query := `UPDATE sources SET oauth_refresh_token = ?, updated_at = ?
+		WHERE id = ? AND user_id = ? AND source_type = ?`
+
+	result, err := db.conn.Exec(query, encryptedRefreshToken, time.Now().UTC(), id, userID, SourceTypeGoogle)
+	if err != nil {
+		return fmt.Errorf("failed to update oauth refresh token: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
 // UpdateSourceSyncStatus updates the sync status of a source.
 func (db *DB) UpdateSourceSyncStatus(id string, status SyncStatus, message string) error {
 	now := time.Now().UTC()
