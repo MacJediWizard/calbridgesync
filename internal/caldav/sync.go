@@ -1555,6 +1555,13 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	//     deferred to a follow-up. The shouldSkipTwoWayDeletion
 	//     guard is still consulted to short-circuit when the dest
 	//     query failed entirely.
+	//
+	// deferredSourceDelete holds UIDs whose source delete the safety
+	// threshold postponed this cycle. The forward pass must not
+	// re-create them on the destination, or the user's dest-side delete
+	// is undone for good. Their tracking rows are kept so the next
+	// cycle outside the window performs the source delete. (#182)
+	deferredSourceDelete := make(map[string]bool)
 	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil {
 		// Step 1: dest-deletion via planTwoWayDeletion. The helper's
 		// three guards subsume the previous shouldSkipTwoWayDeletion
@@ -1647,6 +1654,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			// the "protect everything forever" accident.
 			if isWithinSyncSafetyThreshold(syncedEvent.CreatedAt, sourceInterval, now) {
 				log.Printf("Event %s not on destination but newly synced (CreatedAt=%v) - skipping deletion from source (safety)", uid, syncedEvent.CreatedAt)
+				deferredSourceDelete[uid] = true
 				continue
 			}
 
@@ -1702,6 +1710,12 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		}
 
 		destEvent, existsByUID := destEventMap[sourceEvent.UID]
+
+		if !existsByUID && deferredSourceDelete[sourceEvent.UID] {
+			result.EventsProcessed++
+			updateProgress()
+			continue
+		}
 
 		if !existsByUID {
 			// Check for duplicate by content

@@ -349,16 +349,33 @@ func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
 	h.dst.remove(destPath("B"))
 	r := h.cycle()
 	assertNoWarnings(t, "cycle3", r)
-	// TODAY (#182): the source delete is skipped by the safety
-	// threshold and the forward pass then re-creates B on dest, because
-	// B is still on source and no longer on dest. The user's dest-side
-	// delete is undone. The fix for #182 flips this to no dest PUT.
-	assertCounts(t, "cycle3", r, counts{Created: 1, EventsProcessed: 5})
+	// The source delete is deferred by the safety threshold, and the
+	// forward pass must not re-create B on dest: that would undo the
+	// user's dest-side delete for good (#182). B's row stays so the
+	// next cycle outside the window can perform the source delete.
+	assertCounts(t, "cycle3", r, counts{EventsProcessed: 5})
 	assertPaths(t, "cycle3", "source DELETEs", h.src.deleteLog())
-	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog(), destPath("B"))
+	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog())
 	assertRowUIDs(t, "cycle3", h.rows(), "A", "B", "C", "D", "X")
 	if _, ok := h.src.get(srcPath("B")); !ok {
 		t.Errorf("cycle3: source B was deleted despite the safety threshold")
+	}
+	if _, ok := h.dst.get(destPath("B")); ok {
+		t.Errorf("cycle3: dest B was re-created while its source delete was deferred")
+	}
+
+	// Cycle 4: outside the window, the deferred source delete happens.
+	// (Whether the forward loop then re-PUTs B from the stale slice is
+	// remediation PR-08, pinned in its own test.)
+	h.source.SyncInterval = 0
+	r = h.cycle()
+	assertNoWarnings(t, "cycle4", r)
+	if r.Deleted != 1 {
+		t.Errorf("cycle4: Deleted = %d, want 1", r.Deleted)
+	}
+	assertPaths(t, "cycle4", "source DELETEs", h.src.deleteLog(), srcPath("B"))
+	if _, ok := h.src.get(srcPath("B")); ok {
+		t.Errorf("cycle4: source B still present after the window passed")
 	}
 }
 
