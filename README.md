@@ -58,7 +58,7 @@ DATABASE_PATH=./data/calbridgesync.db
 
 # Sync Intervals (seconds)
 MIN_SYNC_INTERVAL=30
-MAX_SYNC_INTERVAL=3600
+MAX_SYNC_INTERVAL=86400
 ```
 
 ### Running with Docker

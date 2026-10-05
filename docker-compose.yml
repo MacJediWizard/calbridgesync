@@ -55,7 +55,7 @@ services:
       #- OAUTH_STATE_MAX_AGE_SECS=${OAUTH_STATE_MAX_AGE_SECS:-300} # 5m
       #- CALDAV_REQUEST_TIMEOUT=${CALDAV_REQUEST_TIMEOUT:-300}     # 5m per HTTP call
       #- MIN_SYNC_INTERVAL=${MIN_SYNC_INTERVAL:-30}                # seconds
-      #- MAX_SYNC_INTERVAL=${MAX_SYNC_INTERVAL:-3600}              # seconds
+      #- MAX_SYNC_INTERVAL=${MAX_SYNC_INTERVAL:-86400}             # seconds
       #- ALERT_MAX_SEND_ATTEMPTS=${ALERT_MAX_SEND_ATTEMPTS:-3}     # retry count for webhook/email
       #- ALERT_INITIAL_BACKOFF_MS=${ALERT_INITIAL_BACKOFF_MS:-500} # first retry delay
       # GOOGLE_OAUTH_REDIRECT_URL is auto-derived from BASE_URL if

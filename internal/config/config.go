@@ -257,7 +257,7 @@ func Load() (*Config, error) {
 	}
 	cfg.Sync.MinInterval = minInterval
 
-	maxInterval, err := getEnvInt("MAX_SYNC_INTERVAL", 3600)
+	maxInterval, err := getEnvInt("MAX_SYNC_INTERVAL", 86400)
 	if err != nil {
 		return nil, fmt.Errorf("%w: MAX_SYNC_INTERVAL: %w", ErrInvalidConfig, err)
 	}
