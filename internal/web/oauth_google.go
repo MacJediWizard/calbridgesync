@@ -473,7 +473,9 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		return
 	}
 
-	h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to schedule source %s: %v", source.ID, err)
+	}
 	log.Printf("Google OAuth callback: created source %s for %s", source.ID, email)
 
 	// Full-page navigation back to the SPA, which will load /sources
