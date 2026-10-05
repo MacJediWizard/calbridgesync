@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 
@@ -15,6 +16,7 @@ var (
 	ErrTokenVerify      = errors.New("token verification failed")
 	ErrMissingEmail     = errors.New("email claim is required")
 	ErrEmailNotVerified = errors.New("email is not verified")
+	ErrNonceMismatch    = errors.New("id token nonce does not match login request")
 )
 
 // OIDCClaims represents the claims extracted from an ID token.
@@ -59,22 +61,37 @@ func NewOIDCProvider(ctx context.Context, issuer, clientID, clientSecret, redire
 	}, nil
 }
 
-// AuthCodeURL returns the URL to redirect the user to for authentication.
-func (p *OIDCProvider) AuthCodeURL(state string) string {
-	return p.config.AuthCodeURL(state)
+// GenerateOIDCLoginSecrets returns a fresh nonce and PKCE code verifier
+// for one login attempt. Both must be stored alongside the OAuth state
+// and handed back to Exchange / VerifyIDToken on the callback.
+func GenerateOIDCLoginSecrets() (nonce, verifier string, err error) {
+	nonce, err = GenerateState()
+	if err != nil {
+		return "", "", err
+	}
+	return nonce, oauth2.GenerateVerifier(), nil
 }
 
-// Exchange exchanges an authorization code for tokens.
-func (p *OIDCProvider) Exchange(ctx context.Context, code string) (*oauth2.Token, error) {
-	token, err := p.config.Exchange(ctx, code)
+// AuthCodeURL returns the URL to redirect the user to for authentication.
+// The nonce is bound into the ID token by the IdP, and the verifier is
+// sent as an S256 PKCE code_challenge.
+func (p *OIDCProvider) AuthCodeURL(state, nonce, verifier string) string {
+	return p.config.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier))
+}
+
+// Exchange exchanges an authorization code for tokens, proving
+// possession of the PKCE verifier used in AuthCodeURL.
+func (p *OIDCProvider) Exchange(ctx context.Context, code, verifier string) (*oauth2.Token, error) {
+	token, err := p.config.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrTokenExchange, err)
 	}
 	return token, nil
 }
 
-// VerifyIDToken verifies the ID token and extracts claims.
-func (p *OIDCProvider) VerifyIDToken(ctx context.Context, token *oauth2.Token) (*OIDCClaims, error) {
+// VerifyIDToken verifies the ID token, checks that its nonce matches the
+// one issued for this login attempt, and extracts claims.
+func (p *OIDCProvider) VerifyIDToken(ctx context.Context, token *oauth2.Token, nonce string) (*OIDCClaims, error) {
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
 		return nil, fmt.Errorf("%w: missing id_token", ErrTokenVerify)
@@ -83,6 +100,10 @@ func (p *OIDCProvider) VerifyIDToken(ctx context.Context, token *oauth2.Token) (
 	idToken, err := p.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrTokenVerify, err)
+	}
+
+	if nonce == "" || subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(nonce)) != 1 {
+		return nil, ErrNonceMismatch
 	}
 
 	var claims OIDCClaims
