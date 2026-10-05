@@ -1423,12 +1423,16 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	} else {
 		destCalendars, destDiscoverErr = destClient.FindCalendars(ctx)
 	}
+	destURLPath := destClient.GetCalendarPath()
+	discoverStatus := "ok"
 	if destDiscoverErr != nil {
+		discoverStatus = "error"
 		log.Printf("Failed to discover destination calendars, falling back to URL path: %v", destDiscoverErr)
-		destCalendarPath = destClient.GetCalendarPath()
+		destCalendarPath = destURLPath
 	} else if len(destCalendars) == 0 {
+		discoverStatus = "empty"
 		log.Printf("No calendars found on destination, using URL path as fallback")
-		destCalendarPath = destClient.GetCalendarPath()
+		destCalendarPath = destURLPath
 	} else {
 		log.Printf("Found %d calendar(s) on destination:", len(destCalendars))
 		for i, cal := range destCalendars {
@@ -1440,6 +1444,10 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		}
 	}
 	log.Printf("Using destination calendar path: %s", destCalendarPath)
+	// Log-only: records whether dest_url's path matches a discovered
+	// calendar so selection can be revisited per source with evidence.
+	// Does not change destCalendarPath.
+	log.Printf("%s", destSelectLogLine(source.ID, calendar.Name, discoverStatus, destCalendars, destCalendarPath, destURLPath))
 
 	// Get all events from destination (no collector needed - we only track source issues)
 	updateStatus("fetching destination events")
