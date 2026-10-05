@@ -78,6 +78,7 @@ linters:
         - -SA1019
         - -ST1000
         - -ST1003
+        - -QF* # v2 "all" adds quickfix checks; v1 staticcheck/stylecheck never ran them
   exclusions:
     generated: lax
     presets:
