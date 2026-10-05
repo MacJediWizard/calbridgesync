@@ -83,6 +83,14 @@ export const prepareGoogleSource = async (data: PrepareGoogleSourceRequest): Pro
   return response.data;
 };
 
+// Re-authorize an existing Google source whose refresh token expired
+// or was revoked. Returns the Google consent URL to navigate to; the
+// callback replaces only the stored refresh token. (#192)
+export const reconnectGoogleSource = async (id: string): Promise<PrepareGoogleSourceResponse> => {
+  const response = await api.post(`/sources/${id}/google/reconnect`, {});
+  return response.data;
+};
+
 export const updateSource = async (id: string, data: Partial<SourceFormData>): Promise<Source> => {
   const response = await api.put(`/sources/${id}`, data);
   return response.data;
@@ -99,20 +107,6 @@ export const toggleSource = async (id: string): Promise<Source> => {
 
 export const triggerSync = async (id: string): Promise<void> => {
   await api.post(`/sources/${id}/sync`);
-};
-
-export const dryRunSync = async (id: string): Promise<{
-  success: boolean;
-  created: number;
-  updated: number;
-  deleted: number;
-  skipped: number;
-  dry_run: boolean;
-  message: string;
-  warnings?: string[];
-}> => {
-  const response = await api.post(`/sources/${id}/sync?dry_run=true`);
-  return response.data;
 };
 
 export const getSourceStats = async (id: string): Promise<{

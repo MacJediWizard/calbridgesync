@@ -198,9 +198,15 @@ func (s *Scheduler) resetAuthFailCount(sourceID string) {
 // isAuthError returns true if the sync result looks like it failed
 // due to an authentication or authorization problem. Uses substring
 // matching against the error strings because CalDAV servers report
-// auth failures inconsistently.
+// auth failures inconsistently. OAuth2 token-endpoint rejections
+// (Google's `oauth2: "invalid_grant" ...`) come back as HTTP 400 and
+// match none of the generic markers, so they are checked explicitly.
+// (#192)
 func (s *Scheduler) isAuthError(result *caldav.SyncResult) bool {
 	check := func(text string) bool {
+		if caldav.ErrorTextIsOAuthGrantRevoked(text) {
+			return true
+		}
 		lower := strings.ToLower(text)
 		return strings.Contains(lower, "401") ||
 			strings.Contains(lower, "403") ||
@@ -236,9 +242,17 @@ func (s *Scheduler) sendCredentialExpiryAlert(source *db.Source, consecutiveFail
 	userPrefs := s.getUserAlertPrefs(source.UserID)
 	msg := fmt.Sprintf("Credentials may be expired for source '%s' — %d consecutive authentication failures. Re-enter credentials in the web UI.",
 		source.Name, consecutiveFailures)
+	details := "Check if the app password or OAuth token was revoked."
+	if source.SourceType == db.SourceTypeGoogle {
+		// Google sources have no password to re-enter; the fix is
+		// re-running OAuth for the existing source. (#192)
+		msg = fmt.Sprintf("Google authorization expired or was revoked for source '%s' — %d consecutive authentication failures. Open the source in the web UI and click \"Reconnect Google account\".",
+			source.Name, consecutiveFailures)
+		details = "If this keeps happening, make sure the Google Cloud OAuth consent screen is published (\"In production\"); apps in Testing mode get refresh tokens that expire after 7 days."
+	}
 	s.notifier.SendSyncFailureAlertWithPrefs(
 		s.ctx, source.ID, source.Name, userEmail,
-		msg, "Check if the app password or OAuth token was revoked.", userPrefs,
+		msg, details, userPrefs,
 	)
 }
 
@@ -269,7 +283,9 @@ func (s *Scheduler) Start() error {
 	for i, source := range sources {
 		interval := time.Duration(source.SyncInterval) * time.Second
 		stagger := time.Duration(i) * startupStagger
-		s.AddJobWithDelay(source.ID, interval, stagger)
+		if err := s.AddJobWithDelay(source.ID, interval, stagger); err != nil {
+			log.Printf("Not scheduling source %s: %v", source.ID, err)
+		}
 	}
 
 	// Start cleanup goroutine
@@ -504,8 +520,22 @@ func (s *Scheduler) Stop() {
 	}
 }
 
-// AddJob adds or replaces a sync job for a source.
-func (s *Scheduler) AddJob(sourceID string, interval time.Duration) {
+// validateInterval rejects non-positive job intervals. time.NewTicker
+// panics on them, so every job constructor must check first. (#191)
+func validateInterval(sourceID string, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("invalid sync interval %v for source %s: must be positive", interval, sourceID)
+	}
+	return nil
+}
+
+// AddJob adds or replaces a sync job for a source. Returns an error
+// and leaves any existing job untouched if interval is not positive.
+func (s *Scheduler) AddJob(sourceID string, interval time.Duration) error {
+	if err := validateInterval(sourceID, interval); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -532,11 +562,18 @@ func (s *Scheduler) AddJob(sourceID string, interval time.Duration) {
 	go s.runJob(job)
 
 	log.Printf("Added sync job for source %s with interval %v", sourceID, interval)
+	return nil
 }
 
 // AddJobWithDelay adds a sync job with a delayed initial sync.
 // This is used to stagger sync starts and avoid resource contention.
-func (s *Scheduler) AddJobWithDelay(sourceID string, interval time.Duration, initialDelay time.Duration) {
+// Returns an error and leaves any existing job untouched if interval
+// is not positive.
+func (s *Scheduler) AddJobWithDelay(sourceID string, interval time.Duration, initialDelay time.Duration) error {
+	if err := validateInterval(sourceID, interval); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -562,9 +599,16 @@ func (s *Scheduler) AddJobWithDelay(sourceID string, interval time.Duration, ini
 	go s.runJobWithDelay(job, initialDelay)
 
 	log.Printf("Added sync job for source %s with interval %v (starting in %v)", sourceID, interval, initialDelay)
+	return nil
 }
 
 // RemoveJob removes a sync job and cleans up associated resources.
+//
+// The per-source sync lock is deliberately kept: a sync for this
+// source may still be running and holding it, and deleting the map
+// entry would hand the next executeSync (TriggerSync, or a re-enable)
+// a fresh mutex, letting two syncs run at once. The cost is one
+// sync.Mutex per source ID ever seen. (#191)
 func (s *Scheduler) RemoveJob(sourceID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -573,7 +617,6 @@ func (s *Scheduler) RemoveJob(sourceID string) {
 		close(job.stopCh)
 		job.ticker.Stop()
 		delete(s.jobs, sourceID)
-		delete(s.syncLocks, sourceID) // Clean up sync lock to prevent memory leak
 		log.Printf("Removed sync job for source %s", sourceID)
 	}
 
@@ -587,14 +630,20 @@ func (s *Scheduler) RemoveJob(sourceID string) {
 }
 
 // UpdateJobInterval updates the interval for an existing job by stopping and restarting it.
-func (s *Scheduler) UpdateJobInterval(sourceID string, interval time.Duration) {
+// Returns an error and leaves the existing job running if interval is
+// not positive. (#191)
+func (s *Scheduler) UpdateJobInterval(sourceID string, interval time.Duration) error {
+	if err := validateInterval(sourceID, interval); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	existingJob, exists := s.jobs[sourceID]
 	if !exists {
-		s.mu.Unlock()
 		log.Printf("Updated sync interval for source %s to %v", sourceID, interval)
-		return
+		return nil
 	}
 
 	// Stop the existing job goroutine and ticker
@@ -612,13 +661,13 @@ func (s *Scheduler) UpdateJobInterval(sourceID string, interval time.Duration) {
 	}
 
 	s.jobs[sourceID] = job
-	s.mu.Unlock()
 
 	// Start job goroutine (don't run immediately - next tick will be at interval from now)
 	s.wg.Add(1)
 	go s.runJobFromTicker(job)
 
 	log.Printf("Updated sync interval for source %s to %v", sourceID, interval)
+	return nil
 }
 
 // TriggerSync manually triggers a sync for a source.

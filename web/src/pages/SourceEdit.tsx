@@ -1,13 +1,17 @@
 import { useState, useEffect } from 'react';
-import { useNavigate, useParams, Link } from 'react-router-dom';
-import { getSource, updateSource, deleteSource, discoverCalendars } from '../services/api';
+import { useNavigate, useParams, Link, useSearchParams } from 'react-router-dom';
+import { getSource, updateSource, deleteSource, discoverCalendars, reconnectGoogleSource } from '../services/api';
+import { GOOGLE_OAUTH_ERRORS } from '../services/googleOAuthErrors';
 import DestinationManager from '../components/DestinationManager';
 import type { Source, Calendar, CalendarConfig } from '../types';
 
 export default function SourceEdit() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [loading, setLoading] = useState(true);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [source, setSource] = useState<Source | null>(null);
@@ -35,6 +39,33 @@ export default function SourceEdit() {
     loadSource();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  // The Google reconnect callback redirects back here with either
+  // ?google_oauth=reconnected or ?error=<code>. (#192)
+  useEffect(() => {
+    const errCode = searchParams.get('error');
+    if (errCode) {
+      setError(GOOGLE_OAUTH_ERRORS[errCode] || `Google reconnect failed (${errCode}).`);
+    } else if (searchParams.get('google_oauth') === 'reconnected') {
+      setNotice('Google account reconnected. A sync has been started.');
+    }
+  }, [searchParams]);
+
+  const handleReconnectGoogle = async () => {
+    if (!id) return;
+    setReconnecting(true);
+    setError(null);
+    try {
+      const { redirect_url } = await reconnectGoogleSource(id);
+      // Full-page navigation to Google's consent screen; the backend
+      // callback brings the browser back to this page.
+      window.location.href = redirect_url;
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      setError(axiosErr.response?.data?.error || 'Failed to start Google reconnect');
+      setReconnecting(false);
+    }
+  };
 
   const loadSource = async () => {
     if (!id) return;
@@ -223,6 +254,42 @@ export default function SourceEdit() {
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
           {error && (
             <div className="p-3 rounded bg-red-900/50 border border-red-700 text-red-200 text-sm">{error}</div>
+          )}
+          {notice && (
+            <div className="p-3 rounded bg-green-900/40 border border-green-700 text-green-200 text-sm">{notice}</div>
+          )}
+
+          {/* Google authorization (#192) */}
+          {source?.source_type === 'google' && (
+            <div
+              className={
+                source.needs_reauth
+                  ? 'p-4 rounded bg-yellow-900/30 border border-yellow-700 space-y-3'
+                  : 'p-4 rounded bg-black/50 border border-zinc-800 space-y-3'
+              }
+            >
+              <h4 className="text-xs font-semibold text-gray-400 uppercase">Google Authorization</h4>
+              {source.needs_reauth ? (
+                <p className="text-sm text-yellow-200">
+                  Google authorization for this source expired or was revoked, so it cannot sync. Reconnect
+                  the same Google account ({source.source_username}) to resume syncing. Settings and sync
+                  history are kept.
+                </p>
+              ) : (
+                <p className="text-sm text-gray-400">
+                  Syncing as {source.source_username}. If Google access was revoked or expired, reconnect
+                  the same Google account here. Settings and sync history are kept.
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={handleReconnectGoogle}
+                disabled={reconnecting}
+                className="px-4 py-2 text-sm font-medium rounded bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50"
+              >
+                {reconnecting ? 'Redirecting to Google...' : 'Reconnect Google account'}
+              </button>
+            </div>
           )}
 
           {/* General Settings */}
@@ -510,6 +577,15 @@ export default function SourceEdit() {
                   <p className="text-white">{formatDate(source.created_at)}</p>
                 </div>
               </div>
+              {source.last_sync_message && (
+                <p
+                  className={
+                    source.sync_status === 'error' ? 'mt-3 text-sm text-red-300' : 'mt-3 text-sm text-gray-400'
+                  }
+                >
+                  {source.last_sync_message}
+                </p>
+              )}
             </div>
           )}
 

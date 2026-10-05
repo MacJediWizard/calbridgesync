@@ -147,40 +147,38 @@ func main() {
 		}
 	}
 
+	// The destination is a different server with its own collection
+	// layout, so the source calendar path from selected_calendars is
+	// meaningless there. Discover the destination calendar exactly as
+	// the sync engine does so we search where events were written.
+	var destCalendarPath string
+	if destClient != nil {
+		destCalendarPath = discoverDestCalendarPath(ctx, destClient, source.DestURL)
+		fmt.Printf("Dest calendar:    %s\n\n", destCalendarPath)
+	}
+
 	var totalFound, totalDeleted, totalErrors int
 
 	for _, calCfg := range source.SelectedCalendars {
 		fmt.Printf("Calendar: %s\n", calCfg.Path)
 
-		if *side == "both" || *side == "dest" {
-			found, del, errs := handleSide(ctx, "dest", destClient, calCfg.Path, *uid, *confirm)
-			totalFound += found
-			totalDeleted += del
-			totalErrors += errs
+		var targets []sideTarget
+		if destClient != nil {
+			targets = append(targets, sideTarget{label: "dest", client: destClient, calendarPath: destCalendarPath})
+		}
+		if sourceClient != nil {
+			targets = append(targets, sideTarget{label: "source", client: sourceClient, calendarPath: calCfg.Path})
 		}
 
-		if *side == "both" || *side == "source" {
-			found, del, errs := handleSide(ctx, "source", sourceClient, calCfg.Path, *uid, *confirm)
-			totalFound += found
-			totalDeleted += del
-			totalErrors += errs
-		}
-
-		// Scrub the synced_events tracking row for this calendar +
-		// UID regardless of whether we found/deleted on each side.
-		// If the UID was already gone from both sides but the row
-		// still existed, this stops the sync engine from treating
-		// future server-side additions as "previously synced" and
-		// incorrectly planning a deletion.
-		if *confirm {
-			if err := database.DeleteSyncedEvent(source.ID, calCfg.Path, *uid); err != nil {
-				fmt.Printf("  synced_events: scrub FAILED: %v\n", err)
-				totalErrors++
-			} else {
-				fmt.Printf("  synced_events: scrubbed\n")
-			}
-		} else {
-			fmt.Printf("  synced_events: would scrub row (source_id=%s, calendar=%s, uid=%s)\n", source.ID, calCfg.Path, *uid)
+		calendarPath := calCfg.Path
+		found, del, errs := purgeCalendar(ctx, targets, *uid, *confirm, func() error {
+			return database.DeleteSyncedEvent(source.ID, calendarPath, *uid)
+		})
+		totalFound += found
+		totalDeleted += del
+		totalErrors += errs
+		if !*confirm {
+			fmt.Printf("  synced_events: would scrub row if all deletes succeed (source_id=%s, calendar=%s, uid=%s)\n", source.ID, calCfg.Path, *uid)
 		}
 		fmt.Println()
 	}
@@ -198,85 +196,167 @@ func main() {
 	}
 }
 
-// handleSide searches a single CalDAV calendar for the target UID
-// and optionally deletes it. Returns (found, deleted, errors) counts
-// so the top-level summary can aggregate across calendars/sides.
-func handleSide(ctx context.Context, label string, client *caldav.Client, calendarPath, targetUID string, confirm bool) (int, int, int) {
-	foundPath, err := findUIDInCalendar(ctx, client, calendarPath, targetUID)
-	if err != nil {
-		fmt.Printf("  %s: ERROR searching calendar: %v\n", label, err)
-		return 0, 0, 1
-	}
-	if foundPath == "" {
-		fmt.Printf("  %s: not present\n", label)
-		return 0, 0, 0
-	}
-	fmt.Printf("  %s: FOUND at %s\n", label, foundPath)
-	if !confirm {
-		fmt.Printf("  %s: would DELETE (dry-run)\n", label)
-		return 1, 0, 0
-	}
-	if err := client.DeleteEvent(ctx, foundPath); err != nil {
-		fmt.Printf("  %s: DELETE failed: %v\n", label, err)
-		return 1, 0, 1
-	}
-	fmt.Printf("  %s: DELETED\n", label)
-	return 1, 1, 0
+// eventClient is the subset of *caldav.Client used to search and
+// delete events. It exists so purgeCalendar can be unit tested.
+type eventClient interface {
+	GetEvents(ctx context.Context, calendarPath string, collector *caldav.MalformedEventCollector) ([]caldav.Event, error)
+	DeleteEvent(ctx context.Context, eventPath string) error
 }
 
-// findUIDInCalendar lists every event in a calendar and returns the
-// path of the one matching targetUID, or empty string if not found.
-//
-// Thin wrapper around findUIDInEvents that does the CalDAV I/O. The
-// pure matching logic lives in findUIDInEvents so it can be unit
-// tested without mocking a CalDAV server.
-//
-// Returns (path, err). err is non-nil only on transport failure; a
-// missing UID is reported as ("", nil).
-func findUIDInCalendar(ctx context.Context, client *caldav.Client, calendarPath, targetUID string) (string, error) {
-	collector := caldav.NewMalformedEventCollector()
-	events, err := client.GetEvents(ctx, calendarPath, collector)
-	if err != nil {
-		return "", err
+// calendarFinder is the subset of *caldav.Client used to discover the
+// destination calendar path.
+type calendarFinder interface {
+	FindCalendars(ctx context.Context) ([]caldav.Calendar, error)
+	FindCalendarsGoogle(ctx context.Context) ([]caldav.Calendar, error)
+	GetCalendarPath() string
+}
+
+// discoverDestCalendarPath returns the destination calendar path using
+// the same rules as SyncEngine.syncCalendar / fullSync: Google URLs use
+// FindCalendarsGoogle, everything else FindCalendars; the first
+// discovered calendar wins, and discovery failure or an empty result
+// falls back to the path of the configured destination URL.
+func discoverDestCalendarPath(ctx context.Context, client calendarFinder, destURL string) string {
+	var (
+		cals []caldav.Calendar
+		err  error
+	)
+	if caldav.IsGoogleURL(destURL) {
+		cals, err = client.FindCalendarsGoogle(ctx)
+	} else {
+		cals, err = client.FindCalendars(ctx)
 	}
-	return findUIDInEvents(events, targetUID), nil
+	if err != nil {
+		log.Printf("WARNING: destination calendar discovery failed, falling back to URL path: %v", err)
+		return client.GetCalendarPath()
+	}
+	if len(cals) == 0 {
+		return client.GetCalendarPath()
+	}
+	if len(cals) > 1 {
+		log.Printf("WARNING: multiple destination calendars found, using first one (same as sync engine): %s", cals[0].Path)
+	}
+	return cals[0].Path
+}
+
+// sideTarget is one side (source or dest) of one calendar to purge.
+type sideTarget struct {
+	label        string
+	client       eventClient
+	calendarPath string
+}
+
+// purgeCalendar searches each target for targetUID and, when confirm is
+// set, deletes every match. The synced_events scrub runs only when
+// confirm is set AND every target finished with zero search/delete
+// errors: if a remote object survived, its tracking row must survive
+// too, or the next sync treats the leftover as never-seen (PR #90).
+// Returns aggregate (found, deleted, errors) counts.
+func purgeCalendar(ctx context.Context, targets []sideTarget, targetUID string, confirm bool, scrub func() error) (int, int, int) {
+	var found, deleted, errs int
+	for _, t := range targets {
+		f, d, e := handleSide(ctx, t.label, t.client, t.calendarPath, targetUID, confirm)
+		found += f
+		deleted += d
+		errs += e
+	}
+	if !confirm {
+		return found, deleted, errs
+	}
+	if errs > 0 {
+		fmt.Printf("  synced_events: scrub SKIPPED (%d error(s) above; tracking row kept so it matches the surviving remote state)\n", errs)
+		return found, deleted, errs
+	}
+	if err := scrub(); err != nil {
+		fmt.Printf("  synced_events: scrub FAILED: %v\n", err)
+		return found, deleted, errs + 1
+	}
+	fmt.Printf("  synced_events: scrubbed\n")
+	return found, deleted, errs
+}
+
+// handleSide searches a single CalDAV calendar for the target UID
+// and optionally deletes every match. Returns (found, deleted, errors)
+// counts so the top-level summary can aggregate across calendars/sides.
+func handleSide(ctx context.Context, label string, client eventClient, calendarPath, targetUID string, confirm bool) (int, int, int) {
+	events, err := client.GetEvents(ctx, calendarPath, caldav.NewMalformedEventCollector())
+	if err != nil {
+		fmt.Printf("  %s: ERROR searching calendar %s: %v\n", label, calendarPath, err)
+		return 0, 0, 1
+	}
+	paths := findUIDInEvents(events, targetUID)
+	if len(paths) == 0 {
+		fmt.Printf("  %s: not present in %s\n", label, calendarPath)
+		return 0, 0, 0
+	}
+	var deleted, errs int
+	for _, p := range paths {
+		fmt.Printf("  %s: FOUND at %s\n", label, p)
+		if !confirm {
+			fmt.Printf("  %s: would DELETE (dry-run)\n", label)
+			continue
+		}
+		if err := client.DeleteEvent(ctx, p); err != nil {
+			fmt.Printf("  %s: DELETE failed: %v\n", label, err)
+			errs++
+			continue
+		}
+		fmt.Printf("  %s: DELETED\n", label)
+		deleted++
+	}
+	return len(paths), deleted, errs
 }
 
 // findUIDInEvents scans a slice of CalDAV events for targetUID and
-// returns the event path, or empty string if not found.
+// returns the path of every matching event (nil if none).
 //
-// It checks two things for each event in priority order:
-//  1. The parsed Event.UID field — normal case. Returns on first hit.
-//  2. A raw substring match against Event.Data for "UID:<target>" —
-//     catches the pathological case where the iCalendar parser
-//     dropped or mangled the UID property but the raw VEVENT block
-//     still carries it. This matters for zombie-recovery scenarios
-//     where the event is partially corrupted and the parser
-//     returned an empty or wrong UID.
+// Two passes, results de-duplicated, parsed matches first:
+//  1. The parsed Event.UID field equals targetUID — normal case.
+//  2. The raw Event.Data, after RFC 5545 line unfolding, contains a
+//     line that is exactly "UID:<target>" — catches the zombie-recovery
+//     case where the parser dropped or mangled the UID but the raw
+//     VEVENT still carries it. The whole-line match means purging
+//     "abc" never selects "abcd". Property parameters like
+//     "UID;X-PARAM=...:" are non-standard and not handled here.
 //
-// If the parsed-UID pass and the raw-data pass would both match but
-// at different paths, the parsed-UID pass wins (it's the
-// authoritative match). This keeps the behavior deterministic when
-// both the live form and a corrupted form of the same UID happen to
-// coexist in one calendar.
-func findUIDInEvents(events []caldav.Event, targetUID string) string {
-	// Pass 1: parsed UID match.
+// Every match is returned because a calendar can hold several objects
+// for one UID (the corrupted-duplicate case this tool exists for).
+func findUIDInEvents(events []caldav.Event, targetUID string) []string {
+	var paths []string
+	seen := make(map[string]bool)
+	add := func(p string) {
+		if !seen[p] {
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
 	for i := range events {
 		if events[i].UID == targetUID {
-			return events[i].Path
+			add(events[i].Path)
 		}
 	}
-	// Pass 2: raw substring fallback. "UID:<value>" is the standard
-	// line format in iCalendar (RFC 5545 §3.8.4.7). We don't try to
-	// handle property parameters like "UID;X-PARAM=...:" here —
-	// that's non-standard and the parsed UID should catch it.
 	needle := "UID:" + targetUID
 	for i := range events {
-		if strings.Contains(events[i].Data, needle) {
-			return events[i].Path
+		if hasLine(events[i].Data, needle) {
+			add(events[i].Path)
 		}
 	}
-	return ""
+	return paths
+}
+
+// icalUnfolder removes RFC 5545 section 3.1 line folds (CRLF or LF
+// followed by a single space or tab).
+var icalUnfolder = strings.NewReplacer("\r\n ", "", "\r\n\t", "", "\n ", "", "\n\t", "")
+
+// hasLine reports whether the unfolded iCalendar data contains a line
+// exactly equal to want (ignoring a trailing CR).
+func hasLine(data, want string) bool {
+	for _, line := range strings.Split(icalUnfolder.Replace(data), "\n") {
+		if strings.TrimSuffix(line, "\r") == want {
+			return true
+		}
+	}
+	return false
 }
 
 func modeLabel(confirm bool) string {

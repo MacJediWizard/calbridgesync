@@ -18,6 +18,7 @@ import (
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
 	"github.com/emersion/go-webdav/caldav"
+	"golang.org/x/oauth2"
 )
 
 var (
@@ -34,28 +35,6 @@ var (
 	// errors.Is(err, ErrEventSkipped) to distinguish.
 	ErrEventSkipped = errors.New("event skipped")
 )
-
-// dryRunContextKey is a context key that, when present, causes
-// PutEvent and DeleteEvent to return nil without actually calling
-// the CalDAV server. The sync engine runs the full computation
-// (determines what WOULD change) and populates SyncResult as if
-// the operations happened, but no data is actually written. (#150)
-type dryRunContextKeyType struct{}
-
-var dryRunContextKey = dryRunContextKeyType{}
-
-// WithDryRun returns a context that causes PutEvent and DeleteEvent
-// to be no-ops. The sync engine will still compute all deltas and
-// populate SyncResult, but no CalDAV writes will happen.
-func WithDryRun(ctx context.Context) context.Context {
-	return context.WithValue(ctx, dryRunContextKey, true)
-}
-
-// IsDryRun returns true if the context has the dry-run flag set.
-func IsDryRun(ctx context.Context) bool {
-	v, _ := ctx.Value(dryRunContextKey).(bool)
-	return v
-}
 
 const (
 	defaultTimeout = 300 * time.Second // 5 minutes default for slow CalDAV servers like iCloud
@@ -143,6 +122,11 @@ type Client struct {
 	password     string
 	httpClient   *http.Client
 	caldavClient *caldav.Client
+	// tokenSource is set only for OAuth clients (NewOAuthClient). It is
+	// the same ReuseTokenSource the HTTP transport uses, so calling
+	// Token() on it to probe credentials does not cause an extra
+	// refresh on the next request. (#192)
+	tokenSource oauth2.TokenSource
 }
 
 // NewClient creates a new CalDAV client.
@@ -194,7 +178,18 @@ func (c *Client) TestConnection(ctx context.Context) error {
 // TestConnectionGoogle tests a Google CalDAV connection by listing
 // calendars directly, since Google doesn't support the standard
 // FindCurrentUserPrincipal PROPFIND. (#160)
+//
+// For OAuth clients it first forces a token refresh, because
+// FindCalendarsGoogle makes no network call: without this probe a
+// revoked refresh token was only discovered inside GetEvents, where
+// it was flattened into a generic per-calendar error and never
+// recognized as an auth failure. (#192)
 func (c *Client) TestConnectionGoogle(ctx context.Context) error {
+	if c.tokenSource != nil {
+		if _, err := c.tokenSource.Token(); err != nil {
+			return classifyTokenError(err)
+		}
+	}
 	_, err := c.FindCalendarsGoogle(ctx)
 	return err
 }
@@ -786,16 +781,6 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 //     write). Callers should surface these in result.Warnings or
 //     result.Errors as appropriate.
 func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event) error {
-	// Dry-run: return nil without writing. The caller's bookkeeping
-	// (result.Created++, result.Updated++) proceeds as normal,
-	// producing an accurate preview of what WOULD happen. (#150)
-	if IsDryRun(ctx) {
-		if event.Data == "" {
-			return ErrEventSkipped
-		}
-		return nil
-	}
-
 	// Skip events with empty data. This is NOT a success — we did not
 	// write anything. Previously this returned nil, which made the
 	// caller's `result.Created++` bookkeeping lie.
@@ -969,10 +954,6 @@ func rewriteSequenceInCalendar(cal *ical.Calendar, newSeq int) {
 
 // DeleteEvent deletes an event.
 func (c *Client) DeleteEvent(ctx context.Context, eventPath string) error {
-	// Dry-run: return nil without deleting. (#150)
-	if IsDryRun(ctx) {
-		return nil
-	}
 	err := c.caldavClient.RemoveAll(ctx, eventPath)
 	if err != nil {
 		return fmt.Errorf("%w: failed to delete event: %w", ErrConnectionFailed, err)

@@ -347,6 +347,79 @@ func TestUpdateJobInterval(t *testing.T) {
 	})
 }
 
+// TestUpdateJobIntervalInvalidReleasesLock: a non-positive interval
+// used to reach time.NewTicker while s.mu was held without a defer,
+// so the panic left the scheduler mutex locked forever and every
+// later AddJob/RemoveJob/GetJobCount call blocked.
+func TestUpdateJobIntervalInvalidReleasesLock(t *testing.T) {
+	sched := New(nil, nil, nil)
+	addJobDirectly(sched, "source-1", time.Hour)
+
+	if err := sched.UpdateJobInterval("source-1", 0); err == nil {
+		t.Fatal("expected error for zero interval")
+	}
+
+	// AddJobWithDelay takes the same s.mu as AddJob; the long delay
+	// keeps the job from running a sync against the nil test DB.
+	done := make(chan error, 1)
+	go func() {
+		done <- sched.AddJobWithDelay("source-2", time.Hour, time.Hour)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AddJobWithDelay: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AddJobWithDelay blocked: UpdateJobInterval left s.mu locked")
+	}
+
+	// The rejected update must leave the original job in place.
+	sched.mu.RLock()
+	job, ok := sched.jobs["source-1"]
+	sched.mu.RUnlock()
+	if !ok || job.interval != time.Hour {
+		t.Fatal("rejected UpdateJobInterval should leave the existing job unchanged")
+	}
+
+	sched.RemoveJob("source-1")
+	sched.RemoveJob("source-2")
+}
+
+func TestAddJobRejectsNonPositiveInterval(t *testing.T) {
+	sched := New(nil, nil, nil)
+	for _, interval := range []time.Duration{0, -time.Second} {
+		if err := sched.AddJob("source-1", interval); err == nil {
+			t.Errorf("AddJob(%v): expected error", interval)
+		}
+		if err := sched.AddJobWithDelay("source-1", interval, 0); err == nil {
+			t.Errorf("AddJobWithDelay(%v): expected error", interval)
+		}
+	}
+	if n := sched.GetJobCount(); n != 0 {
+		t.Errorf("expected no jobs after rejected adds, got %d", n)
+	}
+}
+
+// TestRemoveJobKeepsHeldSyncLock: RemoveJob deleted the per-source
+// sync lock even while a sync held it, so a sync started right after
+// (TriggerSync, or re-enabling the source) got a fresh mutex and ran
+// concurrently with the in-flight one.
+func TestRemoveJobKeepsHeldSyncLock(t *testing.T) {
+	sched := New(nil, nil, nil)
+	addJobDirectly(sched, "source-1", time.Hour)
+
+	held := sched.getSyncLock("source-1")
+	held.Lock()
+	defer held.Unlock()
+
+	sched.RemoveJob("source-1")
+
+	if got := sched.getSyncLock("source-1"); got != held {
+		t.Fatal("RemoveJob replaced the in-use sync lock; a new sync could run concurrently with the in-flight one")
+	}
+}
+
 // addJobDirectly adds a job to the scheduler without starting the goroutine.
 // This is for testing purposes only.
 func addJobDirectly(s *Scheduler, sourceID string, interval time.Duration) {
@@ -905,4 +978,38 @@ func TestMaybeSendFailureAlert_NilNotifierSafe(t *testing.T) {
 
 	// Must not panic.
 	sched.maybeSendFailureAlert(source.ID, source, result)
+}
+
+// TestIsAuthError_GoogleInvalidGrant reproduces #192: the prod Google
+// source failed 719/719 syncs with an oauth2 invalid_grant error that
+// isAuthError did not recognize, so the credential-expiry alert never
+// fired. Both shapes the sync engine can produce must classify as auth
+// failures: the per-calendar GetEvents error (token died mid-sync) and
+// the connection-test error (token rejected up front).
+func TestIsAuthError_GoogleInvalidGrant(t *testing.T) {
+	sched := New(nil, nil, nil)
+
+	cases := map[string]*caldav.SyncResult{
+		"prod GetEvents error": {
+			Message: "Sync failed with 1 errors",
+			Errors:  []string{`Failed to get source events: connection failed: Propfind "https://apidata.googleusercontent.com/caldav/v2/x/events/": oauth2: "invalid_grant" "Bad Request"`},
+		},
+		"connection test error": {
+			Message: caldav.GoogleAuthExpiredMessage,
+			Errors:  []string{`authentication failed: oauth2: "invalid_grant" "Bad Request"`},
+		},
+	}
+	for name, result := range cases {
+		if !sched.isAuthError(result) {
+			t.Errorf("%s: expected isAuthError to be true", name)
+		}
+	}
+
+	notAuth := &caldav.SyncResult{
+		Message: "Sync failed with 1 errors",
+		Errors:  []string{"Failed to get source events: connection failed: dial tcp: i/o timeout"},
+	}
+	if sched.isAuthError(notAuth) {
+		t.Error("a network timeout must not be classified as an auth error")
+	}
 }

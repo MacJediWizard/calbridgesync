@@ -115,11 +115,16 @@ type APISource struct {
 	Enabled           bool                `json:"enabled"`
 	StripAlarms       bool                `json:"strip_alarms"`
 	SyncStatus        string              `json:"sync_status"`
-	LastSyncAt        *string             `json:"last_sync_at"`
-	NextSyncAt        *string             `json:"next_sync_at"`
-	IsStale           bool                `json:"is_stale"`
-	CreatedAt         string              `json:"created_at"`
-	UpdatedAt         string              `json:"updated_at"`
+	LastSyncMessage   string              `json:"last_sync_message"`
+	// NeedsReauth is true for a Google source whose last sync failed
+	// because its OAuth grant expired or was revoked; the SPA shows a
+	// "Reconnect Google account" prompt. (#192)
+	NeedsReauth bool    `json:"needs_reauth"`
+	LastSyncAt  *string `json:"last_sync_at"`
+	NextSyncAt  *string `json:"next_sync_at"`
+	IsStale     bool    `json:"is_stale"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
 }
 
 // APICalendar represents a calendar discovered on a CalDAV server.
@@ -229,6 +234,8 @@ func sourceToAPI(s *db.Source) *APISource {
 		Enabled:           s.Enabled,
 		StripAlarms:       s.StripAlarms,
 		SyncStatus:        string(s.LastSyncStatus),
+		LastSyncMessage:   s.LastSyncMessage,
+		NeedsReauth:       s.SourceType == db.SourceTypeGoogle && s.LastSyncMessage == caldav.GoogleAuthExpiredMessage,
 		CreatedAt:         s.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:         s.UpdatedAt.Format(time.RFC3339),
 	}
@@ -833,7 +840,9 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		return
 	}
 
-	h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to schedule source %s: %v", source.ID, err)
+	}
 
 	c.JSON(http.StatusCreated, h.sourceToAPIWithScheduler(source))
 }
@@ -945,7 +954,9 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 
-	h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to reschedule source %s: %v", source.ID, err)
+	}
 
 	c.JSON(http.StatusOK, h.sourceToAPIWithScheduler(source))
 }
@@ -1000,7 +1011,9 @@ func (h *Handlers) APIToggleSource(c *gin.Context) {
 	}
 
 	if source.Enabled {
-		h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+		if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+			log.Printf("Failed to schedule source %s: %v", source.ID, err)
+		}
 	} else {
 		h.scheduler.RemoveJob(source.ID)
 	}
@@ -1017,20 +1030,8 @@ func (h *Handlers) APITriggerSync(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
-	if err != nil {
+	if _, err := h.db.GetSourceByIDForUser(sourceID, session.UserID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	// Dry-run mode: run the sync synchronously with a dry-run
-	// context so PutEvent/DeleteEvent are no-ops. Returns the
-	// SyncResult as JSON so the user can preview what would
-	// happen without actually changing any data. (#150)
-	if c.Query("dry_run") == "true" {
-		ctx := caldav.WithDryRun(c.Request.Context())
-		result := h.syncEngine.SyncSource(ctx, source)
-		c.JSON(http.StatusOK, result)
 		return
 	}
 
