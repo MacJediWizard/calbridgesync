@@ -1230,12 +1230,19 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 	// Start activity tracking
 	se.tracker.StartSync(source.ID, source.Name, len(sourceCalendars))
 
+	// The destination calendar is chosen without regard to the source
+	// calendar, so every selected source calendar writes into the same
+	// destination calendar. With more than one, the two-way
+	// reverse-create pass would copy each calendar's events into the
+	// others; syncEventsToDestination skips it in that case.
+	sharedDestCalendar := len(sourceCalendars) > 1
+
 	// Sync each calendar
 	for i, cal := range sourceCalendars {
 		// Update activity tracker with current calendar
 		se.tracker.UpdateCalendar(source.ID, cal.Name, i+1)
 
-		calResult := se.syncCalendar(ctx, source, sourceClient, destClient, cal, i+1)
+		calResult := se.syncCalendar(ctx, source, sourceClient, destClient, cal, i+1, sharedDestCalendar)
 		result.Created += calResult.Created
 		result.Updated += calResult.Updated
 		result.Deleted += calResult.Deleted
@@ -1282,7 +1289,7 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 			continue
 		}
 		for i, cal := range sourceCalendars {
-			calResult := se.syncCalendar(ctx, source, sourceClient, extraDestClient, cal, i+1)
+			calResult := se.syncCalendar(ctx, source, sourceClient, extraDestClient, cal, i+1, sharedDestCalendar)
 			result.Created += calResult.Created
 			result.Updated += calResult.Updated
 			result.Deleted += calResult.Deleted
@@ -1336,8 +1343,8 @@ func syncFailureMessage(source *db.Source, errs []string) string {
 // the guarded full sync. The WebDAV-Sync (RFC 6578) shortcut that used
 // to live here bypassed the deletion planners and ETag gating, so it
 // was removed (#196).
-func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int) *SyncResult {
-	return se.fullSync(ctx, source, sourceClient, destClient, calendar, calendarIndex)
+func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int, sharedDestCalendar bool) *SyncResult {
+	return se.fullSync(ctx, source, sourceClient, destClient, calendar, calendarIndex, sharedDestCalendar)
 }
 
 // filterEventsByDate filters events to only include those with start time after cutoff date.
@@ -1394,7 +1401,7 @@ func filterEventsByDate(events []Event, cutoffDate time.Time) []Event {
 	return filtered
 }
 
-func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, calendar Calendar, calendarIndex int) *SyncResult {
+func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, calendar Calendar, calendarIndex int, sharedDestCalendar bool) *SyncResult {
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),
@@ -1478,7 +1485,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	}
 
 	// Delegate to shared sync logic
-	return se.syncEventsToDestination(ctx, source, sourceClient, destClient, sourceEvents, sourceReport, calendar, calendarIndex, syncDirection)
+	return se.syncEventsToDestination(ctx, source, sourceClient, destClient, sourceEvents, sourceReport, calendar, calendarIndex, syncDirection, sharedDestCalendar)
 }
 
 // syncEventsToDestination handles the comparison, creation, update, and deletion of events
@@ -1487,7 +1494,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 //
 // sourceReport lists source objects that were listed but could not be
 // read; the ICS path passes an empty report. (#206)
-func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, sourceReport FetchReport, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, sourceReport FetchReport, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection, sharedDestCalendar bool) *SyncResult {
 	sourceClient = nilIfTypedNil(sourceClient)
 	result := &SyncResult{
 		Errors:   make([]string, 0),
@@ -2034,12 +2041,22 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		// event under a different UID (content dedupe, #78), returning
 		// those separately in contentDupes so we can record the dest
 		// UID in currentUIDs and prevent the next cycle from retrying.
-		toUpload, contentDupes, planWarning := planReverseCreate(
-			destEvents,
-			sourceEventMap,
-			previouslySyncedMap,
-			defaultReverseCreateHardCap,
-		)
+		//
+		// Skipped when several source calendars share this destination
+		// calendar: their synced events are destination-only from this
+		// calendar's point of view and would be copied into it.
+		var toUpload, contentDupes []Event
+		var planWarning string
+		if sharedDestCalendar {
+			planWarning = fmt.Sprintf("Two-way reverse-create skipped for calendar %q: several source calendars sync into the same destination calendar (%s), so events created on the destination are not copied back to the source", calendar.Name, destCalendarPath)
+		} else {
+			toUpload, contentDupes, planWarning = planReverseCreate(
+				destEvents,
+				sourceEventMap,
+				previouslySyncedMap,
+				defaultReverseCreateHardCap,
+			)
+		}
 		if planWarning != "" {
 			log.Printf("WARNING: %s", planWarning)
 			result.Warnings = append(result.Warnings, planWarning)
@@ -2482,7 +2499,7 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	se.tracker.UpdateCalendar(source.ID, calendar.Name, 1)
 
 	// Use shared sync logic — ICS is always one-way, sourceClient is nil (no write-back)
-	syncResult := se.syncEventsToDestination(ctx, source, nil, destClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay)
+	syncResult := se.syncEventsToDestination(ctx, source, nil, destClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay, false)
 
 	result.Created = syncResult.Created
 	result.Updated = syncResult.Updated
@@ -2522,7 +2539,7 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 			result.Warnings = append(result.Warnings, fmt.Sprintf("Connection test failed for additional dest %q: %v", dest.Name, testErr))
 			continue
 		}
-		extraResult := se.syncEventsToDestination(ctx, source, nil, extraDestClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay)
+		extraResult := se.syncEventsToDestination(ctx, source, nil, extraDestClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay, false)
 		result.Created += extraResult.Created
 		result.Updated += extraResult.Updated
 		result.Deleted += extraResult.Deleted
