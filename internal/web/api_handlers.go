@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -882,6 +883,19 @@ type APIUpdateSourceRequest struct {
 	StripAlarms       bool                `json:"strip_alarms"`
 }
 
+// urlOrigin returns the lower-cased scheme://host[:port] of raw, the
+// unit a stored password is bound to. A raw value without a host is
+// returned lower-cased as-is, so any change to it counts as an origin
+// change (fail closed).
+func urlOrigin(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return strings.ToLower(raw)
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+}
+
 // APIUpdateSource updates an existing source.
 func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	session := auth.GetCurrentUser(c)
@@ -920,6 +934,66 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 
+	// The source type is fixed at creation. Changing it would switch the
+	// auth model (Basic, Google OAuth, optional-auth ICS) underneath the
+	// stored credentials, and would let an ICS feed be made two-way.
+	// An omitted type keeps the stored one. (PR-26)
+	if req.SourceType != "" && db.SourceType(req.SourceType) != source.SourceType {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Source type cannot be changed; create a new source instead"})
+		return
+	}
+	isICS := source.SourceType == db.SourceTypeICS
+	if isICS && db.SyncDirection(req.SyncDirection) == db.SyncDirectionTwoWay {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ICS feeds are read-only and cannot use two-way sync"})
+		return
+	}
+
+	// Stored passwords are bound to the origin they were entered for.
+	// When the source or destination origin changes, the stored
+	// password must not be sent to the new host: require it again and
+	// test the connection before anything is saved. (PR-26)
+	ctx := c.Request.Context()
+	if urlOrigin(req.SourceURL) != urlOrigin(source.SourceURL) {
+		switch {
+		case source.SourceType == db.SourceTypeGoogle:
+			// The OAuth bearer token would go to the new host.
+			c.JSON(http.StatusBadRequest, gin.H{"error": "The URL of a Google source cannot be changed"})
+			return
+		case isICS:
+			// ICS sends Basic auth only when a username is set.
+			if req.SourceUsername != "" && req.SourcePassword == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Source URL host changed: re-enter the source password"})
+				return
+			}
+			if err := h.syncEngine.TestICSConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
+				log.Printf("ICS feed connection test failed for %s: %v", req.SourceURL, err)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to ICS feed: " + categorizeConnectionError(err)})
+				return
+			}
+		default:
+			if req.SourcePassword == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Source URL host changed: re-enter the source password"})
+				return
+			}
+			if err := h.syncEngine.TestConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
+				log.Printf("Source connection test failed for %s: %v", req.SourceURL, err)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + categorizeConnectionError(err)})
+				return
+			}
+		}
+	}
+	if req.DestURL != "" && urlOrigin(req.DestURL) != urlOrigin(source.DestURL) {
+		if req.DestPassword == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Destination URL host changed: re-enter the destination password"})
+			return
+		}
+		if err := h.syncEngine.TestConnection(ctx, req.DestURL, req.DestUsername, req.DestPassword); err != nil {
+			log.Printf("Destination connection test failed for %s: %v", req.DestURL, err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to destination: " + categorizeConnectionError(err)})
+			return
+		}
+	}
+
 	// Convert API calendar configs to DB calendar configs
 	var dbCalendars []db.CalendarConfig
 	for _, c := range req.SelectedCalendars {
@@ -931,7 +1005,6 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 
 	// Update fields
 	source.Name = req.Name
-	source.SourceType = db.SourceType(req.SourceType)
 	source.SourceURL = req.SourceURL
 	source.SourceUsername = req.SourceUsername
 	source.DestURL = req.DestURL
