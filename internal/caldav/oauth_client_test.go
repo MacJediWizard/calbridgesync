@@ -176,3 +176,116 @@ func TestOAuthClient_RefreshHitsTokenEndpoint(t *testing.T) {
 		t.Errorf("expected refresh token %q, got %q", "the-refresh-token", got)
 	}
 }
+
+// newGoogleTokenServer returns a mock OAuth2 token endpoint that
+// responds with the given status and JSON body to every refresh.
+func newGoogleTokenServer(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newTestGoogleClient(t *testing.T, tokenURL string) *Client {
+	t.Helper()
+	cfg := &oauth2.Config{ClientID: "x", ClientSecret: "y", Endpoint: oauth2.Endpoint{TokenURL: tokenURL}}
+	client, err := NewOAuthClient(context.Background(),
+		"https://apidata.googleusercontent.com/caldav/v2/someone@example.com/user",
+		cfg, &oauth2.Token{RefreshToken: "refresh"})
+	if err != nil {
+		t.Fatalf("NewOAuthClient: %v", err)
+	}
+	return client
+}
+
+// TestTestConnectionGoogle_InvalidGrantIsAuthFailure reproduces the
+// prod failure from #192: a revoked/expired Google refresh token makes
+// the token endpoint answer 400 {"error":"invalid_grant"}. The
+// connection test must actually refresh the token (it previously made
+// no network call at all) and report the failure as ErrAuthFailed with
+// IsOAuthGrantRevoked true, so the sync engine and scheduler treat it
+// as an authorization problem instead of a generic sync error.
+func TestTestConnectionGoogle_InvalidGrantIsAuthFailure(t *testing.T) {
+	tokenSrv := newGoogleTokenServer(t, http.StatusBadRequest,
+		`{"error":"invalid_grant","error_description":"Bad Request"}`)
+	client := newTestGoogleClient(t, tokenSrv.URL)
+
+	err := client.TestConnectionGoogle(context.Background())
+	if err == nil {
+		t.Fatal("expected TestConnectionGoogle to fail for invalid_grant")
+	}
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("expected ErrAuthFailed, got %v", err)
+	}
+	if !IsOAuthGrantRevoked(err) {
+		t.Errorf("expected IsOAuthGrantRevoked to be true for %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid_grant") {
+		t.Errorf("error should keep the provider error code, got %v", err)
+	}
+}
+
+// TestTestConnectionGoogle_ClientErrorIsAuthFailure verifies that other
+// 4xx rejections from the token endpoint (e.g. a deleted OAuth client)
+// are also auth failures, but are not reported as a revoked grant
+// because reconnecting with the same client would not help.
+func TestTestConnectionGoogle_ClientErrorIsAuthFailure(t *testing.T) {
+	tokenSrv := newGoogleTokenServer(t, http.StatusUnauthorized,
+		`{"error":"invalid_client","error_description":"The OAuth client was not found."}`)
+	client := newTestGoogleClient(t, tokenSrv.URL)
+
+	err := client.TestConnectionGoogle(context.Background())
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("expected ErrAuthFailed, got %v", err)
+	}
+	if IsOAuthGrantRevoked(err) {
+		t.Errorf("invalid_client must not be reported as a revoked grant")
+	}
+}
+
+// TestTestConnectionGoogle_TokenEndpoint5xxIsConnectionFailure ensures a
+// Google outage is not misclassified as expired credentials.
+func TestTestConnectionGoogle_TokenEndpoint5xxIsConnectionFailure(t *testing.T) {
+	tokenSrv := newGoogleTokenServer(t, http.StatusServiceUnavailable, `{"error":"backend_error"}`)
+	client := newTestGoogleClient(t, tokenSrv.URL)
+
+	err := client.TestConnectionGoogle(context.Background())
+	if !errors.Is(err, ErrConnectionFailed) {
+		t.Errorf("expected ErrConnectionFailed, got %v", err)
+	}
+	if errors.Is(err, ErrAuthFailed) {
+		t.Errorf("a 5xx from the token endpoint must not be an auth failure: %v", err)
+	}
+}
+
+// TestTestConnectionGoogle_ValidTokenSucceeds verifies the happy path:
+// a token endpoint that issues an access token passes the test.
+func TestTestConnectionGoogle_ValidTokenSucceeds(t *testing.T) {
+	tokenSrv := newGoogleTokenServer(t, http.StatusOK,
+		`{"access_token":"at","token_type":"Bearer","expires_in":3600}`)
+	client := newTestGoogleClient(t, tokenSrv.URL)
+
+	if err := client.TestConnectionGoogle(context.Background()); err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+}
+
+// TestErrorTextIsOAuthGrantRevoked covers the case where the error
+// chain was flattened to a string (sync results carry []string
+// errors), as seen in prod: the text still identifies invalid_grant.
+func TestErrorTextIsOAuthGrantRevoked(t *testing.T) {
+	prod := `Failed to get source events: connection failed: Propfind "https://apidata.googleusercontent.com/caldav/v2/x/events/": oauth2: "invalid_grant" "Bad Request"`
+	if !ErrorTextIsOAuthGrantRevoked(prod) {
+		t.Error("expected prod error text to be detected as a revoked grant")
+	}
+	if ErrorTextIsOAuthGrantRevoked("connection failed: 503 Service Unavailable") {
+		t.Error("unrelated error must not be detected as a revoked grant")
+	}
+	if IsOAuthGrantRevoked(nil) {
+		t.Error("nil error must not be a revoked grant")
+	}
+}

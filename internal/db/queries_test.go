@@ -877,3 +877,65 @@ func TestDatabaseConnection(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdateSourceOAuthRefreshToken covers the Google reconnect write
+// path (#192): it replaces only the refresh token, only on the owner's
+// Google source, and leaves every other column (id, settings, other
+// credentials) untouched.
+func TestUpdateSourceOAuthRefreshToken(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	owner := createTestUser(t, db, "owner@example.com")
+	other := createTestUser(t, db, "other@example.com")
+
+	google := &Source{
+		UserID:             owner,
+		Name:               "Google",
+		SourceType:         SourceTypeGoogle,
+		SourceURL:          "https://apidata.googleusercontent.com/caldav/v2/owner@example.com/user",
+		SourceUsername:     "owner@example.com",
+		OAuthRefreshToken:  "enc-old",
+		GoogleClientID:     "client-id",
+		GoogleClientSecret: "enc-secret",
+		DestURL:            "https://dest.com/caldav",
+		DestUsername:       "destuser",
+		DestPassword:       "enc-dest",
+		SyncInterval:       3600,
+		SyncDaysPast:       60,
+		SyncDirection:      SyncDirectionTwoWay,
+		ConflictStrategy:   ConflictSourceWins,
+		Enabled:            true,
+		StripAlarms:        true,
+	}
+	if err := db.CreateSource(google); err != nil {
+		t.Fatalf("CreateSource: %v", err)
+	}
+	custom := createTestSource(t, db, owner, "CalDAV")
+
+	if err := db.UpdateSourceOAuthRefreshToken(google.ID, other, "enc-hijack"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("other user's update: expected ErrNotFound, got %v", err)
+	}
+	if err := db.UpdateSourceOAuthRefreshToken(custom.ID, owner, "enc-new"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("non-google source: expected ErrNotFound, got %v", err)
+	}
+	if err := db.UpdateSourceOAuthRefreshToken(google.ID, owner, ""); err == nil {
+		t.Error("empty token: expected an error")
+	}
+
+	if err := db.UpdateSourceOAuthRefreshToken(google.ID, owner, "enc-new"); err != nil {
+		t.Fatalf("owner update: %v", err)
+	}
+	got, err := db.GetSourceByID(google.ID)
+	if err != nil {
+		t.Fatalf("GetSourceByID: %v", err)
+	}
+	if got.OAuthRefreshToken != "enc-new" {
+		t.Errorf("refresh token = %q, want enc-new", got.OAuthRefreshToken)
+	}
+	if got.UserID != owner || got.SyncDirection != SyncDirectionTwoWay || got.SyncDaysPast != 60 ||
+		!got.StripAlarms || got.GoogleClientSecret != "enc-secret" || got.DestPassword != "enc-dest" ||
+		got.SourceURL != google.SourceURL {
+		t.Errorf("reconnect changed unrelated columns: %+v", got)
+	}
+}

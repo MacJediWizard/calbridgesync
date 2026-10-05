@@ -52,6 +52,10 @@ type PendingGoogleSource struct {
 	// StripAlarms is the per-source "Ignore alarms" flag; carried
 	// through OAuth so the callback writes it onto the created source.
 	StripAlarms bool `json:"strip_alarms"`
+	// ReconnectSourceID, when set, marks this as a re-authorization of
+	// an existing Google source: the callback replaces that source's
+	// refresh token instead of creating a new source. (#192)
+	ReconnectSourceID string `json:"reconnect_source_id,omitempty"`
 }
 
 var (

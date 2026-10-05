@@ -80,6 +80,55 @@ go build -o calbridgesync ./cmd/calbridgesync
 ./calbridgesync
 ```
 
+## Google Calendar Sources
+
+Google sources sync over Google's CalDAV API using OAuth 2.0. Each source
+uses a Google Cloud OAuth client that you create; its client ID and secret
+are entered in the add-source form. The secret and the refresh token are
+stored encrypted.
+
+### Google Cloud setup
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create
+   or select a project.
+2. Under **APIs & Services > Library**, enable the **CalDAV API**. Without
+   it, every sync fails even when OAuth succeeds.
+3. Configure the **OAuth consent screen** and add these scopes:
+   - `https://www.googleapis.com/auth/calendar` (CalDAV read/write)
+   - `https://www.googleapis.com/auth/userinfo.email` (used to build the
+     account's CalDAV URL)
+4. **Set the consent screen's publishing status to "In production".** While
+   an app is in **Testing**, Google expires its refresh tokens after
+   **7 days**. Syncs then fail with `oauth2: "invalid_grant"` and the source
+   has to be reconnected. An unverified app that is in production shows an
+   "unverified app" warning during consent, which you can click through for
+   your own account. Its refresh tokens do not expire on a timer.
+5. Under **Credentials**, create an **OAuth client ID** of type **Web
+   application**. Add this authorized redirect URI:
+   `<BASE_URL>/auth/oauth/google/callback`, or the value of
+   `GOOGLE_OAUTH_REDIRECT_URL` if you set that to override it.
+
+CalBridgeSync always requests offline access with `prompt=consent`, so Google
+issues a refresh token on every authorization. If Google returns no refresh
+token, the flow fails with an error instead of saving a source that cannot
+sync.
+
+### Reconnecting an expired or revoked Google account
+
+A refresh token stops working when access is revoked at
+<https://myaccount.google.com/permissions>, when the password changes, after
+the 7-day Testing expiry, or when the token goes unused for 6 months. Once
+that happens, the source shows "Google authorization expired or was revoked"
+in the web UI and the sources list shows a **Reconnect** link. After 3
+consecutive authentication failures, the credential-expiry alert is sent
+through the configured alert channels.
+
+To fix it, open the source (**Edit**) and click **Reconnect Google account**,
+then sign in with the **same** Google account. Only the stored refresh token
+is replaced: the source ID, settings and sync history are kept, and a sync
+starts right away. A different Google account is rejected, because it would
+point the existing source at another calendar.
+
 ## API Endpoints
 
 ### Health Checks

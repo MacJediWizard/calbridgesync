@@ -21,6 +21,8 @@ export interface Source {
   enabled: boolean;
   strip_alarms: boolean;
   sync_status: string;
+  last_sync_message: string;
+  needs_reauth: boolean;
   last_sync_at: string | null;
   next_sync_at: string | null;
   is_stale: boolean;

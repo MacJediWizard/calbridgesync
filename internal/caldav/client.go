@@ -18,6 +18,7 @@ import (
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
 	"github.com/emersion/go-webdav/caldav"
+	"golang.org/x/oauth2"
 )
 
 var (
@@ -119,6 +120,11 @@ type Client struct {
 	password     string
 	httpClient   *http.Client
 	caldavClient *caldav.Client
+	// tokenSource is set only for OAuth clients (NewOAuthClient). It is
+	// the same ReuseTokenSource the HTTP transport uses, so calling
+	// Token() on it to probe credentials does not cause an extra
+	// refresh on the next request. (#192)
+	tokenSource oauth2.TokenSource
 }
 
 // NewClient creates a new CalDAV client.
@@ -170,7 +176,18 @@ func (c *Client) TestConnection(ctx context.Context) error {
 // TestConnectionGoogle tests a Google CalDAV connection by listing
 // calendars directly, since Google doesn't support the standard
 // FindCurrentUserPrincipal PROPFIND. (#160)
+//
+// For OAuth clients it first forces a token refresh, because
+// FindCalendarsGoogle makes no network call: without this probe a
+// revoked refresh token was only discovered inside GetEvents, where
+// it was flattened into a generic per-calendar error and never
+// recognized as an auth failure. (#192)
 func (c *Client) TestConnectionGoogle(ctx context.Context) error {
+	if c.tokenSource != nil {
+		if _, err := c.tokenSource.Token(); err != nil {
+			return classifyTokenError(err)
+		}
+	}
 	_, err := c.FindCalendarsGoogle(ctx)
 	return err
 }
