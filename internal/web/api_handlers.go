@@ -780,13 +780,13 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 	ctx := c.Request.Context()
 	if isICS {
 		if err := h.syncEngine.TestICSConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
-			log.Printf("ICS feed connection test failed for %s: %v", req.SourceURL, err)
+			log.Printf("ICS feed connection test failed for %s: %v", urlOrigin(req.SourceURL), err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to ICS feed: " + categorizeConnectionError(err)})
 			return
 		}
 	} else {
 		if err := h.syncEngine.TestConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
-			log.Printf("Source connection test failed for %s: %v", req.SourceURL, err)
+			log.Printf("Source connection test failed for %s: %v", urlOrigin(req.SourceURL), err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + categorizeConnectionError(err)})
 			return
 		}
@@ -795,7 +795,7 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 	// Test destination if provided
 	if req.DestURL != "" && req.DestUsername != "" && req.DestPassword != "" {
 		if err := h.syncEngine.TestConnection(ctx, req.DestURL, req.DestUsername, req.DestPassword); err != nil {
-			log.Printf("Destination connection test failed for %s: %v", req.DestURL, err)
+			log.Printf("Destination connection test failed for %s: %v", urlOrigin(req.DestURL), err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to destination: " + categorizeConnectionError(err)})
 			return
 		}
@@ -943,9 +943,15 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 	isICS := source.SourceType == db.SourceTypeICS
-	if isICS && db.SyncDirection(req.SyncDirection) == db.SyncDirectionTwoWay {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ICS feeds are read-only and cannot use two-way sync"})
-		return
+	if isICS {
+		twoWay := db.SyncDirection(req.SyncDirection) == db.SyncDirectionTwoWay
+		for _, cal := range req.SelectedCalendars {
+			twoWay = twoWay || db.SyncDirection(cal.SyncDirection) == db.SyncDirectionTwoWay
+		}
+		if twoWay {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "ICS feeds are read-only and cannot use two-way sync"})
+			return
+		}
 	}
 
 	// Stored passwords are bound to the origin they were entered for.
@@ -953,6 +959,7 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	// password must not be sent to the new host: require it again and
 	// test the connection before anything is saved. (PR-26)
 	ctx := c.Request.Context()
+	clearSourcePassword := false
 	if urlOrigin(req.SourceURL) != urlOrigin(source.SourceURL) {
 		switch {
 		case source.SourceType == db.SourceTypeGoogle:
@@ -966,17 +973,21 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 				return
 			}
 			if err := h.syncEngine.TestICSConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
-				log.Printf("ICS feed connection test failed for %s: %v", req.SourceURL, err)
+				log.Printf("ICS feed connection test failed for %s: %v", urlOrigin(req.SourceURL), err)
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to ICS feed: " + categorizeConnectionError(err)})
 				return
 			}
+			// A public feed on the new host needs no password. Drop the
+			// stored one so a later same-origin edit that only adds a
+			// username cannot reattach it to the new host. (#215)
+			clearSourcePassword = req.SourcePassword == ""
 		default:
 			if req.SourcePassword == "" {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Source URL host changed: re-enter the source password"})
 				return
 			}
 			if err := h.syncEngine.TestConnection(ctx, req.SourceURL, req.SourceUsername, req.SourcePassword); err != nil {
-				log.Printf("Source connection test failed for %s: %v", req.SourceURL, err)
+				log.Printf("Source connection test failed for %s: %v", urlOrigin(req.SourceURL), err)
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to source: " + categorizeConnectionError(err)})
 				return
 			}
@@ -988,7 +999,7 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 			return
 		}
 		if err := h.syncEngine.TestConnection(ctx, req.DestURL, req.DestUsername, req.DestPassword); err != nil {
-			log.Printf("Destination connection test failed for %s: %v", req.DestURL, err)
+			log.Printf("Destination connection test failed for %s: %v", urlOrigin(req.DestURL), err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to connect to destination: " + categorizeConnectionError(err)})
 			return
 		}
@@ -1021,6 +1032,9 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	}
 
 	// Update passwords if provided
+	if clearSourcePassword {
+		source.SourcePassword = ""
+	}
 	if req.SourcePassword != "" {
 		encPassword, err := h.encryptor.Encrypt(req.SourcePassword)
 		if err != nil {
