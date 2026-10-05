@@ -5,7 +5,7 @@ A production-ready Go application for bidirectional CalDAV calendar synchronizat
 ## Features
 
 - **CalDAV Synchronization**: Sync calendars between any CalDAV-compatible servers
-- **WebDAV-Sync Support**: Efficient delta synchronization using RFC 6578
+- **Guarded Full Sync**: Each cycle compares the full calendars, skips unchanged events by ETag, and runs deletions through safety guards
 - **OIDC Authentication**: Secure single sign-on via OpenID Connect
 - **Encrypted Credentials**: AES-256-GCM encryption for stored credentials
 - **Background Scheduling**: Configurable automatic sync intervals
@@ -30,6 +30,10 @@ Create a `.env` file based on `.env.example`:
 PORT=8080
 BASE_URL=https://calbridgesync.example.com
 ENVIRONMENT=production
+# Reverse proxy IPs/CIDRs allowed to set X-Forwarded-For (comma-separated).
+# Empty = trust none. Behind a reverse proxy, set this or every user
+# shares one rate-limit bucket and audit logs show the proxy IP.
+TRUSTED_PROXIES=172.17.0.1
 
 # OIDC Authentication
 OIDC_ISSUER=https://auth.example.com/realms/main
