@@ -762,10 +762,10 @@ type caldavEventDeleter interface {
 // sync flow can be driven against an in-memory fake in tests (#177);
 // production always passes a *Client.
 //
-// Callers that have no source client (the ICS path) pass an untyped
-// nil, so the "sourceClient != nil" checks in syncEventsToDestination
-// keep their meaning. Never pass a typed nil *Client here: it would
-// compare non-nil inside the interface.
+// Callers that have no source client (the ICS path) pass nil. A typed
+// nil *Client would compare non-nil inside the interface, so
+// syncEventsToDestination normalizes it with nilIfTypedNil before its
+// "sourceClient != nil" checks.
 type calendarClient interface {
 	FindCalendars(ctx context.Context) ([]Calendar, error)
 	FindCalendarsGoogle(ctx context.Context) ([]Calendar, error)
@@ -777,6 +777,15 @@ type calendarClient interface {
 }
 
 var _ calendarClient = (*Client)(nil)
+
+// nilIfTypedNil turns a calendarClient holding a nil *Client into an
+// untyped nil, so "c != nil" means "there is a client to call".
+func nilIfTypedNil(c calendarClient) calendarClient {
+	if cc, ok := c.(*Client); ok && cc == nil {
+		return nil
+	}
+	return c
+}
 
 // syncedEventTrackingDeleter is the narrow DB surface that
 // performDeletionAndCleanup needs. Same rationale as
@@ -1554,6 +1563,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 // between source events and a destination CalDAV calendar. This is shared by both CalDAV
 // full sync and ICS feed sync paths.
 func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+	sourceClient = nilIfTypedNil(sourceClient)
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),

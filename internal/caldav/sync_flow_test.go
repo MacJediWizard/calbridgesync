@@ -218,8 +218,9 @@ func TestSyncFlow_OneWay_CreateUpdateOrphanDelete(t *testing.T) {
 	assertPaths(t, "cycle4", "dest DELETEs", h.dst.deleteLog(), destPath("C"))
 	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle4", "dest contents", h.dst.paths(), destPath("A"), destPath("B"), destPath("Z"))
-	// TODAY: the one-way orphan delete does not remove C's
+	// TODAY (#181): the one-way orphan delete does not remove C's
 	// synced_events row (only the two-way paths do), so the row leaks.
+	// The fix for #181 flips this to rows A, B.
 	assertRowUIDs(t, "cycle4", h.rows(), "A", "B", "C")
 
 	// Cycle 5: steady again; the leaked row causes no further writes.
@@ -339,10 +340,10 @@ func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
 	h.dst.remove(destPath("B"))
 	r := h.cycle()
 	assertNoWarnings(t, "cycle3", r)
-	// TODAY: the source delete is skipped by the safety threshold and
-	// the forward pass then re-creates B on dest, because B is still on
-	// source and no longer on dest. The user's dest-side delete is
-	// undone.
+	// TODAY (#182): the source delete is skipped by the safety
+	// threshold and the forward pass then re-creates B on dest, because
+	// B is still on source and no longer on dest. The user's dest-side
+	// delete is undone. The fix for #182 flips this to no dest PUT.
 	assertCounts(t, "cycle3", r, counts{Created: 1, EventsProcessed: 5})
 	assertPaths(t, "cycle3", "source DELETEs", h.src.deleteLog())
 	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog(), destPath("B"))
@@ -377,3 +378,30 @@ var errFake503 = fakeErr("503 Service Unavailable")
 type fakeErr string
 
 func (e fakeErr) Error() string { return string(e) }
+
+// A typed-nil *Client passed as sourceClient must behave like the
+// untyped nil the ICS path passes: the source-side passes are skipped
+// instead of calling methods on a nil receiver.
+func TestSyncEventsToDestination_TypedNilSourceClientIsTreatedAsNil(t *testing.T) {
+	h := twoWaySetup(t, 0) // outside the safety window
+	h.dst.remove(destPath("B"))
+	h.src.resetLog()
+	h.dst.resetLog()
+
+	events, err := h.src.GetEvents(context.Background(), flowSrcCal, nil)
+	if err != nil {
+		t.Fatalf("GetEvents: %v", err)
+	}
+	var nilClient *Client
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("syncEventsToDestination panicked with a typed-nil source client: %v", p)
+		}
+	}()
+	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, h.cal, 1, db.SyncDirectionTwoWay)
+	if len(r.Errors) > 0 {
+		t.Fatalf("errors: %v", r.Errors)
+	}
+	assertPaths(t, "typed-nil", "source DELETEs", h.src.deleteLog())
+	assertPaths(t, "typed-nil", "source PUTs", h.src.putLog())
+}
