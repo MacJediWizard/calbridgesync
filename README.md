@@ -5,7 +5,7 @@ A production-ready Go application for bidirectional CalDAV calendar synchronizat
 ## Features
 
 - **CalDAV Synchronization**: Sync calendars between any CalDAV-compatible servers
-- **WebDAV-Sync Support**: Efficient delta synchronization using RFC 6578
+- **Guarded Full Sync**: Each cycle compares the full calendars, skips unchanged events by ETag, and runs deletions through safety guards
 - **OIDC Authentication**: Secure single sign-on via OpenID Connect
 - **Encrypted Credentials**: AES-256-GCM encryption for stored credentials
 - **Background Scheduling**: Configurable automatic sync intervals

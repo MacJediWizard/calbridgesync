@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -445,8 +446,12 @@ func (h *Handlers) APIDeleteDestination(c *gin.Context) {
 		return
 	}
 	destID := c.Param("destId")
-	if err := h.db.DeleteDestination(destID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Destination not found"})
+	if err := h.db.DeleteDestination(destID, sourceID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Destination not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete destination"})
 		return
 	}
 	h.audit(c, "destination.delete", "destination", destID, fmt.Sprintf("source=%s", sourceID))

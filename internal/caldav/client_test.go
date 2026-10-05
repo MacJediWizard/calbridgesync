@@ -143,8 +143,6 @@ func TestCalendarStruct(t *testing.T) {
 			Name:        "Default Calendar",
 			Description: "My default calendar",
 			Color:       "#FF5733",
-			SyncToken:   "sync-token-123",
-			CTag:        "ctag-456",
 		}
 
 		if cal.Path != "/dav/calendars/user/default/" {
@@ -158,12 +156,6 @@ func TestCalendarStruct(t *testing.T) {
 		}
 		if cal.Color != "#FF5733" {
 			t.Error("Color not set correctly")
-		}
-		if cal.SyncToken != "sync-token-123" {
-			t.Error("SyncToken not set correctly")
-		}
-		if cal.CTag != "ctag-456" {
-			t.Error("CTag not set correctly")
 		}
 	})
 }
@@ -811,209 +803,6 @@ func TestNewSyncEngine(t *testing.T) {
 	})
 }
 
-func TestSyncItem(t *testing.T) {
-	t.Run("struct has expected fields", func(t *testing.T) {
-		item := SyncItem{
-			Path: "/calendars/event.ics",
-			ETag: "etag-123",
-			Data: "BEGIN:VCALENDAR...",
-		}
-
-		if item.Path != "/calendars/event.ics" {
-			t.Error("Path not set correctly")
-		}
-		if item.ETag != "etag-123" {
-			t.Error("ETag not set correctly")
-		}
-		if item.Data != "BEGIN:VCALENDAR..." {
-			t.Error("Data not set correctly")
-		}
-	})
-}
-
-func TestSyncResponse(t *testing.T) {
-	t.Run("struct has expected fields", func(t *testing.T) {
-		resp := SyncResponse{
-			SyncToken: "sync-token-123",
-			Changed:   []SyncItem{{Path: "/event1.ics"}},
-			Deleted:   []string{"/event2.ics"},
-		}
-
-		if resp.SyncToken != "sync-token-123" {
-			t.Error("SyncToken not set correctly")
-		}
-		if len(resp.Changed) != 1 {
-			t.Errorf("expected 1 changed item, got %d", len(resp.Changed))
-		}
-		if len(resp.Deleted) != 1 {
-			t.Errorf("expected 1 deleted item, got %d", len(resp.Deleted))
-		}
-	})
-}
-
-func TestBuildSyncCollectionRequest(t *testing.T) {
-	t.Run("builds request without sync token", func(t *testing.T) {
-		result := buildSyncCollectionRequest("")
-
-		if !strings.Contains(result, "<D:sync-token/>") {
-			t.Error("expected empty sync-token element")
-		}
-		if !strings.Contains(result, "<D:sync-collection") {
-			t.Error("expected sync-collection element")
-		}
-		if !strings.Contains(result, "<D:getetag/>") {
-			t.Error("expected getetag element")
-		}
-		if !strings.Contains(result, "<C:calendar-data/>") {
-			t.Error("expected calendar-data element")
-		}
-	})
-
-	t.Run("builds request with sync token", func(t *testing.T) {
-		result := buildSyncCollectionRequest("http://example.com/sync/token123")
-
-		if !strings.Contains(result, "<D:sync-token>http://example.com/sync/token123</D:sync-token>") {
-			t.Error("expected sync-token with value")
-		}
-	})
-
-	t.Run("escapes special characters in sync token", func(t *testing.T) {
-		result := buildSyncCollectionRequest("token<>&'\"")
-
-		if strings.Contains(result, "token<>") {
-			t.Error("expected special characters to be escaped")
-		}
-		if !strings.Contains(result, "&lt;") {
-			t.Error("expected < to be escaped")
-		}
-		if !strings.Contains(result, "&gt;") {
-			t.Error("expected > to be escaped")
-		}
-	})
-}
-
-func TestParseSyncResponse(t *testing.T) {
-	t.Run("parses response with changed items", func(t *testing.T) {
-		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
-<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:sync-token>http://example.com/sync/token456</D:sync-token>
-  <D:response>
-    <D:href>/calendars/event1.ics</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:getetag>"etag-123"</D:getetag>
-        <C:calendar-data>BEGIN:VCALENDAR...</C:calendar-data>
-      </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
-    </D:propstat>
-  </D:response>
-</D:multistatus>`
-
-		resp, err := parseSyncResponse([]byte(xmlBody))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		if resp.SyncToken != "http://example.com/sync/token456" {
-			t.Errorf("expected sync token, got %q", resp.SyncToken)
-		}
-		if len(resp.Changed) != 1 {
-			t.Fatalf("expected 1 changed item, got %d", len(resp.Changed))
-		}
-		if resp.Changed[0].Path != "/calendars/event1.ics" {
-			t.Errorf("expected path, got %q", resp.Changed[0].Path)
-		}
-	})
-
-	t.Run("parses response with deleted items", func(t *testing.T) {
-		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
-<D:multistatus xmlns:D="DAV:">
-  <D:sync-token>token123</D:sync-token>
-  <D:response>
-    <D:href>/calendars/deleted-event.ics</D:href>
-    <D:status>HTTP/1.1 404 Not Found</D:status>
-  </D:response>
-</D:multistatus>`
-
-		resp, err := parseSyncResponse([]byte(xmlBody))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		if len(resp.Deleted) != 1 {
-			t.Fatalf("expected 1 deleted item, got %d", len(resp.Deleted))
-		}
-		if resp.Deleted[0] != "/calendars/deleted-event.ics" {
-			t.Errorf("expected deleted path, got %q", resp.Deleted[0])
-		}
-	})
-
-	t.Run("returns error for invalid XML", func(t *testing.T) {
-		_, err := parseSyncResponse([]byte("not valid xml"))
-		if err == nil {
-			t.Error("expected error for invalid XML")
-		}
-	})
-}
-
-func TestXmlEscape(t *testing.T) {
-	testCases := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "escapes ampersand",
-			input:    "a & b",
-			expected: "a &amp; b",
-		},
-		{
-			name:     "escapes less than",
-			input:    "a < b",
-			expected: "a &lt; b",
-		},
-		{
-			name:     "escapes greater than",
-			input:    "a > b",
-			expected: "a &gt; b",
-		},
-		{
-			name:     "escapes single quote",
-			input:    "it's",
-			expected: "it&apos;s",
-		},
-		{
-			name:     "escapes double quote",
-			input:    `say "hello"`,
-			expected: "say &quot;hello&quot;",
-		},
-		{
-			name:     "escapes all special characters",
-			input:    `<tag attr='val' & "test">`,
-			expected: "&lt;tag attr=&apos;val&apos; &amp; &quot;test&quot;&gt;",
-		},
-		{
-			name:     "returns empty string unchanged",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "returns plain text unchanged",
-			input:    "plain text",
-			expected: "plain text",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := xmlEscape(tc.input)
-			if result != tc.expected {
-				t.Errorf("expected %q, got %q", tc.expected, result)
-			}
-		})
-	}
-}
-
 func TestConstants(t *testing.T) {
 	t.Run("defaultTimeout is 5 minutes", func(t *testing.T) {
 		if defaultTimeout != 300*time.Second {
@@ -1360,93 +1149,6 @@ func TestSyncEngineTestConnection(t *testing.T) {
 	})
 }
 
-func TestParseSyncResponseEdgeCases(t *testing.T) {
-	t.Run("handles response with propstat but no 200 status", func(t *testing.T) {
-		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
-<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:sync-token>token123</D:sync-token>
-  <D:response>
-    <D:href>/calendars/event.ics</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:getetag>"etag-123"</D:getetag>
-      </D:prop>
-      <D:status>HTTP/1.1 403 Forbidden</D:status>
-    </D:propstat>
-  </D:response>
-</D:multistatus>`
-
-		resp, err := parseSyncResponse([]byte(xmlBody))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		// Should not include items with non-200 status
-		if len(resp.Changed) != 0 {
-			t.Errorf("expected 0 changed items for 403 status, got %d", len(resp.Changed))
-		}
-	})
-
-	t.Run("handles mixed changed and deleted items", func(t *testing.T) {
-		xmlBody := `<?xml version="1.0" encoding="utf-8"?>
-<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:sync-token>token456</D:sync-token>
-  <D:response>
-    <D:href>/calendars/event1.ics</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:getetag>"etag-1"</D:getetag>
-        <C:calendar-data>DATA1</C:calendar-data>
-      </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
-    </D:propstat>
-  </D:response>
-  <D:response>
-    <D:href>/calendars/deleted.ics</D:href>
-    <D:status>HTTP/1.1 404 Not Found</D:status>
-  </D:response>
-  <D:response>
-    <D:href>/calendars/event2.ics</D:href>
-    <D:propstat>
-      <D:prop>
-        <D:getetag>"etag-2"</D:getetag>
-        <C:calendar-data>DATA2</C:calendar-data>
-      </D:prop>
-      <D:status>HTTP/1.1 200 OK</D:status>
-    </D:propstat>
-  </D:response>
-</D:multistatus>`
-
-		resp, err := parseSyncResponse([]byte(xmlBody))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		if len(resp.Changed) != 2 {
-			t.Errorf("expected 2 changed items, got %d", len(resp.Changed))
-		}
-		if len(resp.Deleted) != 1 {
-			t.Errorf("expected 1 deleted item, got %d", len(resp.Deleted))
-		}
-	})
-}
-
-func TestBuildSyncCollectionRequestFormat(t *testing.T) {
-	t.Run("request has correct XML structure", func(t *testing.T) {
-		result := buildSyncCollectionRequest("")
-
-		if !strings.Contains(result, `xmlns:D="DAV:"`) {
-			t.Error("expected DAV namespace")
-		}
-		if !strings.Contains(result, `xmlns:C="urn:ietf:params:xml:ns:caldav"`) {
-			t.Error("expected CalDAV namespace")
-		}
-		if !strings.Contains(result, `<D:sync-level>1</D:sync-level>`) {
-			t.Error("expected sync-level element")
-		}
-	})
-}
-
 func TestIsMalformedErrorEdgeCases(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -1752,8 +1454,6 @@ func TestCalendarStructJSON(t *testing.T) {
 			Name:        "Work",
 			Description: "Work calendar",
 			Color:       "#0000FF",
-			SyncToken:   "token",
-			CTag:        "ctag",
 		}
 
 		// Verify all fields are accessible
