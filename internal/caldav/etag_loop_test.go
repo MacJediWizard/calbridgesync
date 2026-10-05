@@ -44,6 +44,24 @@ func TestShouldUpdateDestFromSource_EmptyStoredETagSkips(t *testing.T) {
 	}
 }
 
+// TestShouldUpdateDestFromSource_ICSSyntheticETagRollout: ICS events
+// used to carry no ETag at all, so every ICS row was stuck in the
+// empty-SourceETag branch above and feed edits never propagated.
+// FetchEvents now sets "ics-<sha256>" (#246). The first cycle after
+// deploy only records the hash through the legacy branch; from the
+// second cycle on a changed hash triggers the PUT.
+func TestShouldUpdateDestFromSource_ICSSyntheticETagRollout(t *testing.T) {
+	if shouldUpdateDestFromSource("ics-aaa", &db.SyncedEvent{SourceETag: ""}) {
+		t.Error("first cycle after deploy should only record the ICS hash, not PUT")
+	}
+	if shouldUpdateDestFromSource("ics-aaa", &db.SyncedEvent{SourceETag: "ics-aaa"}) {
+		t.Error("unchanged ICS hash should skip the PUT")
+	}
+	if !shouldUpdateDestFromSource("ics-bbb", &db.SyncedEvent{SourceETag: "ics-aaa"}) {
+		t.Error("changed ICS hash must trigger the PUT")
+	}
+}
+
 // TestShouldUpdateDestFromSource_MatchingETagSkips: the happy steady-
 // state case. Source ETag matches the stored one, meaning the source
 // has not changed since last sync. Skip the PUT. This is the path

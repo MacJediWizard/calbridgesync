@@ -220,7 +220,9 @@ type Source struct {
 	// before writing them to the destination. Useful for subscribed
 	// publish feeds where the source-side alarms shouldn't fire on the
 	// destination calendar. Malformed VALARMs (missing TRIGGER) are
-	// always stripped regardless of this flag.
+	// always stripped regardless of this flag. Ignored for two-way
+	// calendars, where the stripped copy would be written back over
+	// the source and erase its alarms.
 	StripAlarms bool `json:"strip_alarms"`
 }
 

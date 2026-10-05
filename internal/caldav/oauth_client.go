@@ -64,7 +64,7 @@ func NewOAuthClient(ctx context.Context, baseURL string, oauthConfig *oauth2.Con
 	}
 
 	httpClient := &http.Client{
-		Timeout:   defaultTimeout,
+		Timeout:   requestTimeout(),
 		Transport: oauthTransport,
 	}
 

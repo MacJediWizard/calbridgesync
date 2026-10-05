@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -244,7 +243,10 @@ func RequireJSONContentType() gin.HandlerFunc {
 
 // ValidateOrigin validates the Origin header for CSRF protection.
 // This provides an additional layer of protection beyond SameSite cookies.
-func ValidateOrigin() gin.HandlerFunc {
+// configured is Config.Server.AllowedOrigins; it is resolved once here,
+// when the route group is built, so requests share an immutable slice.
+func ValidateOrigin(configured []string) gin.HandlerFunc {
+	allowedOrigins := resolveAllowedOrigins(configured)
 	return func(c *gin.Context) {
 		// Only validate state-changing methods
 		if c.Request.Method == "GET" || c.Request.Method == "HEAD" || c.Request.Method == "OPTIONS" {
@@ -276,9 +278,6 @@ func ValidateOrigin() gin.HandlerFunc {
 			return
 		}
 
-		// Get allowed origins from environment or use defaults
-		allowedOrigins := getAllowedOrigins()
-
 		// Validate origin
 		originValid := false
 		for _, allowed := range allowedOrigins {
@@ -300,56 +299,32 @@ func ValidateOrigin() gin.HandlerFunc {
 	}
 }
 
-// allowedOriginsCache caches the parsed origins so we don't re-parse
-// ALLOWED_ORIGINS on every request. Initialization is guarded by
-// allowedOriginsOnce so the parse happens exactly once even under
-// concurrent first-request load. Previously this was a bool +
-// unguarded slice pair, which was a data race: two goroutines hitting
-// the first request simultaneously could read and write the slice
-// with no synchronization, and under the Go memory model that's
-// undefined behavior — in the worst case a half-initialized slice
-// visible to one goroutine before the cache init flag flipped
-// could cause a request to fail-open or fail-closed depending on
-// scheduling. sync.Once gives us a lock-free fast path after the
-// initialization completes, so the per-request cost stays trivial. (#91)
-var (
-	allowedOriginsCache []string
-	allowedOriginsOnce  sync.Once
-)
-
-// getAllowedOrigins returns the list of allowed origins for CSRF validation.
-// SECURITY: In production, always set ALLOWED_ORIGINS environment variable.
-func getAllowedOrigins() []string {
-	allowedOriginsOnce.Do(func() {
-		origins := []string{}
-
-		// Add from environment variable if set
-		if env := os.Getenv("ALLOWED_ORIGINS"); env != "" {
-			for _, o := range strings.Split(env, ",") {
-				origin := strings.TrimSpace(o)
-				if isValidOrigin(origin) {
-					origins = append(origins, origin)
-				} else {
-					log.Printf("WARNING: Invalid origin in ALLOWED_ORIGINS ignored: %s", origin)
-				}
-			}
+// resolveAllowedOrigins returns the origins accepted for CSRF
+// validation: the valid entries of the configured list (from
+// ALLOWED_ORIGINS via config.Config, #239), or localhost defaults for
+// development when none are valid. Config.Validate refuses to start in
+// production with an empty list.
+func resolveAllowedOrigins(configured []string) []string {
+	origins := []string{}
+	for _, origin := range configured {
+		if isValidOrigin(origin) {
+			origins = append(origins, origin)
+		} else {
+			log.Printf("WARNING: Invalid origin in ALLOWED_ORIGINS ignored: %s", origin)
 		}
+	}
 
-		// Fall back to localhost origins for development only
-		if len(origins) == 0 {
-			// Log warning - this should not happen in production
-			log.Printf("WARNING: ALLOWED_ORIGINS not set - using localhost defaults. Set ALLOWED_ORIGINS in production!")
-			origins = []string{
-				"http://localhost:8080",
-				"http://localhost:5173",
-				"http://127.0.0.1:8080",
-				"http://127.0.0.1:5173",
-			}
+	// Fall back to localhost origins for development only
+	if len(origins) == 0 {
+		log.Printf("WARNING: ALLOWED_ORIGINS not set - using localhost defaults. Set ALLOWED_ORIGINS in production!")
+		origins = []string{
+			"http://localhost:8080",
+			"http://localhost:5173",
+			"http://127.0.0.1:8080",
+			"http://127.0.0.1:5173",
 		}
-
-		allowedOriginsCache = origins
-	})
-	return allowedOriginsCache
+	}
+	return origins
 }
 
 // isValidOrigin validates that an origin string is a proper URL format.

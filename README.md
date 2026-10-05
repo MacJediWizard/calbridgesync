@@ -9,7 +9,7 @@ A production-ready Go application for bidirectional CalDAV calendar synchronizat
 - **OIDC Authentication**: Secure single sign-on via OpenID Connect
 - **Encrypted Credentials**: AES-256-GCM encryption for stored credentials
 - **Background Scheduling**: Configurable automatic sync intervals
-- **Web Dashboard**: HTMX + Tailwind CSS interface for management
+- **Web Dashboard**: React + Tailwind CSS single-page app for management
 - **Health Monitoring**: Kubernetes-ready health endpoints
 - **Docker Ready**: Multi-stage build with security best practices
 
@@ -29,7 +29,10 @@ Create a `.env` file based on `.env.example`:
 # Server
 PORT=8080
 BASE_URL=https://calbridgesync.example.com
+# Must be "production" or "development"; anything else fails at startup.
 ENVIRONMENT=production
+# Required in production: browser origins allowed by the CSRF check (comma-separated).
+ALLOWED_ORIGINS=https://calbridgesync.example.com
 # Reverse proxy IPs/CIDRs allowed to set X-Forwarded-For (comma-separated).
 # Empty = trust none. Behind a reverse proxy, set this or every user
 # shares one rate-limit bucket and audit logs show the proxy IP.
@@ -45,19 +48,17 @@ OIDC_REDIRECT_URL=https://calbridgesync.example.com/auth/callback
 ENCRYPTION_KEY=your-64-character-hex-encryption-key
 SESSION_SECRET=your-session-secret-min-32-chars
 
-# CalDAV
+# CalDAV (in production, http:// is allowed only for private or loopback hosts)
 DEFAULT_DEST_URL=https://caldav.example.com/calendars/
+# Per-request HTTP timeout for CalDAV and ICS calls, in seconds (default 300)
+CALDAV_REQUEST_TIMEOUT=300
 
 # Database
 DATABASE_PATH=./data/calbridgesync.db
 
-# Rate Limiting
-RATE_LIMIT_RPS=10
-RATE_LIMIT_BURST=20
-
 # Sync Intervals (seconds)
 MIN_SYNC_INTERVAL=30
-MAX_SYNC_INTERVAL=3600
+MAX_SYNC_INTERVAL=86400
 ```
 
 ### Running with Docker

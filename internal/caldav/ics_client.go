@@ -115,6 +115,18 @@ func isICSBlockedIP(ip net.IP) (bool, string) {
 // avoids retrofitting if httptest-based ICS tests get added. (#129)
 var icsDialContext = icsLoopbackOnlyDialContext
 
+// SetICSDialContextForTesting replaces the ICS dial function and
+// returns a func that restores the previous one. It exists only so
+// tests in other packages (e.g. internal/web handler tests against an
+// httptest server on 127.0.0.1) can bypass the SSRF guard; production
+// code must never call it. It affects ICS clients built after the
+// swap. Not safe for use by parallel tests. (#215)
+func SetICSDialContextForTesting(fn func(ctx context.Context, network, addr string) (net.Conn, error)) (restore func()) {
+	orig := icsDialContext
+	icsDialContext = fn
+	return func() { icsDialContext = orig }
+}
+
 // ICSClient fetches and parses ICS calendar feeds over HTTP.
 type ICSClient struct {
 	feedURL    string
@@ -245,7 +257,7 @@ func NewICSClient(feedURL, username, password string) (*ICSClient, error) {
 	}
 
 	httpClient := &http.Client{
-		Timeout:   defaultTimeout,
+		Timeout:   requestTimeout(),
 		Transport: transport,
 	}
 
@@ -412,9 +424,27 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 			Summary:   g.summary,
 			StartTime: g.startTime,
 			Data:      data,
+			ETag:      icsSyntheticETag(data),
 		})
 	}
 
 	log.Printf("ICS feed: parsed %d events (%d UIDs grouped from %d VEVENTs)", len(events), len(groups), len(cal.Events()))
 	return events, nil
+}
+
+// icsSyntheticETag derives a stable ETag for one encoded UID group.
+// ICS feeds have no per-object ETag, and an empty SourceETag makes
+// shouldUpdateDestFromSource skip every update, so feed edits never
+// propagated. DTSTAMP lines are excluded because many feeds regenerate
+// DTSTAMP on every request. The encoder sorts properties and params and
+// never folds lines, so the remaining bytes are deterministic. (#246)
+func icsSyntheticETag(data string) string {
+	h := sha256.New()
+	for _, line := range strings.SplitAfter(data, "\n") {
+		if strings.HasPrefix(line, "DTSTAMP:") || strings.HasPrefix(line, "DTSTAMP;") {
+			continue
+		}
+		h.Write([]byte(line))
+	}
+	return fmt.Sprintf("ics-%x", h.Sum(nil))
 }

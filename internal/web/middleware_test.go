@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -221,16 +220,12 @@ func TestRequireJSONContentType(t *testing.T) {
 }
 
 func TestValidateOrigin(t *testing.T) {
-	// Reset cache before tests
-	allowedOriginsCache = nil
-	allowedOriginsOnce = sync.Once{}
-
 	t.Run("allows GET requests without origin", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if c.IsAborted() {
@@ -243,7 +238,7 @@ func TestValidateOrigin(t *testing.T) {
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodHead, "/", nil)
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if c.IsAborted() {
@@ -256,7 +251,7 @@ func TestValidateOrigin(t *testing.T) {
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodOptions, "/", nil)
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if c.IsAborted() {
@@ -265,15 +260,11 @@ func TestValidateOrigin(t *testing.T) {
 	})
 
 	t.Run("rejects POST without origin", func(t *testing.T) {
-		// Reset cache
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if !c.IsAborted() {
@@ -285,18 +276,12 @@ func TestValidateOrigin(t *testing.T) {
 	})
 
 	t.Run("allows POST with valid origin", func(t *testing.T) {
-		// Reset cache and set allowed origins
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-		os.Setenv("ALLOWED_ORIGINS", "http://localhost:8080")
-		defer os.Unsetenv("ALLOWED_ORIGINS")
-
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 		c.Request.Header.Set("Origin", "http://localhost:8080")
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if c.IsAborted() {
@@ -305,18 +290,12 @@ func TestValidateOrigin(t *testing.T) {
 	})
 
 	t.Run("rejects POST with invalid origin", func(t *testing.T) {
-		// Reset cache and set allowed origins
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-		os.Setenv("ALLOWED_ORIGINS", "http://localhost:8080")
-		defer os.Unsetenv("ALLOWED_ORIGINS")
-
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 		c.Request.Header.Set("Origin", "http://evil.com")
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if !c.IsAborted() {
@@ -328,18 +307,12 @@ func TestValidateOrigin(t *testing.T) {
 	})
 
 	t.Run("extracts origin from referer", func(t *testing.T) {
-		// Reset cache and set allowed origins
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-		os.Setenv("ALLOWED_ORIGINS", "http://localhost:8080")
-		defer os.Unsetenv("ALLOWED_ORIGINS")
-
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
 		c.Request.Header.Set("Referer", "http://localhost:8080/page")
 
-		handler := ValidateOrigin()
+		handler := ValidateOrigin([]string{"http://localhost:8080"})
 		handler(c)
 
 		if c.IsAborted() {
@@ -402,64 +375,16 @@ func TestIsSafeRedirectURL(t *testing.T) {
 	}
 }
 
-func TestGetAllowedOrigins(t *testing.T) {
-	t.Run("returns cached origins on subsequent calls", func(t *testing.T) {
-		// Reset cache
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-		os.Unsetenv("ALLOWED_ORIGINS")
-
-		// First call initializes cache
-		origins1 := getAllowedOrigins()
-		// Second call should return cached value
-		origins2 := getAllowedOrigins()
-
-		if len(origins1) != len(origins2) {
-			t.Error("expected same origins from cache")
+func TestResolveAllowedOrigins(t *testing.T) {
+	t.Run("uses configured origins", func(t *testing.T) {
+		origins := resolveAllowedOrigins([]string{"http://localhost:8080", "https://example.com"})
+		if len(origins) != 2 || origins[0] != "http://localhost:8080" || origins[1] != "https://example.com" {
+			t.Errorf("unexpected origins: %v", origins)
 		}
 	})
 
-	t.Run("parses ALLOWED_ORIGINS environment variable", func(t *testing.T) {
-		// Reset cache
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-
-		os.Setenv("ALLOWED_ORIGINS", "http://localhost:8080,https://example.com")
-		defer os.Unsetenv("ALLOWED_ORIGINS")
-
-		origins := getAllowedOrigins()
-
-		if len(origins) != 2 {
-			t.Errorf("expected 2 origins, got %d", len(origins))
-		}
-
-		found8080 := false
-		foundExample := false
-		for _, o := range origins {
-			if o == "http://localhost:8080" {
-				found8080 = true
-			}
-			if o == "https://example.com" {
-				foundExample = true
-			}
-		}
-
-		if !found8080 || !foundExample {
-			t.Error("expected both origins to be parsed")
-		}
-	})
-
-	t.Run("uses localhost defaults when env not set", func(t *testing.T) {
-		// Reset cache
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-		os.Unsetenv("ALLOWED_ORIGINS")
-
-		origins := getAllowedOrigins()
-
-		if len(origins) == 0 {
-			t.Error("expected default localhost origins")
-		}
+	t.Run("uses localhost defaults when none configured", func(t *testing.T) {
+		origins := resolveAllowedOrigins(nil)
 
 		hasLocalhost := false
 		for _, o := range origins {
@@ -468,95 +393,46 @@ func TestGetAllowedOrigins(t *testing.T) {
 				break
 			}
 		}
-
 		if !hasLocalhost {
-			t.Error("expected localhost in default origins")
+			t.Errorf("expected localhost in default origins, got %v", origins)
 		}
 	})
 
-	t.Run("ignores invalid origins in env", func(t *testing.T) {
-		// Reset cache
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-
-		os.Setenv("ALLOWED_ORIGINS", "http://valid.com,invalid,http://also-valid.com")
-		defer os.Unsetenv("ALLOWED_ORIGINS")
-
-		origins := getAllowedOrigins()
-
-		// Should have 2 valid origins
+	t.Run("ignores invalid origins", func(t *testing.T) {
+		origins := resolveAllowedOrigins([]string{"http://valid.com", "invalid", "http://also-valid.com"})
 		if len(origins) != 2 {
 			t.Errorf("expected 2 valid origins, got %d: %v", len(origins), origins)
 		}
 	})
 
-	// TestGetAllowedOrigins_ConcurrentInit is a regression test for
-	// the data race fixed in #91. Previously getAllowedOrigins used
-	// an unguarded bool+slice pair for its cache, which meant
-	// concurrent first-request callers could observe a partially
-	// initialized cache. With sync.Once the initialization runs
-	// exactly once even under heavy concurrent load.
-	//
-	// Run this test under `go test -race` to actually catch
-	// regressions — a reintroduced race is only visible with the
-	// race detector enabled.
-	t.Run("concurrent init is race-free", func(t *testing.T) {
-		allowedOriginsCache = nil
-		allowedOriginsOnce = sync.Once{}
-		os.Setenv("ALLOWED_ORIGINS", "http://one.example.com,http://two.example.com")
-		defer os.Unsetenv("ALLOWED_ORIGINS")
+	// The origin list is now resolved once when the middleware is
+	// built (#239), replacing the lazily-initialised package cache
+	// from #91. Keep a concurrent-use check so a reintroduced lazy
+	// cache is caught under `go test -race`.
+	t.Run("concurrent requests are race-free", func(t *testing.T) {
+		handler := ValidateOrigin([]string{"http://one.example.com", "http://two.example.com"})
 
 		const workers = 64
 		var wg sync.WaitGroup
 		wg.Add(workers)
-		results := make([][]string, workers)
+		aborted := make([]bool, workers)
 		for i := 0; i < workers; i++ {
-			i := i
 			go func() {
 				defer wg.Done()
-				results[i] = getAllowedOrigins()
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+				c.Request.Header.Set("Origin", "http://two.example.com")
+				handler(c)
+				aborted[i] = c.IsAborted()
 			}()
 		}
 		wg.Wait()
 
-		for i, got := range results {
-			if len(got) != 2 {
-				t.Errorf("worker %d: expected 2 origins, got %d: %v", i, len(got), got)
+		for i, a := range aborted {
+			if a {
+				t.Errorf("worker %d: allowed origin was rejected", i)
 			}
-		}
-	})
-}
-
-func TestIsHTMX(t *testing.T) {
-	t.Run("returns true for HTMX request", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-		c.Request.Header.Set("HX-Request", "true")
-
-		if !isHTMX(c) {
-			t.Error("expected isHTMX to return true")
-		}
-	})
-
-	t.Run("returns false for non-HTMX request", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-
-		if isHTMX(c) {
-			t.Error("expected isHTMX to return false")
-		}
-	})
-
-	t.Run("returns false for other HX-Request values", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-		c.Request.Header.Set("HX-Request", "false")
-
-		if isHTMX(c) {
-			t.Error("expected isHTMX to return false for 'false' value")
 		}
 	})
 }

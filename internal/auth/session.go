@@ -14,7 +14,6 @@ const (
 	sessionName             = "calbridgesync_session"
 	oauthStateName          = "calbridgesync_oauth_state"
 	googlePendingSourceName = "calbridgesync_google_pending" // #70
-	csrfTokenLength         = 32
 	// pendingSourceMaxAge is how long a pending Google source can sit
 	// in its cookie between form submit and OAuth callback. Long
 	// enough for the user to go through Google's consent screen,
@@ -65,11 +64,10 @@ var (
 
 // SessionData represents the data stored in a user session.
 type SessionData struct {
-	UserID    string `json:"user_id"`
-	Email     string `json:"email"`
-	Name      string `json:"name"`
-	Picture   string `json:"picture"`
-	CSRFToken string `json:"csrf_token"`
+	UserID  string `json:"user_id"`
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+	Picture string `json:"picture"`
 }
 
 // SessionManager manages user sessions.
@@ -116,7 +114,7 @@ func (sm *SessionManager) Get(r *http.Request) (*SessionData, error) {
 	}
 
 	// These type assertions are intentionally unchecked - missing values default to empty string
-	var email, name, picture, csrfToken string
+	var email, name, picture string
 	if v, ok := session.Values["email"].(string); ok {
 		email = v
 	}
@@ -126,16 +124,12 @@ func (sm *SessionManager) Get(r *http.Request) (*SessionData, error) {
 	if v, ok := session.Values["picture"].(string); ok {
 		picture = v
 	}
-	if v, ok := session.Values["csrf_token"].(string); ok {
-		csrfToken = v
-	}
 
 	return &SessionData{
-		UserID:    userID,
-		Email:     email,
-		Name:      name,
-		Picture:   picture,
-		CSRFToken: csrfToken,
+		UserID:  userID,
+		Email:   email,
+		Name:    name,
+		Picture: picture,
 	}, nil
 }
 
@@ -150,20 +144,12 @@ func (sm *SessionManager) Set(w http.ResponseWriter, r *http.Request, data *Sess
 		}
 	}
 
-	// Generate CSRF token if not present
-	if data.CSRFToken == "" {
-		csrfToken, err := generateCSRFToken()
-		if err != nil {
-			return err
-		}
-		data.CSRFToken = csrfToken
-	}
-
 	session.Values["user_id"] = data.UserID
 	session.Values["email"] = data.Email
 	session.Values["name"] = data.Name
 	session.Values["picture"] = data.Picture
-	session.Values["csrf_token"] = data.CSRFToken
+	// Drop the token written by builds that still had the HTMX UI.
+	delete(session.Values, "csrf_token")
 
 	return session.Save(r, w)
 }
@@ -327,15 +313,6 @@ func (sm *SessionManager) GetPendingGoogleSource(w http.ResponseWriter, r *http.
 // GenerateState generates a random state string for OAuth.
 func GenerateState() (string, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.URLEncoding.EncodeToString(b), nil
-}
-
-// generateCSRFToken generates a random CSRF token.
-func generateCSRFToken() (string, error) {
-	b := make([]byte, csrfTokenLength)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}

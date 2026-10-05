@@ -1,11 +1,11 @@
 package config
 
 import (
-	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -32,15 +32,14 @@ const (
 
 // Config holds all application configuration.
 type Config struct {
-	Server       ServerConfig
-	OIDC         OIDCConfig
-	Security     SecurityConfig
-	Database     DatabaseConfig
-	CalDAV       CalDAVConfig
-	RateLimiting RateLimitConfig
-	Sync         SyncConfig
-	Alerts       AlertConfig
-	GoogleOAuth  GoogleOAuthConfig
+	Server      ServerConfig
+	OIDC        OIDCConfig
+	Security    SecurityConfig
+	Database    DatabaseConfig
+	CalDAV      CalDAVConfig
+	Sync        SyncConfig
+	Alerts      AlertConfig
+	GoogleOAuth GoogleOAuthConfig
 	// LogRetentionDays controls how many days of sync logs the
 	// scheduler's daily cleanup routine keeps. Configurable via
 	// SYNC_LOG_RETENTION_DAYS env var. Default 30.
@@ -119,6 +118,10 @@ type ServerConfig struct {
 	// is honoured when resolving the client IP. Empty means trust no
 	// proxy. Set via TRUSTED_PROXIES (comma-separated). (#199)
 	TrustedProxies []string
+	// AllowedOrigins lists the browser origins accepted by the CSRF
+	// origin check (web.ValidateOrigin). Set via ALLOWED_ORIGINS
+	// (comma-separated). Required in production. (#239)
+	AllowedOrigins []string
 }
 
 // OIDCConfig holds OIDC authentication configuration.
@@ -148,12 +151,6 @@ type CalDAVConfig struct {
 	RequestTimeoutSecs int // HTTP request timeout in seconds (default: 300 = 5 minutes)
 }
 
-// RateLimitConfig holds rate limiting configuration.
-type RateLimitConfig struct {
-	RPS   float64
-	Burst int
-}
-
 // SyncConfig holds sync interval configuration.
 type SyncConfig struct {
 	MinInterval int
@@ -176,6 +173,17 @@ func Load() (*Config, error) {
 	cfg.Server.Port = port
 	cfg.Server.BaseURL = getEnvRequired("BASE_URL")
 	cfg.Server.Environment = Environment(strings.ToLower(getEnv("ENVIRONMENT", "production")))
+	// Any other value would make IsProduction() false and silently
+	// disable every production-only check. (#239)
+	if cfg.Server.Environment != EnvDevelopment && cfg.Server.Environment != EnvProduction {
+		return nil, fmt.Errorf("%w: ENVIRONMENT must be %q or %q, got %q",
+			ErrInvalidConfig, EnvDevelopment, EnvProduction, cfg.Server.Environment)
+	}
+	for _, o := range strings.Split(getEnv("ALLOWED_ORIGINS", ""), ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			cfg.Server.AllowedOrigins = append(cfg.Server.AllowedOrigins, o)
+		}
+	}
 	for _, p := range strings.Split(getEnv("TRUSTED_PROXIES", ""), ",") {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -236,20 +244,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: CALDAV_REQUEST_TIMEOUT: %w", ErrInvalidConfig, err)
 	}
+	if caldavTimeout < 1 {
+		return nil, fmt.Errorf("%w: CALDAV_REQUEST_TIMEOUT must be a positive number of seconds, got %d",
+			ErrInvalidConfig, caldavTimeout)
+	}
 	cfg.CalDAV.RequestTimeoutSecs = caldavTimeout
-
-	// Rate limiting configuration
-	rps, err := getEnvFloat("RATE_LIMIT_RPS", 10.0)
-	if err != nil {
-		return nil, fmt.Errorf("%w: RATE_LIMIT_RPS: %w", ErrInvalidConfig, err)
-	}
-	cfg.RateLimiting.RPS = rps
-
-	burst, err := getEnvInt("RATE_LIMIT_BURST", 20)
-	if err != nil {
-		return nil, fmt.Errorf("%w: RATE_LIMIT_BURST: %w", ErrInvalidConfig, err)
-	}
-	cfg.RateLimiting.Burst = burst
 
 	// Sync configuration
 	minInterval, err := getEnvInt("MIN_SYNC_INTERVAL", 30)
@@ -258,7 +257,7 @@ func Load() (*Config, error) {
 	}
 	cfg.Sync.MinInterval = minInterval
 
-	maxInterval, err := getEnvInt("MAX_SYNC_INTERVAL", 3600)
+	maxInterval, err := getEnvInt("MAX_SYNC_INTERVAL", 86400)
 	if err != nil {
 		return nil, fmt.Errorf("%w: MAX_SYNC_INTERVAL: %w", ErrInvalidConfig, err)
 	}
@@ -399,42 +398,65 @@ func (c *Config) getMissingRequired() []string {
 	return missing
 }
 
-// Validate validates all URLs are reachable.
-func (c *Config) Validate(ctx context.Context) error {
+// Validate checks URL formats and production-only requirements. It
+// makes no network calls, so a transient IdP or DNS outage cannot
+// block startup; reachability is exercised by the OIDC provider
+// setup and the first sync instead. Called from main right after
+// Load. (#239)
+func (c *Config) Validate() error {
 	v := validator.New()
+	isProd := c.IsProduction()
 
-	// Validate base URL format
-	if err := v.ValidateURL(c.Server.BaseURL, c.IsProduction()); err != nil {
+	if err := v.ValidateURL(c.Server.BaseURL, isProd); err != nil {
 		return fmt.Errorf("%w: BASE_URL: %w", ErrValidationFailed, err)
 	}
 
-	// Validate OIDC issuer is reachable
-	if err := v.ValidateOIDCIssuer(ctx, c.OIDC.Issuer); err != nil {
+	// The issuer is always https, in every environment: the OIDC
+	// discovery document and tokens travel over it.
+	if err := v.ValidateURL(c.OIDC.Issuer, true); err != nil {
 		return fmt.Errorf("%w: OIDC_ISSUER: %w", ErrValidationFailed, err)
 	}
 
-	// Validate OIDC redirect URL format
-	if err := v.ValidateURL(c.OIDC.RedirectURL, c.IsProduction()); err != nil {
+	if err := v.ValidateURL(c.OIDC.RedirectURL, isProd); err != nil {
 		return fmt.Errorf("%w: OIDC_REDIRECT_URL: %w", ErrValidationFailed, err)
 	}
 
-	// Validate CalDAV default destination URL format
-	if err := v.ValidateURL(c.CalDAV.DefaultDestURL, c.IsProduction()); err != nil {
+	// DEFAULT_DEST_URL may be plain http in production only when it
+	// points at a private or loopback host (a LAN or same-host SOGo).
+	if err := v.ValidateURL(c.CalDAV.DefaultDestURL, false); err != nil {
 		return fmt.Errorf("%w: DEFAULT_DEST_URL: %w", ErrValidationFailed, err)
+	}
+	if isProd {
+		if u, _ := url.Parse(c.CalDAV.DefaultDestURL); u.Scheme != "https" && !isPrivateOrLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("%w: DEFAULT_DEST_URL: %w (http is allowed only for private or loopback hosts)",
+				ErrValidationFailed, validator.ErrHTTPSRequired)
+		}
 	}
 
 	// ALLOWED_ORIGINS is required in production mode. See
 	// validateAllowedOriginsForProd for the full rationale.
-	if err := validateAllowedOriginsForProd(c.IsProduction(), os.Getenv("ALLOWED_ORIGINS")); err != nil {
-		return err
-	}
+	return validateAllowedOriginsForProd(isProd, c.Server.AllowedOrigins)
+}
 
-	return nil
+// isPrivateOrLoopbackHost reports whether host is a private or
+// loopback IP literal, "localhost" (or a *.localhost name), or a
+// single-label name such as a Docker service name. Single-label names
+// do not resolve in public DNS, so they can only reach a local
+// network. Decided without a DNS lookup, so Validate stays offline.
+func isPrivateOrLoopbackHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate()
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	return host != "" && !strings.Contains(host, ".")
 }
 
 // validateAllowedOriginsForProd enforces that ALLOWED_ORIGINS is
 // set when running in production mode. Returns nil in development
-// mode or when the env var is non-empty. Returns a wrapped
+// mode or when at least one origin is configured. Returns a wrapped
 // ErrValidationFailed otherwise.
 //
 // Without this check, internal/web/middleware.go falls back to
@@ -444,16 +466,11 @@ func (c *Config) Validate(ctx context.Context) error {
 // forgets ALLOWED_ORIGINS, CORS rejects every request, user sees
 // a blank dashboard, operator blames the app. Fail-fast at
 // startup instead.
-//
-// Extracted as a package-private helper so the rule can be
-// unit-tested without spinning up a full Config.Validate() call
-// chain (which also hits ValidateOIDCIssuer, a network call).
-// The caller in Validate() passes the pre-computed inputs.
-func validateAllowedOriginsForProd(isProd bool, allowedOriginsEnv string) error {
+func validateAllowedOriginsForProd(isProd bool, allowedOrigins []string) error {
 	if !isProd {
 		return nil
 	}
-	if allowedOriginsEnv == "" {
+	if len(allowedOrigins) == 0 {
 		return fmt.Errorf("%w: ALLOWED_ORIGINS must be set in production mode (comma-separated list of allowed origins, e.g. https://calbridgesync.example.com) - the localhost-only defaults silently block non-localhost CORS requests", ErrValidationFailed)
 	}
 	return nil
@@ -492,19 +509,6 @@ func getEnvInt(key string, defaultValue int) (int, error) {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return 0, fmt.Errorf("invalid integer: %w", err)
-	}
-	return parsed, nil
-}
-
-// getEnvFloat returns the float value of an environment variable or a default.
-func getEnvFloat(key string, defaultValue float64) (float64, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue, nil
-	}
-	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid float: %w", err)
 	}
 	return parsed, nil
 }

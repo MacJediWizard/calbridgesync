@@ -39,6 +39,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/config"
@@ -78,6 +79,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
+	caldav.SetRequestTimeout(time.Duration(cfg.CalDAV.RequestTimeoutSecs) * time.Second)
 
 	database, err := db.New(cfg.Database.Path)
 	if err != nil {

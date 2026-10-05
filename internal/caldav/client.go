@@ -3,17 +3,22 @@ package caldav
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
@@ -37,7 +42,7 @@ var (
 )
 
 const (
-	defaultTimeout = 300 * time.Second // 5 minutes default for slow CalDAV servers like iCloud
+	defaultTimeout = 300 * time.Second // CALDAV_REQUEST_TIMEOUT default: 5 minutes for slow CalDAV servers like iCloud
 	minTLSVersion  = tls.VersionTLS12
 
 	// maxCalDAVResponseSize caps every io.ReadAll over a CalDAV
@@ -53,6 +58,24 @@ const (
 	// convention in ics_client.go (which uses 50 MB for ICS feeds). (#119)
 	maxCalDAVResponseSize = 200 * 1024 * 1024
 )
+
+// requestTimeoutNanos holds the per-request HTTP timeout used by
+// NewClient, NewOAuthClient and NewICSClient. It is set once at startup
+// from CALDAV_REQUEST_TIMEOUT (SetRequestTimeout) and read when each
+// client is built; atomic because sync goroutines build clients. (#239)
+var requestTimeoutNanos atomic.Int64
+
+func init() { requestTimeoutNanos.Store(int64(defaultTimeout)) }
+
+// SetRequestTimeout sets the HTTP timeout for CalDAV and ICS clients
+// created after the call. Non-positive values are ignored.
+func SetRequestTimeout(d time.Duration) {
+	if d > 0 {
+		requestTimeoutNanos.Store(int64(d))
+	}
+}
+
+func requestTimeout() time.Duration { return time.Duration(requestTimeoutNanos.Load()) }
 
 // Calendar represents a CalDAV calendar.
 type Calendar struct {
@@ -113,6 +136,43 @@ func (c *MalformedEventCollector) Count() int {
 	return len(c.events)
 }
 
+// UnreadableKind says why a listed calendar object could not be read.
+type UnreadableKind string
+
+const (
+	// UnreadableTransient: the fetch itself failed (5xx, timeout,
+	// connection reset). The object may be perfectly fine.
+	UnreadableTransient UnreadableKind = "transient"
+	// UnreadableMalformed: the server returned the object but its
+	// iCalendar body was malformed or empty.
+	UnreadableMalformed UnreadableKind = "malformed"
+)
+
+// UnreadableObject is a calendar object the server listed but that
+// could not be turned into an Event. (#206)
+type UnreadableObject struct {
+	Path string
+	Kind UnreadableKind
+	// UID recovered from a raw "UID:" line of a malformed or empty
+	// object, when one exists. Always empty for transient failures.
+	UID string
+	Err string
+}
+
+// FetchReport describes what a GetEventsWithReport call saw but could
+// not return. The sync engine uses it so an object that failed to load
+// is never mistaken for one that was deleted. (#206)
+type FetchReport struct {
+	Unreadable []UnreadableObject
+}
+
+func (r *FetchReport) add(path string, kind UnreadableKind, reason string) {
+	if r == nil {
+		return
+	}
+	r.Unreadable = append(r.Unreadable, UnreadableObject{Path: path, Kind: kind, Err: reason})
+}
+
 // Client provides CalDAV operations.
 type Client struct {
 	baseURL      string
@@ -144,7 +204,7 @@ func NewClient(baseURL, username, password string) (*Client, error) {
 	}
 
 	httpClient := &http.Client{
-		Timeout:   defaultTimeout,
+		Timeout:   requestTimeout(),
 		Transport: transport,
 	}
 
@@ -252,25 +312,133 @@ func (c *Client) FindCalendarsGoogle(ctx context.Context) ([]Calendar, error) {
 
 // GetEvents retrieves all events from a calendar.
 // If collector is provided, malformed events will be recorded there.
+// Objects that could not be read are left out; callers that make
+// deletion decisions must use GetEventsWithReport instead. (#206)
 func (c *Client) GetEvents(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
+	events, _, err := c.GetEventsWithReport(ctx, calendarPath, collector)
+	return events, err
+}
+
+// GetEventsWithReport retrieves all events from a calendar and reports
+// every listed object it could not read (transient fetch failure, or
+// malformed/empty content). An object in the report is NOT absent from
+// the calendar, so it must never be treated as deleted. (#206)
+func (c *Client) GetEventsWithReport(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, FetchReport, error) {
 	// Try the standard calendar-query first
-	events, err := c.getEventsViaQuery(ctx, calendarPath)
-	if err == nil && len(events) > 0 {
-		return events, nil
+	var report FetchReport
+	events, err := c.getEventsViaQuery(ctx, calendarPath, &report)
+	if err != nil || len(events) == 0 {
+		// If query failed (412, etc.) OR returned 0 events, fall back to PROPFIND
+		// Some servers (like SOGo) may return empty results from REPORT but have events accessible via PROPFIND
+		if err != nil {
+			log.Printf("Calendar query failed, trying PROPFIND fallback: %v", err)
+		} else {
+			log.Printf("Calendar query returned 0 events, trying PROPFIND fallback for path: %s", calendarPath)
+		}
+		report = FetchReport{}
+		events, err = c.getEventsViaPropfind(ctx, calendarPath, collector, &report)
+		if err != nil {
+			return nil, FetchReport{}, err
+		}
 	}
 
-	// If query failed (412, etc.) OR returned 0 events, fall back to PROPFIND
-	// Some servers (like SOGo) may return empty results from REPORT but have events accessible via PROPFIND
-	if err != nil {
-		log.Printf("Calendar query failed, trying PROPFIND fallback: %v", err)
-	} else {
-		log.Printf("Calendar query returned 0 events, trying PROPFIND fallback for path: %s", calendarPath)
+	// A malformed or empty object has no parsed UID. Try a raw "UID:"
+	// line so the sync engine can still tell which event it is. If that
+	// raw GET fails, nothing is known about the object (the first
+	// response may not even have been the real object), so it is
+	// reported as transient, which blocks deletions this cycle.
+	for i := range report.Unreadable {
+		u := &report.Unreadable[i]
+		if u.Kind != UnreadableMalformed {
+			continue
+		}
+		raw, rawErr := c.fetchRawEvent(ctx, u.Path)
+		if rawErr != nil {
+			u.Kind = UnreadableTransient
+			u.Err = fmt.Sprintf("%s; raw re-fetch failed: %v", u.Err, rawErr)
+			continue
+		}
+		u.UID = extractUIDFromICS(raw)
 	}
-	return c.getEventsViaPropfind(ctx, calendarPath, collector)
+	return events, report, nil
+}
+
+// extractUIDFromICS returns the value of the first UID property in raw
+// iCalendar text, or "" if there is none. It does not need the rest of
+// the object to parse, so it works on content go-ical rejects. (#206)
+func extractUIDFromICS(data string) string {
+	data = strings.ReplaceAll(data, "\r\n", "\n")
+	// Unfold continuation lines (RFC 5545 section 3.1).
+	data = strings.ReplaceAll(data, "\n ", "")
+	data = strings.ReplaceAll(data, "\n\t", "")
+	for _, line := range strings.Split(data, "\n") {
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		name := line[:colon]
+		if semi := strings.Index(name, ";"); semi >= 0 {
+			name = name[:semi]
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "UID") {
+			return strings.TrimSpace(line[colon+1:])
+		}
+	}
+	return ""
+}
+
+// httpStatusCode returns the status of a go-webdav HTTPError anywhere
+// in err's chain. That type is internal, so it is matched by its
+// Error() format, "<code> <status text>[: <cause>]". The cause can
+// include up to 1KB of a text/* response body. (#206)
+func httpStatusCode(err error) (int, bool) {
+	for ; err != nil; err = errors.Unwrap(err) {
+		s := err.Error()
+		if len(s) < 4 || s[3] != ' ' {
+			continue
+		}
+		code, convErr := strconv.Atoi(s[:3])
+		if convErr != nil || code < 100 || code > 599 {
+			continue
+		}
+		prefix := fmt.Sprintf("%d %s", code, http.StatusText(code))
+		if s == prefix || strings.HasPrefix(s, prefix+": ") {
+			return code, true
+		}
+	}
+	return 0, false
+}
+
+// isTransportError reports whether err came from the network or the
+// request context rather than from the response content.
+func isTransportError(err error) bool {
+	var urlErr *url.Error
+	var netErr net.Error
+	return errors.As(err, &urlErr) ||
+		errors.As(err, &netErr) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// isMalformedBodyError reports whether a GetCalendarObject error that
+// is neither an HTTP status nor a transport failure describes the body
+// of a 200 response: an empty body (go-ical returns io.EOF), a missing
+// or wrong Content-Type, or an iCalendar parse error.
+func isMalformedBodyError(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	errStr := err.Error()
+	return strings.HasPrefix(errStr, "mime: ") ||
+		strings.Contains(errStr, "expected Content-Type") ||
+		strings.Contains(errStr, "malformed") ||
+		strings.Contains(errStr, "missing colon") ||
+		(strings.Contains(errStr, "invalid") && strings.Contains(errStr, "ical"))
 }
 
 // getEventsViaQuery uses REPORT calendar-query to get events.
-func (c *Client) getEventsViaQuery(ctx context.Context, calendarPath string) ([]Event, error) {
+func (c *Client) getEventsViaQuery(ctx context.Context, calendarPath string, report *FetchReport) ([]Event, error) {
 	query := &caldav.CalendarQuery{
 		CompRequest: caldav.CalendarCompRequest{
 			Name: "VCALENDAR",
@@ -285,17 +453,17 @@ func (c *Client) getEventsViaQuery(ctx context.Context, calendarPath string) ([]
 		return nil, fmt.Errorf("%w: failed to query calendar: %w", ErrConnectionFailed, err)
 	}
 
-	return c.objectsToEvents(objects), nil
+	return c.objectsToEvents(objects, report), nil
 }
 
 // getEventsViaPropfind uses PROPFIND to list calendar objects, then fetches each one.
-func (c *Client) getEventsViaPropfind(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
+func (c *Client) getEventsViaPropfind(ctx context.Context, calendarPath string, collector *MalformedEventCollector, report *FetchReport) ([]Event, error) {
 	// Go directly to PROPFIND list since MultiGetCalendar requires specific paths
-	return c.getEventsViaList(ctx, calendarPath, collector)
+	return c.getEventsViaList(ctx, calendarPath, collector, report)
 }
 
 // getEventsViaList lists calendar contents and fetches events using batch MULTIGET.
-func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error) {
+func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, collector *MalformedEventCollector, report *FetchReport) ([]Event, error) {
 	// Build the full URL - calendarPath might be absolute or relative
 	fullURL := c.buildURL(calendarPath)
 
@@ -358,11 +526,11 @@ func (c *Client) getEventsViaList(ctx context.Context, calendarPath string, coll
 		log.Printf("Fetching events batch: %d-%d of %d (%.0f%%)", batchStart+1, batchEnd, total, float64(batchEnd)/float64(total)*100)
 
 		// Try MULTIGET for this batch
-		batchEvents, malformed, empty, err := c.getEventsBatch(ctx, calendarPath, batchPaths, collector)
+		batchEvents, malformed, empty, err := c.getEventsBatch(ctx, calendarPath, batchPaths, collector, report)
 		if err != nil {
 			// If MULTIGET fails, fall back to individual fetches for this batch
 			log.Printf("MULTIGET failed, falling back to individual fetches: %v", err)
-			batchEvents, malformed, empty = c.getEventsIndividually(ctx, batchPaths, collector)
+			batchEvents, malformed, empty = c.getEventsIndividually(ctx, batchPaths, collector, report)
 		}
 
 		events = append(events, batchEvents...)
@@ -437,7 +605,7 @@ func findDroppedMultiGetPaths(requestedPaths, returnedPaths []string) []string {
 // MalformedEventCollector. That's one extra HTTP round-trip per dropped
 // path, but only for paths that are genuinely problematic — in normal
 // operation the fallback loop doesn't execute at all.
-func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths []string, collector *MalformedEventCollector) ([]Event, int, int, error) {
+func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths []string, collector *MalformedEventCollector, report *FetchReport) ([]Event, int, int, error) {
 	multiGet := &caldav.CalendarMultiGet{
 		Paths: paths,
 		CompRequest: caldav.CalendarCompRequest{
@@ -467,6 +635,7 @@ func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths 
 			if collector != nil {
 				collector.Add(obj.Path, "nil iCalendar data - event may be corrupted or deleted")
 			}
+			report.add(obj.Path, UnreadableMalformed, "nil iCalendar data")
 			skippedEmpty++
 			continue
 		}
@@ -480,6 +649,7 @@ func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths 
 			if collector != nil {
 				collector.Add(obj.Path, fmt.Sprintf("failed to encode event: %v", encErr))
 			}
+			report.add(obj.Path, UnreadableMalformed, fmt.Sprintf("failed to encode event: %v", encErr))
 			skippedMalformed++
 			continue
 		}
@@ -511,31 +681,54 @@ func (c *Client) getEventsBatch(ctx context.Context, calendarPath string, paths 
 		log.Printf("MULTIGET response missing %d of %d requested paths; probing individually to classify", len(dropped), len(paths))
 	}
 	for _, missingPath := range dropped {
-		_, probeErr := c.GetEvent(ctx, missingPath)
+		recovered, probeErr := c.GetEvent(ctx, missingPath)
 		if probeErr != nil {
 			// Got a concrete error from the individual fetch. Record it
 			// in the collector so the user sees it on the dashboard.
 			if collector != nil {
 				collector.Add(missingPath, fmt.Sprintf("MULTIGET silently dropped this event; individual fetch returned: %v", probeErr))
 			}
+			reportFetchError(report, missingPath, probeErr)
 			skippedMalformed++
 			continue
 		}
-		// Individual fetch succeeded where MULTIGET didn't. This is
-		// weird but not data loss — log it so the next sync cycle's
-		// MULTIGET can try again. Don't add the recovered event to
-		// the return slice because the existing processing loop
-		// already ran without it; mixing in a late addition would
-		// require re-running all the extract logic here and we'd
-		// rather keep the happy path simple.
-		log.Printf("MULTIGET dropped %s but individual GetEvent succeeded; will retry on next sync", missingPath)
+		if recovered.Data == "" {
+			if collector != nil {
+				collector.Add(missingPath, "MULTIGET silently dropped this event; individual fetch returned empty iCalendar data")
+			}
+			report.add(missingPath, UnreadableMalformed, "empty iCalendar data")
+			skippedEmpty++
+			continue
+		}
+		// Individual fetch succeeded where MULTIGET didn't. Return the
+		// recovered event: GetEvent already ran the same UID, Summary
+		// and StartTime extraction. Dropping it made the event look
+		// deleted for a whole cycle. (#206)
+		log.Printf("MULTIGET dropped %s but individual GetEvent succeeded; using the individually fetched copy", missingPath)
+		events = append(events, *recovered)
 	}
 
 	return events, skippedMalformed, skippedEmpty, nil
 }
 
+// reportFetchError records a failed single-object GET in report. A 404
+// means the object really is gone (deleted after the PROPFIND listing),
+// so it is not reported. (#206)
+func reportFetchError(report *FetchReport, path string, err error) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return
+	case errors.Is(err, ErrMalformedContent):
+		// Sentinel only: IsMalformedError also matches on error text,
+		// which for an HTTP error can be the response body. (#206)
+		report.add(path, UnreadableMalformed, err.Error())
+	default:
+		report.add(path, UnreadableTransient, err.Error())
+	}
+}
+
 // getEventsIndividually fetches events one by one (fallback for servers that don't support MULTIGET).
-func (c *Client) getEventsIndividually(ctx context.Context, paths []string, collector *MalformedEventCollector) ([]Event, int, int) {
+func (c *Client) getEventsIndividually(ctx context.Context, paths []string, collector *MalformedEventCollector, report *FetchReport) ([]Event, int, int) {
 	events := make([]Event, 0, len(paths))
 	skippedMalformed := 0
 	skippedEmpty := 0
@@ -543,20 +736,23 @@ func (c *Client) getEventsIndividually(ctx context.Context, paths []string, coll
 	for _, path := range paths {
 		event, err := c.GetEvent(ctx, path)
 		if err != nil {
-			if IsMalformedError(err) {
+			if errors.Is(err, ErrMalformedContent) {
 				if collector != nil {
 					collector.Add(path, err.Error())
 				}
+				reportFetchError(report, path, err)
 				skippedMalformed++
 				continue
 			}
 			log.Printf("Failed to fetch event %s: %v", path, err)
+			reportFetchError(report, path, err)
 			continue
 		}
 		if event.Data == "" {
 			if collector != nil {
 				collector.Add(path, "empty iCalendar data - event may be corrupted or deleted")
 			}
+			report.add(path, UnreadableMalformed, "empty iCalendar data")
 			skippedEmpty++
 			continue
 		}
@@ -571,17 +767,19 @@ func (c *Client) getEventsIndividually(ctx context.Context, paths []string, coll
 // may have fewer entries than the input. This is safer than the prior
 // behavior, which silently stored Event{Data: ""} values that then flowed
 // into the sync engine as if they were valid events.
-func (c *Client) objectsToEvents(objects []caldav.CalendarObject) []Event {
+func (c *Client) objectsToEvents(objects []caldav.CalendarObject, report *FetchReport) []Event {
 	events := make([]Event, 0, len(objects))
 	for _, obj := range objects {
 		if obj.Data == nil {
 			log.Printf("objectsToEvents: skipping %s with nil data", obj.Path)
+			report.add(obj.Path, UnreadableMalformed, "nil iCalendar data")
 			continue
 		}
 
 		data, encErr := encodeCalendar(obj.Data)
 		if encErr != nil {
 			log.Printf("objectsToEvents: skipping %s, encode failed: %v", obj.Path, encErr)
+			report.add(obj.Path, UnreadableMalformed, fmt.Sprintf("failed to encode event: %v", encErr))
 			continue
 		}
 
@@ -724,14 +922,26 @@ func IsMalformedError(err error) bool {
 func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error) {
 	obj, err := c.caldavClient.GetCalendarObject(ctx, eventPath)
 	if err != nil {
-		// Check for malformed content errors from the iCal parser
-		errStr := err.Error()
-		if strings.Contains(errStr, "malformed") ||
-			strings.Contains(errStr, "missing colon") ||
-			strings.Contains(errStr, "invalid") && strings.Contains(errStr, "ical") {
-			return nil, fmt.Errorf("%w: %s", ErrMalformedContent, eventPath)
+		// Classify by HTTP status first. Only a 404 means the object
+		// is gone; any other status (5xx, auth failure) says nothing
+		// about the object and is transient. The status check must
+		// come before any string matching, because the error text can
+		// carry the response body. (#206)
+		if code, ok := httpStatusCode(err); ok {
+			if code == http.StatusNotFound {
+				return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+			}
+			return nil, fmt.Errorf("failed to fetch event %s: %w", eventPath, err)
 		}
-		return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+		if isTransportError(err) {
+			return nil, fmt.Errorf("failed to fetch event %s: %w", eventPath, err)
+		}
+		// A 200 whose body cannot be decoded is a property of the
+		// object, not a passing fault.
+		if isMalformedBodyError(err) {
+			return nil, fmt.Errorf("%w: %s: %v", ErrMalformedContent, eventPath, err)
+		}
+		return nil, fmt.Errorf("failed to fetch event %s: %w", eventPath, err)
 	}
 
 	event := &Event{
@@ -766,6 +976,28 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	}
 
 	return event, nil
+}
+
+// objectFilenameForUID returns the object filename PutEvent uses when it
+// has to build a destination path from an event UID (the create path).
+//
+// Ordinary UIDs keep uid + ".ics" exactly, so existing destination objects
+// stay addressable. go-webdav already escapes '?', '#', '%' and spaces when
+// it builds the request URL, so those must NOT be pre-escaped here.
+//
+// A UID containing '/', ".." or a control character would produce a path in
+// a sub-collection, a traversal out of the calendar collection, or an
+// invalid request line, and go-webdav cannot send '/' as %2F. Those UIDs get
+// a deterministic hashed filename instead. The UID inside the iCalendar
+// data is unchanged; CalDAV servers key events by that, not by filename.
+func objectFilenameForUID(uid string) string {
+	unsafe := strings.Contains(uid, "/") || strings.Contains(uid, "..") ||
+		strings.ContainsFunc(uid, unicode.IsControl)
+	if !unsafe {
+		return uid + ".ics"
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return hex.EncodeToString(sum[:])[:32] + ".ics"
 }
 
 // PutEvent creates or updates an event on the destination calendar.
@@ -811,7 +1043,7 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 			}
 		}
 		if event.UID != "" {
-			path = strings.TrimSuffix(calendarPath, "/") + "/" + event.UID + ".ics"
+			path = strings.TrimSuffix(calendarPath, "/") + "/" + objectFilenameForUID(event.UID)
 		} else {
 			// Skip events without UID — can't construct a valid path. Same
 			// honesty contract as the empty-data case above: return a
