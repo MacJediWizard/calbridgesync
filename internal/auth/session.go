@@ -190,6 +190,8 @@ func (sm *SessionManager) SetOAuthState(w http.ResponseWriter, r *http.Request, 
 	}
 
 	session.Values["state"] = state
+	delete(session.Values, "nonce")
+	delete(session.Values, "pkce_verifier")
 	session.Options.MaxAge = sm.oauthStateMaxAge // Configurable via OAUTH_STATE_MAX_AGE_SECS
 
 	return session.Save(r, w)
@@ -214,6 +216,59 @@ func (sm *SessionManager) GetOAuthState(w http.ResponseWriter, r *http.Request) 
 	}
 
 	return state, nil
+}
+
+// OIDCLoginState is the per-attempt data the app sign-in flow needs on
+// the callback: the CSRF state, the ID token nonce and the PKCE verifier.
+type OIDCLoginState struct {
+	State    string
+	Nonce    string
+	Verifier string
+}
+
+// SetOIDCLoginState stores state, nonce and PKCE verifier for an app
+// sign-in attempt in the short-lived OAuth state cookie.
+func (sm *SessionManager) SetOIDCLoginState(w http.ResponseWriter, r *http.Request, ls *OIDCLoginState) error {
+	session, err := sm.store.Get(r, oauthStateName)
+	if err != nil {
+		session, err = sm.store.New(r, oauthStateName)
+		if err != nil {
+			return err
+		}
+	}
+
+	session.Values["state"] = ls.State
+	session.Values["nonce"] = ls.Nonce
+	session.Values["pkce_verifier"] = ls.Verifier
+	session.Options.MaxAge = sm.oauthStateMaxAge
+
+	return session.Save(r, w)
+}
+
+// GetOIDCLoginState retrieves and clears the app sign-in state. All three
+// values must be present; a cookie written by SetOAuthState alone (the
+// Google source flow) is rejected.
+func (sm *SessionManager) GetOIDCLoginState(w http.ResponseWriter, r *http.Request) (*OIDCLoginState, error) {
+	session, err := sm.store.Get(r, oauthStateName)
+	if err != nil {
+		return nil, err
+	}
+
+	state, _ := session.Values["state"].(string)
+	nonce, _ := session.Values["nonce"].(string)
+	verifier, _ := session.Values["pkce_verifier"].(string)
+
+	// Clear the state after reading, even if it turns out to be invalid.
+	session.Options.MaxAge = -1
+	if err := session.Save(r, w); err != nil {
+		return nil, err
+	}
+
+	if state == "" || nonce == "" || verifier == "" {
+		return nil, ErrInvalidSession
+	}
+
+	return &OIDCLoginState{State: state, Nonce: nonce, Verifier: verifier}, nil
 }
 
 // SetPendingGoogleSource stores a pending Google source form in a

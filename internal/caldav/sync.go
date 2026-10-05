@@ -1498,11 +1498,33 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// alarms (missing the RFC-required TRIGGER) so RFC-strict destinations
 	// like SOGo don't 501 the whole calendar object. When the user has
 	// flipped "Ignore alarms" for this source, strip every VALARM.
+	//
+	// "Ignore alarms" only applies to one-way syncs. In two-way mode the
+	// alarm-less destination copy is written back over the source by the
+	// reverse pass, which would erase the user's own alarms on the source.
+	//
+	// The effective policy is folded into the source ETag so that
+	// toggling the flag (or the calendar's direction) re-PUTs
+	// already-synced events once. A two-way calendar whose source has
+	// the flag set gets its own marker: rows synced before this scoping
+	// fix hold the raw ETag next to a stripped destination copy, and the
+	// marker forces the one re-PUT that restores the alarms there.
+	stripAll := source.StripAlarms && syncDirection == db.SyncDirectionOneWay
+	etagSuffix := ""
+	switch {
+	case stripAll:
+		etagSuffix = stripAlarmsETagSuffix
+	case source.StripAlarms:
+		etagSuffix = alarmsKeptETagSuffix
+	}
 	for i := range sourceEvents {
 		if sourceEvents[i].Data == "" {
 			continue
 		}
-		sourceEvents[i].Data = sanitizeAlarms(sourceEvents[i].Data, source.StripAlarms)
+		sourceEvents[i].Data = sanitizeAlarms(sourceEvents[i].Data, stripAll)
+		if etagSuffix != "" {
+			sourceEvents[i].ETag = markSourceETag(sourceEvents[i].ETag, etagSuffix)
+		}
 	}
 
 	// Helper to update activity tracker with current progress
@@ -1526,12 +1548,16 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	} else {
 		destCalendars, destDiscoverErr = destClient.FindCalendars(ctx)
 	}
+	destURLPath := destClient.GetCalendarPath()
+	discoverStatus := "ok"
 	if destDiscoverErr != nil {
+		discoverStatus = "error"
 		log.Printf("Failed to discover destination calendars, falling back to URL path: %v", destDiscoverErr)
-		destCalendarPath = destClient.GetCalendarPath()
+		destCalendarPath = destURLPath
 	} else if len(destCalendars) == 0 {
+		discoverStatus = "empty"
 		log.Printf("No calendars found on destination, using URL path as fallback")
-		destCalendarPath = destClient.GetCalendarPath()
+		destCalendarPath = destURLPath
 	} else {
 		log.Printf("Found %d calendar(s) on destination:", len(destCalendars))
 		for i, cal := range destCalendars {
@@ -1543,29 +1569,25 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		}
 	}
 	log.Printf("Using destination calendar path: %s", destCalendarPath)
+	// Log-only: records whether dest_url's path matches a discovered
+	// calendar so selection can be revisited per source with evidence.
+	// Does not change destCalendarPath.
+	log.Printf("%s", destSelectLogLine(source.ID, calendar.Name, discoverStatus, destCalendars, destCalendarPath, destURLPath))
 
 	// Get all events from destination (no collector needed - we only track source issues)
 	updateStatus("fetching destination events")
 	destEvents, destReport, err := destClient.GetEventsWithReport(ctx, destCalendarPath, nil)
 	if err != nil {
-		// Previously this failure only logged and then proceeded with
-		// an empty destEvents slice. That silently masked a real
-		// destination failure — the rest of the sync would compute
-		// deltas against "zero destination events" and either mass-
-		// delete tracked UIDs (caught by the ratio guards from #80/#82)
-		// or mass-create them as if the destination was empty.
-		//
-		// Append to Warnings so operators actually see the failure
-		// surfaced in the sync result. Not escalated to result.Errors
-		// because one-way source_wins semantics can tolerate an
-		// empty-destination view — the ratio guards still protect
-		// against cascading deletions, and escalating to Errors would
-		// flip every transient destination fetch failure into a hard
-		// sync failure. Operator design call to tighten this further. (#93)
-		msg := fmt.Sprintf("Failed to get destination events (path: %s): %v - proceeding with empty destination view, ratio guards will protect against cascades", destCalendarPath, err)
+		// Abort this calendar before any planner or write. Proceeding
+		// with an empty destination view (the #93 behavior) re-PUTs
+		// every source event, runs the deletion planners against a
+		// destination that only looks empty, and leans on the
+		// empty-destination guards to avoid a cascade. A failed fetch
+		// is a failed cycle; the next interval retries.
+		msg := fmt.Sprintf("Failed to get destination events (path: %s): %v - skipping calendar, no changes made", destCalendarPath, err)
 		log.Printf("%s", msg)
-		result.Warnings = append(result.Warnings, msg)
-		destEvents = []Event{}
+		result.Errors = append(result.Errors, msg)
+		return result
 	}
 	log.Printf("Fetched %d events from destination calendar", len(destEvents))
 
@@ -1583,10 +1605,17 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	updateStatus(fmt.Sprintf("comparing %d vs %d events", len(sourceEvents), len(destEvents)))
 
 	// Get previously synced events for deletion detection
+	// Without the tracking rows every destination-only event looks
+	// never-synced (reverse-created on the source in two-way), every
+	// source event looks new, and the ratio guards switch off because
+	// they key off len(previouslySynced). Abort this calendar before
+	// any write.
 	previouslySynced, err := se.db.GetSyncedEvents(source.ID, calendar.Path)
 	if err != nil {
-		log.Printf("Failed to get synced events: %v", err)
-		previouslySynced = []*db.SyncedEvent{}
+		msg := fmt.Sprintf("Failed to get synced events for calendar %s: %v - skipping calendar, no changes made", calendar.Path, err)
+		log.Printf("%s", msg)
+		result.Errors = append(result.Errors, msg)
+		return result
 	}
 
 	// Build map of previously synced UIDs
@@ -1632,7 +1661,6 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		key := e.DedupeKey()
 		if key != "|" {
 			destDedupeMap[key] = true
-			log.Printf("Dest dedupe key: %q (UID: %s)", key, e.UID)
 		}
 	}
 
@@ -1648,10 +1676,10 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// Update status to show processing phase
 	updateStatus(fmt.Sprintf("processing %d events", len(sourceEvents)))
 
-	// Handle deletions first (for two-way sync). Both safety guards
-	// below are extracted as pure helpers (Issue #68) so they can be
-	// unit-tested directly — see shouldSkipTwoWayDeletion and
-	// isWithinSyncSafetyThreshold in this file.
+	// Handle deletions first (for two-way sync). The deletion planners
+	// (planTwoWayDeletion, planTwoWaySourceDeletion) and the per-event
+	// isWithinSyncSafetyThreshold check are pure helpers so they can be
+	// unit-tested directly. (#68, #80, #82)
 	sourceInterval := time.Duration(source.SyncInterval) * time.Second
 	now := time.Now()
 
@@ -1667,13 +1695,20 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	//     events. (William lost 748 events to this exact bug.)
 	//
 	//   - Source-deletion: events that were removed from destination
-	//     must be removed from source. Still inline because each
-	//     candidate has its own per-event safety threshold
-	//     (isWithinSyncSafetyThreshold) protecting recently-synced
-	//     events; ratio-based protection for this direction is
-	//     deferred to a follow-up. The shouldSkipTwoWayDeletion
-	//     guard is still consulted to short-circuit when the dest
-	//     query failed entirely.
+	//     must be removed from source. Delegated to
+	//     planTwoWaySourceDeletion, which enforces empty-source,
+	//     empty-dest, and mass-delete ratio guards (#82); each
+	//     candidate is then also checked against the per-event
+	//     safety threshold (isWithinSyncSafetyThreshold). A UID
+	//     deleted here is removed from sourceEventMap, and the
+	//     forward loop skips it so it is not re-created on dest. (#220)
+	//
+	// deferredSourceDelete holds UIDs whose source delete the safety
+	// threshold postponed this cycle. The forward pass must not
+	// re-create them on the destination, or the user's dest-side delete
+	// is undone for good. Their tracking rows are kept so the next
+	// cycle outside the window performs the source delete. (#182)
+	deferredSourceDelete := make(map[string]bool)
 	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil && !blockDeletes {
 		// Step 1: dest-deletion via planTwoWayDeletion. The helper's
 		// three guards subsume the previous shouldSkipTwoWayDeletion
@@ -1768,6 +1803,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			// the "protect everything forever" accident.
 			if isWithinSyncSafetyThreshold(syncedEvent.CreatedAt, sourceInterval, now) {
 				log.Printf("Event %s not on destination but newly synced (CreatedAt=%v) - skipping deletion from source (safety)", uid, syncedEvent.CreatedAt)
+				deferredSourceDelete[uid] = true
 				continue
 			}
 
@@ -1822,8 +1858,21 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		if sourceEvent.UID == "" {
 			continue
 		}
+		// The source-deletion pass above removes a UID from
+		// sourceEventMap but not from this slice. Without this guard
+		// the event is deleted from source and then re-created on
+		// dest in the same cycle. (#220)
+		if _, ok := sourceEventMap[sourceEvent.UID]; !ok {
+			continue
+		}
 
 		destEvent, existsByUID := destEventMap[sourceEvent.UID]
+
+		if !existsByUID && deferredSourceDelete[sourceEvent.UID] {
+			result.EventsProcessed++
+			updateProgress()
+			continue
+		}
 
 		if !existsByUID {
 			// Check for duplicate by content
