@@ -30,6 +30,10 @@ Create a `.env` file based on `.env.example`:
 PORT=8080
 BASE_URL=https://calbridgesync.example.com
 ENVIRONMENT=production
+# Reverse proxy IPs/CIDRs allowed to set X-Forwarded-For (comma-separated).
+# Empty = trust none. Behind a reverse proxy, set this or every user
+# shares one rate-limit bucket and audit logs show the proxy IP.
+TRUSTED_PROXIES=172.17.0.1
 
 # OIDC Authentication
 OIDC_ISSUER=https://auth.example.com/realms/main
