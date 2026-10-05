@@ -1480,10 +1480,17 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	updateStatus(fmt.Sprintf("comparing %d vs %d events", len(sourceEvents), len(destEvents)))
 
 	// Get previously synced events for deletion detection
+	// Without the tracking rows every destination-only event looks
+	// never-synced (reverse-created on the source in two-way), every
+	// source event looks new, and the ratio guards switch off because
+	// they key off len(previouslySynced). Abort this calendar before
+	// any write.
 	previouslySynced, err := se.db.GetSyncedEvents(source.ID, calendar.Path)
 	if err != nil {
-		log.Printf("Failed to get synced events: %v", err)
-		previouslySynced = []*db.SyncedEvent{}
+		msg := fmt.Sprintf("Failed to get synced events for calendar %s: %v - skipping calendar, no changes made", calendar.Path, err)
+		log.Printf("%s", msg)
+		result.Errors = append(result.Errors, msg)
+		return result
 	}
 
 	// Build map of previously synced UIDs
