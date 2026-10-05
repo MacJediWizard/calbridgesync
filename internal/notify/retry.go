@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/textproto"
 	"strings"
 	"time"
 )
@@ -246,18 +247,27 @@ func isTransientHTTPError(err error) bool {
 	return true
 }
 
-// isTransientSMTPError classifies an SMTP send error. SMTP error taxonomy
-// is much less crisp than HTTP, so the default is to retry everything
-// except for the very clearly permanent cases. The cooldown-not-consumed
-// outer loop (PR #34) ensures that even permanent errors are eventually
-// given up on rather than looped forever.
+// isTransientSMTPError classifies an SMTP send error.
+//
+//   - A server reply with a 5xx code (*textproto.Error) is a permanent
+//     failure per RFC 5321 (bad recipient, auth rejected, policy
+//     block): retrying within the same send gives the same answer.
+//   - A 4xx reply is a transient failure by definition.
+//   - Network timeouts (including the per-attempt deadline) are
+//     transient.
+//   - Anything else (connection reset, TLS handshake hiccup) defaults
+//     to transient.
+//
+// The cooldown-not-consumed outer loop (PR #34) still retries permanent
+// failures on a later cycle, so a fixed config recovers on its own.
 func isTransientSMTPError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Very few SMTP errors are deterministically permanent at the
-	// Go SDK level. "530 authentication required" is, but the error
-	// message varies by server. For now, retry everything and let
-	// the outer cooldown loop handle persistent failures.
+	var protoErr *textproto.Error
+	if errors.As(err, &protoErr) {
+		return protoErr.Code < 500 || protoErr.Code > 599
+	}
+	// Timeouts and other connection-level errors: transient.
 	return true
 }
