@@ -221,16 +221,6 @@ type Source struct {
 	StripAlarms bool `json:"strip_alarms"`
 }
 
-// SyncState represents the synchronization state for a calendar.
-type SyncState struct {
-	ID           string    `json:"id"`
-	SourceID     string    `json:"source_id"`
-	CalendarHref string    `json:"calendar_href"`
-	SyncToken    string    `json:"sync_token"`
-	CTag         string    `json:"ctag"`
-	UpdatedAt    time.Time `json:"updated_at"`
-}
-
 // SyncLog represents a log entry for a sync operation.
 type SyncLog struct {
 	ID              string        `json:"id"`
