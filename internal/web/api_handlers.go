@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -457,8 +458,12 @@ func (h *Handlers) APIDeleteDestination(c *gin.Context) {
 		return
 	}
 	destID := c.Param("destId")
-	if err := h.db.DeleteDestination(destID); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Destination not found"})
+	if err := h.db.DeleteDestination(destID, sourceID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Destination not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete destination"})
 		return
 	}
 	h.audit(c, "destination.delete", "destination", destID, fmt.Sprintf("source=%s", sourceID))
@@ -1203,20 +1208,26 @@ func (h *Handlers) APIDeleteMalformedEvent(c *gin.Context) {
 		return
 	}
 
-	// Try to delete the event from the source calendar
-	sourcePassword, err := h.encryptor.Decrypt(source.SourcePassword)
-	if err == nil {
-		client, err := caldav.NewClient(source.SourceURL, source.SourceUsername, sourcePassword)
-		if err == nil {
-			ctx := c.Request.Context()
-			if err := client.DeleteEvent(ctx, event.EventPath); err != nil {
-				log.Printf("Failed to delete malformed event from source: %v", err)
-				// Continue to delete the record anyway
-			} else {
-				log.Printf("Deleted malformed event from source: %s", event.EventPath)
-			}
-		}
+	// An empty path would DELETE the calendar collection itself, and ICS
+	// feeds are read-only, so neither can be removed remotely. (#202)
+	if event.EventPath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Malformed event has no event path"})
+		return
 	}
+	if source.SourceType == db.SourceTypeICS {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Events cannot be deleted from an ICS feed"})
+		return
+	}
+
+	// Drop the record only after the remote delete succeeded (or the
+	// object is already gone). Otherwise the user loses the only sign
+	// that the broken event is still on the source. (#202)
+	if err := h.syncEngine.DeleteSourceEvent(c.Request.Context(), source, event.EventPath); err != nil {
+		log.Printf("Failed to delete malformed event %s from source %s: %v", event.ID, source.ID, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to delete event from source calendar"})
+		return
+	}
+	log.Printf("Deleted malformed event from source: %s", event.EventPath)
 
 	// Delete the malformed event record
 	if err := h.db.DeleteMalformedEvent(eventID); err != nil {

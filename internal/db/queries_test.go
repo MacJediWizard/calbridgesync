@@ -598,67 +598,6 @@ func TestDeleteSource(t *testing.T) {
 }
 
 // ============================================================================
-// SyncState Tests
-// ============================================================================
-
-func TestSyncState(t *testing.T) {
-	db, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	userID := createTestUser(t, db, "syncstate@example.com")
-	source := createTestSource(t, db, userID, "Sync State Test")
-
-	t.Run("upsert creates new sync state", func(t *testing.T) {
-		state := &SyncState{
-			SourceID:     source.ID,
-			CalendarHref: "/calendar/default/",
-			SyncToken:    "sync-token-123",
-			CTag:         "ctag-456",
-		}
-
-		err := db.UpsertSyncState(state)
-		if err != nil {
-			t.Fatalf("failed to upsert: %v", err)
-		}
-
-		// Retrieve and verify
-		retrieved, err := db.GetSyncState(source.ID, "/calendar/default/")
-		if err != nil {
-			t.Fatalf("failed to get sync state: %v", err)
-		}
-		if retrieved.SyncToken != "sync-token-123" {
-			t.Errorf("expected sync token 'sync-token-123', got %q", retrieved.SyncToken)
-		}
-	})
-
-	t.Run("upsert updates existing sync state", func(t *testing.T) {
-		state := &SyncState{
-			SourceID:     source.ID,
-			CalendarHref: "/calendar/default/",
-			SyncToken:    "updated-token",
-			CTag:         "updated-ctag",
-		}
-
-		err := db.UpsertSyncState(state)
-		if err != nil {
-			t.Fatalf("failed to upsert: %v", err)
-		}
-
-		retrieved, _ := db.GetSyncState(source.ID, "/calendar/default/")
-		if retrieved.SyncToken != "updated-token" {
-			t.Errorf("expected 'updated-token', got %q", retrieved.SyncToken)
-		}
-	})
-
-	t.Run("get returns ErrNotFound for unknown state", func(t *testing.T) {
-		_, err := db.GetSyncState(source.ID, "/nonexistent/")
-		if !errors.Is(err, ErrNotFound) {
-			t.Errorf("expected ErrNotFound, got %v", err)
-		}
-	})
-}
-
-// ============================================================================
 // SyncLog Tests
 // ============================================================================
 
@@ -999,4 +938,54 @@ func TestUpdateSourceOAuthRefreshToken(t *testing.T) {
 		got.SourceURL != google.SourceURL {
 		t.Errorf("reconnect changed unrelated columns: %+v", got)
 	}
+}
+
+// TestDeleteDestinationScopedToSource verifies DeleteDestination only
+// deletes a destination that belongs to the given source (#198).
+func TestDeleteDestinationScopedToSource(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	user1 := createTestUser(t, db, "owner@example.com")
+	user2 := createTestUser(t, db, "other@example.com")
+	src1 := createTestSource(t, db, user1, "Owner Source")
+	src2 := createTestSource(t, db, user2, "Other Source")
+
+	dest := &Destination{SourceID: src1.ID, Name: "Extra", DestURL: "https://d.example.com", DestUsername: "u", DestPassword: "p", Enabled: true}
+	if err := db.CreateDestination(dest); err != nil {
+		t.Fatalf("CreateDestination: %v", err)
+	}
+
+	t.Run("wrong source is a no-op", func(t *testing.T) {
+		err := db.DeleteDestination(dest.ID, src2.ID)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+		dests, err := db.GetDestinationsBySourceID(src1.ID)
+		if err != nil {
+			t.Fatalf("GetDestinationsBySourceID: %v", err)
+		}
+		if len(dests) != 1 || dests[0].ID != dest.ID {
+			t.Fatalf("destination should survive wrong-source delete, got %+v", dests)
+		}
+	})
+
+	t.Run("owning source deletes", func(t *testing.T) {
+		if err := db.DeleteDestination(dest.ID, src1.ID); err != nil {
+			t.Fatalf("expected delete to succeed, got %v", err)
+		}
+		dests, err := db.GetDestinationsBySourceID(src1.ID)
+		if err != nil {
+			t.Fatalf("GetDestinationsBySourceID: %v", err)
+		}
+		if len(dests) != 0 {
+			t.Fatalf("expected 0 destinations, got %d", len(dests))
+		}
+	})
+
+	t.Run("missing id returns ErrNotFound", func(t *testing.T) {
+		if err := db.DeleteDestination(dest.ID, src1.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+	})
 }

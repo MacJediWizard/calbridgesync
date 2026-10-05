@@ -26,6 +26,17 @@ var ErrBlockedDestination = errors.New("blocked destination")
 // 127.0.0.1) can swap in a permissive dialer. (#200)
 var caldavDialContext = icsLoopbackOnlyDialContext
 
+// SetDialContextForTesting replaces the CalDAV dial function and
+// returns a func that restores the previous one. It exists only so
+// tests in other packages (e.g. internal/web handler tests against an
+// httptest server on 127.0.0.1) can bypass the SSRF guard; production
+// code must never call it. Not safe for use by parallel tests. (#200)
+func SetDialContextForTesting(fn func(ctx context.Context, network, addr string) (net.Conn, error)) (restore func()) {
+	orig := caldavDialContext
+	caldavDialContext = fn
+	return func() { caldavDialContext = orig }
+}
+
 // dialCalDAV indirects through caldavDialContext at dial time, so a
 // test override applies even to clients built before the swap.
 func dialCalDAV(ctx context.Context, network, addr string) (net.Conn, error) {

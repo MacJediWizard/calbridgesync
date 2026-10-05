@@ -321,6 +321,7 @@ func TestLoad(t *testing.T) {
 		"DEFAULT_DEST_URL",
 		"RATE_LIMIT_RPS", "RATE_LIMIT_BURST",
 		"MIN_SYNC_INTERVAL", "MAX_SYNC_INTERVAL",
+		"TRUSTED_PROXIES",
 	}
 
 	cleanup := func() func() {
@@ -453,6 +454,56 @@ func TestLoad(t *testing.T) {
 		}
 		if cfg.Security.OAuthStateMaxAgeSecs != 600 {
 			t.Errorf("expected OAuthStateMaxAgeSecs 600, got %d", cfg.Security.OAuthStateMaxAgeSecs)
+		}
+	})
+
+	t.Run("TRUSTED_PROXIES defaults to none", func(t *testing.T) {
+		restore := cleanup()
+		defer restore()
+		clearAllEnvVars()
+		setRequiredEnvVars()
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.Server.TrustedProxies) != 0 {
+			t.Errorf("expected no trusted proxies by default, got %v", cfg.Server.TrustedProxies)
+		}
+	})
+
+	t.Run("parses TRUSTED_PROXIES list", func(t *testing.T) {
+		restore := cleanup()
+		defer restore()
+		clearAllEnvVars()
+		setRequiredEnvVars()
+		os.Setenv("TRUSTED_PROXIES", " 172.17.0.1 , 10.0.0.0/8,,::1 ")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"172.17.0.1", "10.0.0.0/8", "::1"}
+		if len(cfg.Server.TrustedProxies) != len(want) {
+			t.Fatalf("TrustedProxies = %v, want %v", cfg.Server.TrustedProxies, want)
+		}
+		for i := range want {
+			if cfg.Server.TrustedProxies[i] != want[i] {
+				t.Errorf("TrustedProxies[%d] = %q, want %q", i, cfg.Server.TrustedProxies[i], want[i])
+			}
+		}
+	})
+
+	t.Run("returns error for invalid TRUSTED_PROXIES entry", func(t *testing.T) {
+		restore := cleanup()
+		defer restore()
+		clearAllEnvVars()
+		setRequiredEnvVars()
+		os.Setenv("TRUSTED_PROXIES", "172.17.0.1,proxy.example.com")
+
+		_, err := Load()
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("expected ErrInvalidConfig, got %v", err)
 		}
 	})
 

@@ -689,3 +689,85 @@ func TestRateLimiterPerIP(t *testing.T) {
 		}
 	})
 }
+
+// TestConfigureTrustedProxies verifies that a client cannot spoof its
+// IP via X-Forwarded-For unless the TCP peer is a configured proxy
+// (#199). Gin's default trusts every peer, which made the rate limiter
+// and audit-log IP trivially spoofable.
+func TestConfigureTrustedProxies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	newEngine := func(t *testing.T, proxies []string) *gin.Engine {
+		t.Helper()
+		engine := gin.New()
+		if err := ConfigureTrustedProxies(engine, proxies); err != nil {
+			t.Fatalf("ConfigureTrustedProxies(%v): %v", proxies, err)
+		}
+		return engine
+	}
+
+	clientIP := func(engine *gin.Engine, remoteAddr, xff string) string {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+		req.RemoteAddr = remoteAddr
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		engine.ServeHTTP(w, req)
+		return w.Body.String()
+	}
+
+	withIPRoute := func(engine *gin.Engine) *gin.Engine {
+		engine.GET("/ip", func(c *gin.Context) { c.String(http.StatusOK, c.ClientIP()) })
+		return engine
+	}
+
+	t.Run("no trusted proxies ignores spoofed X-Forwarded-For", func(t *testing.T) {
+		engine := withIPRoute(newEngine(t, nil))
+		if got := clientIP(engine, "203.0.113.5:4242", "1.2.3.4"); got != "203.0.113.5" {
+			t.Errorf("ClientIP = %q, want peer address 203.0.113.5 (spoofed header must be ignored)", got)
+		}
+	})
+
+	t.Run("trusted proxy peer has its X-Forwarded-For honoured", func(t *testing.T) {
+		engine := withIPRoute(newEngine(t, []string{"172.17.0.1"}))
+		if got := clientIP(engine, "172.17.0.1:4242", "1.2.3.4"); got != "1.2.3.4" {
+			t.Errorf("ClientIP = %q, want forwarded address 1.2.3.4", got)
+		}
+	})
+
+	t.Run("untrusted peer cannot spoof even when a proxy is configured", func(t *testing.T) {
+		engine := withIPRoute(newEngine(t, []string{"172.17.0.0/16"}))
+		if got := clientIP(engine, "203.0.113.5:4242", "1.2.3.4"); got != "203.0.113.5" {
+			t.Errorf("ClientIP = %q, want peer address 203.0.113.5", got)
+		}
+	})
+
+	t.Run("spoofed X-Forwarded-For does not reset the rate limit bucket", func(t *testing.T) {
+		engine := newEngine(t, nil)
+		engine.Use(RateLimiter(1.0, 1))
+		engine.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		do := func(xff string) int {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = "203.0.113.9:4242"
+			req.Header.Set("X-Forwarded-For", xff)
+			engine.ServeHTTP(w, req)
+			return w.Code
+		}
+
+		if code := do("10.0.0.1"); code != http.StatusOK {
+			t.Fatalf("first request: want 200, got %d", code)
+		}
+		if code := do("10.0.0.2"); code != http.StatusTooManyRequests {
+			t.Errorf("second request with a different spoofed X-Forwarded-For: want 429, got %d", code)
+		}
+	})
+
+	t.Run("invalid proxy entry is rejected", func(t *testing.T) {
+		if err := ConfigureTrustedProxies(gin.New(), []string{"not-an-ip"}); err == nil {
+			t.Error("expected error for invalid trusted proxy entry")
+		}
+	})
+}
