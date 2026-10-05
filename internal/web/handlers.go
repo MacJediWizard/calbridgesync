@@ -100,14 +100,23 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
-	if err := h.session.SetOAuthState(c.Writer, c.Request, state); err != nil {
+	nonce, verifier, err := auth.GenerateOIDCLoginSecrets()
+	if err != nil {
+		c.HTML(http.StatusInternalServerError, "error.html", gin.H{
+			"error": "Failed to generate state",
+		})
+		return
+	}
+
+	loginState := &auth.OIDCLoginState{State: state, Nonce: nonce, Verifier: verifier}
+	if err := h.session.SetOIDCLoginState(c.Writer, c.Request, loginState); err != nil {
 		c.HTML(http.StatusInternalServerError, "error.html", gin.H{
 			"error": "Failed to save state",
 		})
 		return
 	}
 
-	authURL := h.oidc.AuthCodeURL(state)
+	authURL := h.oidc.AuthCodeURL(state, nonce, verifier)
 	c.Redirect(http.StatusFound, authURL)
 }
 
@@ -115,8 +124,8 @@ func (h *Handlers) Login(c *gin.Context) {
 func (h *Handlers) Callback(c *gin.Context) {
 	// Verify state
 	state := c.Query("state")
-	savedState, err := h.session.GetOAuthState(c.Writer, c.Request)
-	if err != nil || state != savedState {
+	loginState, err := h.session.GetOIDCLoginState(c.Writer, c.Request)
+	if err != nil || state != loginState.State {
 		c.HTML(http.StatusBadRequest, "error.html", gin.H{
 			"error": "Invalid state parameter",
 		})
@@ -133,7 +142,7 @@ func (h *Handlers) Callback(c *gin.Context) {
 
 	// Exchange code for token
 	code := c.Query("code")
-	token, err := h.oidc.Exchange(c.Request.Context(), code)
+	token, err := h.oidc.Exchange(c.Request.Context(), code, loginState.Verifier)
 	if err != nil {
 		c.HTML(http.StatusBadRequest, "error.html", gin.H{
 			"error": "Failed to exchange code",
@@ -142,7 +151,7 @@ func (h *Handlers) Callback(c *gin.Context) {
 	}
 
 	// Verify ID token and get claims
-	claims, err := h.oidc.VerifyIDToken(c.Request.Context(), token)
+	claims, err := h.oidc.VerifyIDToken(c.Request.Context(), token, loginState.Nonce)
 	if err != nil {
 		c.HTML(http.StatusBadRequest, "error.html", gin.H{
 			"error": "Failed to verify token",
