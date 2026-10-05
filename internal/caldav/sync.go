@@ -757,6 +757,36 @@ type caldavEventDeleter interface {
 	DeleteEvent(ctx context.Context, eventPath string) error
 }
 
+// calendarClient is the CalDAV client surface that fullSync,
+// syncEventsToDestination and cleanupDuplicates use. It exists so the
+// sync flow can be driven against an in-memory fake in tests (#177);
+// production always passes a *Client.
+//
+// Callers that have no source client (the ICS path) pass nil. A typed
+// nil *Client would compare non-nil inside the interface, so
+// syncEventsToDestination normalizes it with nilIfTypedNil before its
+// "sourceClient != nil" checks.
+type calendarClient interface {
+	FindCalendars(ctx context.Context) ([]Calendar, error)
+	FindCalendarsGoogle(ctx context.Context) ([]Calendar, error)
+	GetCalendarPath() string
+	GetEvents(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error)
+	GetEvent(ctx context.Context, eventPath string) (*Event, error)
+	PutEvent(ctx context.Context, calendarPath string, event *Event) error
+	DeleteEvent(ctx context.Context, eventPath string) error
+}
+
+var _ calendarClient = (*Client)(nil)
+
+// nilIfTypedNil turns a calendarClient holding a nil *Client into an
+// untyped nil, so "c != nil" means "there is a client to call".
+func nilIfTypedNil(c calendarClient) calendarClient {
+	if cc, ok := c.(*Client); ok && cc == nil {
+		return nil
+	}
+	return c
+}
+
 // syncedEventTrackingDeleter is the narrow DB surface that
 // performDeletionAndCleanup needs. Same rationale as
 // caldavEventDeleter — keeping the mock small by depending only
@@ -1442,7 +1472,7 @@ func filterEventsByDate(events []Event, cutoffDate time.Time) []Event {
 	return filtered
 }
 
-func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int) *SyncResult {
+func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, calendar Calendar, calendarIndex int) *SyncResult {
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),
@@ -1532,7 +1562,8 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 // syncEventsToDestination handles the comparison, creation, update, and deletion of events
 // between source events and a destination CalDAV calendar. This is shared by both CalDAV
 // full sync and ICS feed sync paths.
-func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient *Client, destClient *Client, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+	sourceClient = nilIfTypedNil(sourceClient)
 	result := &SyncResult{
 		Errors:   make([]string, 0),
 		Warnings: make([]string, 0),
@@ -2249,7 +2280,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 // be lower, and individual failures were invisible to users. Issue #55
 // changed the signature to pass *SyncResult through so failures are
 // observable.
-func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient *Client, destCalendarPath string, sourceEventMap map[string]Event, result *SyncResult) {
+func (se *SyncEngine) cleanupDuplicates(ctx context.Context, destClient calendarClient, destCalendarPath string, sourceEventMap map[string]Event, result *SyncResult) {
 	log.Printf("Starting duplicate cleanup for destination: %s", destCalendarPath)
 
 	// Re-fetch destination events to get current state
