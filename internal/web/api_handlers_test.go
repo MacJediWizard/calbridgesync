@@ -300,9 +300,13 @@ func TestCategorizeConnectionError(t *testing.T) {
 // TestCategorizeConnectionError_NoInternalOracle verifies that a
 // dial blocked by the CalDAV SSRF guard and a refused, timed-out or
 // unreachable dial to a non-public address all produce the same
-// user-facing string, so the error text cannot be used to map hosts
-// and ports on the server's network. Dial failures to public
-// addresses keep their specific messages. (#200)
+// user-facing string, so the error text cannot be used to tell live
+// private hosts from dead ones (refused vs timeout vs unreachable).
+// Dial failures to public addresses keep their specific messages.
+//
+// This does NOT hide whether a private port is open: a dial that
+// connects falls through to the TLS/401/404/default messages. That
+// residual is an accepted trade-off, see categorizeConnectionError. (#200)
 func TestCategorizeConnectionError_NoInternalOracle(t *testing.T) {
 	wrap := func(inner error) error {
 		return fmt.Errorf("%w: %w", caldav.ErrConnectionFailed,

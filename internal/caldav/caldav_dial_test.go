@@ -6,10 +6,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/macjediwizard/calbridgesync/internal/db"
 	"golang.org/x/oauth2"
 )
 
@@ -131,5 +133,131 @@ func TestNewClient_RefusedDialKeepsOpError(t *testing.T) {
 	}
 	if errors.Is(err, ErrBlockedDestination) {
 		t.Errorf("refused dial must not be reported as blocked: %v", err)
+	}
+}
+
+// TestDialVettedIPs_FallsBackToNextIP verifies that the SSRF-guarded
+// dial tries every vetted address in order, like net.Dialer does for a
+// hostname, instead of failing when only the first one is unreachable.
+// Here the first address (::1) has no listener and the second
+// (127.0.0.1) does. (#200 review)
+func TestDialVettedIPs_FallsBackToNextIP(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			_ = c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+
+	ips := []net.IP{net.ParseIP("::1"), net.ParseIP("127.0.0.1")}
+	conn, err := dialVettedIPs(context.Background(), "tcp", ips, port)
+	if err != nil {
+		t.Fatalf("expected fallback to the second IP to succeed, got %v", err)
+	}
+	defer conn.Close()
+	if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
+		t.Errorf("connected to %s, want %s", got, ln.Addr())
+	}
+}
+
+// TestDialVettedIPs_AllFailReturnsFirstError mirrors net.Dialer: when
+// every address fails, the first address's error is returned. (#200 review)
+func TestDialVettedIPs_AllFailReturnsFirstError(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	_ = ln.Close()
+
+	_, err = dialVettedIPs(context.Background(), "tcp", []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}, port)
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Addr == nil || opErr.Addr.String() != net.JoinHostPort("127.0.0.1", port) {
+		t.Fatalf("expected the first address's OpError, got %v", err)
+	}
+}
+
+// TestScrubInternalDialErrors verifies that dial failures to
+// non-public addresses lose the refused/timeout/unreachable detail
+// that would otherwise let a user map the server's private network
+// through the sync log, while dial failures to public addresses and
+// unrelated errors are left alone. (#200 review)
+func TestScrubInternalDialErrors(t *testing.T) {
+	const scrubbed = "could not connect to the server"
+	cases := []struct {
+		in        string
+		wantScrub bool
+	}{
+		{`connection failed: Propfind "http://10.0.0.5:22/": dial tcp 10.0.0.5:22: connect: connection refused`, true},
+		{`connection failed: Propfind "http://10.0.0.5:23/": dial tcp 10.0.0.5:23: i/o timeout`, true},
+		{`Failed to get source events: Report "http://h/": dial tcp 192.168.1.20:8443: connect: no route to host`, true},
+		{`dial tcp [fd00::1]:443: connect: connection refused`, true},
+		{`dial tcp 100.64.0.1:443: connect: network is unreachable`, true},
+		{`dial tcp 127.0.0.1:8080: connect: connection refused`, true},
+		{`dial tcp 8.8.8.8:443: connect: connection refused`, false},
+		{`dial tcp [2001:4860:4860::8888]:443: i/o timeout`, false},
+		{`401 Unauthorized`, false},
+		{`blocked destination: internal.test resolves to 169.254.169.254 (link-local (includes cloud IMDS))`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := scrubInternalDialErrors([]string{tc.in})[0]
+			if tc.wantScrub {
+				for _, leak := range []string{"refused", "timeout", "unreachable", "no route"} {
+					if strings.Contains(got, leak) {
+						t.Errorf("scrubbed text still contains %q: %q", leak, got)
+					}
+				}
+				if !strings.Contains(got, scrubbed) {
+					t.Errorf("got %q, want it to contain %q", got, scrubbed)
+				}
+			} else if got != tc.in {
+				t.Errorf("unexpected rewrite: %q -> %q", tc.in, got)
+			}
+		})
+	}
+
+	// Refused and timed-out dials to the same private host must read
+	// identically once scrubbed.
+	a := scrubInternalDialErrors([]string{`dial tcp 10.0.0.5:22: connect: connection refused`})[0]
+	b := scrubInternalDialErrors([]string{`dial tcp 10.0.0.5:22: i/o timeout`})[0]
+	if a != b {
+		t.Errorf("refused and timeout still distinguishable: %q vs %q", a, b)
+	}
+}
+
+// TestFinishSync_ScrubsInternalDialErrors verifies the scrub is applied
+// at the single choke point that feeds sync_logs.Details (returned by
+// GET /sources/:id/logs), the activity tracker and scheduler alerts. (#200 review)
+func TestFinishSync_ScrubsInternalDialErrors(t *testing.T) {
+	h := newFlowHarness(t, db.SyncDirectionOneWay, db.ConflictSourceWins, 3600)
+	result := &SyncResult{
+		Message: "Source connection test failed",
+		Errors: []string{
+			`connection failed: Propfind "http://10.0.0.5:22/": dial tcp 10.0.0.5:22: connect: connection refused`,
+		},
+		Warnings: []string{`dial tcp 10.0.0.6:22: i/o timeout`},
+	}
+	h.se.finishSync(h.source.ID, result)
+
+	logs, err := h.db.GetSyncLogs(h.source.ID, 1)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("GetSyncLogs: %v (n=%d)", err, len(logs))
+	}
+	all := append(append([]string{}, result.Errors...), result.Warnings...)
+	for _, leak := range []string{"connection refused", "i/o timeout"} {
+		if strings.Contains(logs[0].Details, leak) {
+			t.Errorf("sync log details leak %q: %q", leak, logs[0].Details)
+		}
+		for _, e := range all {
+			if strings.Contains(e, leak) {
+				t.Errorf("result (tracker/alert input) leaks %q: %q", leak, e)
+			}
+		}
 	}
 }

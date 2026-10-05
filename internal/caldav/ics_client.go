@@ -82,14 +82,10 @@ func icsLoopbackOnlyDialContext(ctx context.Context, network, addr string) (net.
 		}
 	}
 
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	// Dial the first resolved IP directly to prevent a second
-	// resolver lookup from returning a different answer.
-	dialAddr := net.JoinHostPort(ips[0].String(), port)
-	return dialer.DialContext(ctx, network, dialAddr)
+	// Dial the vetted IPs directly (in order, falling back like
+	// net.Dialer does) to prevent a second resolver lookup from
+	// returning a different answer.
+	return dialVettedIPs(ctx, network, ips, port)
 }
 
 // isICSBlockedIP is the ICS-specific block classifier. Narrower

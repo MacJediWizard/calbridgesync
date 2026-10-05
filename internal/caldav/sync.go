@@ -2599,6 +2599,12 @@ func (se *SyncEngine) TestICSConnection(ctx context.Context, url, username, pass
 const finishSyncPersistenceWarningPrefix = "sync persistence failure: "
 
 func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
+	// Scrub dial failures to non-public addresses before the text
+	// reaches the sync log, the activity tracker or (via the returned
+	// result) scheduler alerts. (#200 review)
+	result.Errors = scrubInternalDialErrors(result.Errors)
+	result.Warnings = scrubInternalDialErrors(result.Warnings)
+
 	// Determine status: error > partial > success
 	var status db.SyncStatus
 	if !result.Success {
