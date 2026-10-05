@@ -321,15 +321,22 @@ func (c *Client) GetEventsWithReport(ctx context.Context, calendarPath string, c
 	}
 
 	// A malformed or empty object has no parsed UID. Try a raw "UID:"
-	// line so the sync engine can still tell which event it is.
+	// line so the sync engine can still tell which event it is. If that
+	// raw GET fails, nothing is known about the object (the first
+	// response may not even have been the real object), so it is
+	// reported as transient, which blocks deletions this cycle.
 	for i := range report.Unreadable {
 		u := &report.Unreadable[i]
 		if u.Kind != UnreadableMalformed {
 			continue
 		}
-		if raw, rawErr := c.fetchRawEvent(ctx, u.Path); rawErr == nil {
-			u.UID = extractUIDFromICS(raw)
+		raw, rawErr := c.fetchRawEvent(ctx, u.Path)
+		if rawErr != nil {
+			u.Kind = UnreadableTransient
+			u.Err = fmt.Sprintf("%s; raw re-fetch failed: %v", u.Err, rawErr)
+			continue
 		}
+		u.UID = extractUIDFromICS(raw)
 	}
 	return events, report, nil
 }

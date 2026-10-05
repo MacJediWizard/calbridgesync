@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -23,6 +24,9 @@ type stubObject struct {
 	inMG        bool   // returned by MULTIGET
 	errBody     string // GET body on a non-200 status; default "stub failure"
 	contentType string // GET Content-Type on a 200; default text/calendar
+	// okGets, when > 0, serves only the first okGets GETs normally;
+	// every later GET of the object gets a 503.
+	okGets int
 }
 
 // newReportStub serves a minimal CalDAV calendar at /cal/:
@@ -32,6 +36,8 @@ type stubObject struct {
 //   - GET returns each object's status and body.
 func newReportStub(t *testing.T, objects map[string]stubObject) *Client {
 	t.Helper()
+	var mu sync.Mutex
+	gets := make(map[string]int)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		switch r.Method {
@@ -68,6 +74,13 @@ func newReportStub(t *testing.T, objects map[string]stubObject) *Client {
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
+			}
+			mu.Lock()
+			gets[r.URL.Path]++
+			n := gets[r.URL.Path]
+			mu.Unlock()
+			if o.okGets > 0 && n > o.okGets {
+				o.status = http.StatusServiceUnavailable
 			}
 			if o.status != 0 && o.status != http.StatusOK {
 				errBody := o.errBody
@@ -110,6 +123,7 @@ func eventUIDs(events []Event) []string {
 // (e) MULTIGET omits a path and the single GET returns 200: the
 // recovered event must be in the results.
 func TestGetEvents_MultiGetDroppedPathRecoveredByProbeIsReturned(t *testing.T) {
+	allowLoopbackDial(t)
 	c := newReportStub(t, map[string]stubObject{
 		"/cal/a.ics": {body: testICS("a", "A", flowStart), inMG: true},
 		"/cal/b.ics": {body: testICS("b", "B", flowStart), inMG: false},
@@ -129,6 +143,7 @@ func TestGetEvents_MultiGetDroppedPathRecoveredByProbeIsReturned(t *testing.T) {
 }
 
 func TestGetEventsWithReport_TransientProbeFailureIsReported(t *testing.T) {
+	allowLoopbackDial(t)
 	c := newReportStub(t, map[string]stubObject{
 		"/cal/a.ics": {body: testICS("a", "A", flowStart), inMG: true},
 		"/cal/b.ics": {status: http.StatusInternalServerError, inMG: false},
@@ -150,6 +165,7 @@ func TestGetEventsWithReport_TransientProbeFailureIsReported(t *testing.T) {
 }
 
 func TestGetEventsWithReport_MalformedObjectReportsRawUID(t *testing.T) {
+	allowLoopbackDial(t)
 	broken := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:raw-uid@example.com\r\nthis line has no colon\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	c := newReportStub(t, map[string]stubObject{
 		"/cal/a.ics":      {body: testICS("a", "A", flowStart), inMG: true},
@@ -168,7 +184,32 @@ func TestGetEventsWithReport_MalformedObjectReportsRawUID(t *testing.T) {
 	}
 }
 
+// A malformed object whose raw follow-up GET fails has no recoverable
+// UID. Nothing is known about it, so it must be reported as transient
+// (which blocks deletion passes), not as malformed-unmapped (which
+// does not). (#206 review)
+func TestGetEventsWithReport_MalformedObjectWithFailedRawFetchIsTransient(t *testing.T) {
+	allowLoopbackDial(t)
+	broken := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:raw-uid@example.com\r\nthis line has no colon\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	c := newReportStub(t, map[string]stubObject{
+		"/cal/a.ics":      {body: testICS("a", "A", flowStart), inMG: true},
+		"/cal/opaque.ics": {body: broken, inMG: false, okGets: 1},
+	})
+	_, report, err := c.GetEventsWithReport(context.Background(), reportCal, nil)
+	if err != nil {
+		t.Fatalf("GetEventsWithReport: %v", err)
+	}
+	if len(report.Unreadable) != 1 {
+		t.Fatalf("report.Unreadable = %+v, want exactly /cal/opaque.ics", report.Unreadable)
+	}
+	u := report.Unreadable[0]
+	if u.Path != "/cal/opaque.ics" || u.Kind != UnreadableTransient || u.UID != "" {
+		t.Errorf("unreadable = %+v, want transient /cal/opaque.ics with no UID", u)
+	}
+}
+
 func TestGetEvent_OnlyA404IsErrNotFound(t *testing.T) {
+	allowLoopbackDial(t)
 	c := newReportStub(t, map[string]stubObject{
 		"/cal/down.ics": {status: http.StatusServiceUnavailable},
 	})
@@ -186,6 +227,7 @@ func TestGetEvent_OnlyA404IsErrNotFound(t *testing.T) {
 // a 5xx body can contain "malformed", "missing colon" or "invalid" +
 // "ical". The status must win: anything but a 404 is transient. (#206)
 func TestGetEventsWithReport_5xxBodyWithMalformedWordsIsTransient(t *testing.T) {
+	allowLoopbackDial(t)
 	bodies := []string{
 		"backend unavailable: critical invalid state",
 		"malformed upstream response",
@@ -226,6 +268,7 @@ func TestGetEventsWithReport_5xxBodyWithMalformedWordsIsTransient(t *testing.T) 
 // object, not a transient fault: it must be reported as malformed so
 // it does not block every deletion pass on every cycle. (#206)
 func TestGetEventsWithReport_EmptyOrWrongTypeBodyIsMalformed(t *testing.T) {
+	allowLoopbackDial(t)
 	c := newReportStub(t, map[string]stubObject{
 		"/cal/a.ics":     {body: testICS("a", "A", flowStart), inMG: true},
 		"/cal/empty.ics": {body: ""},
