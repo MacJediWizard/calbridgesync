@@ -23,6 +23,12 @@ export const getVersion = async (): Promise<{ version: string }> => {
   return response.data;
 };
 
+// Accepted sync_interval range (seconds); the source API returns 400 outside it.
+export const getSyncLimits = async (): Promise<{ min_sync_interval: number; max_sync_interval: number }> => {
+  const response = await api.get('/settings/sync-limits');
+  return response.data;
+};
+
 // Dashboard
 export const getDashboardStats = async (): Promise<DashboardStats> => {
   const response = await api.get('/dashboard/stats');

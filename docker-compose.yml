@@ -58,7 +58,7 @@ services:
       #- RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-10.0}                    # requests/sec per client
       #- RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-20}
       #- MIN_SYNC_INTERVAL=${MIN_SYNC_INTERVAL:-30}                # seconds
-      #- MAX_SYNC_INTERVAL=${MAX_SYNC_INTERVAL:-3600}              # seconds
+      #- MAX_SYNC_INTERVAL=${MAX_SYNC_INTERVAL:-86400}             # seconds
       #- ALERT_MAX_SEND_ATTEMPTS=${ALERT_MAX_SEND_ATTEMPTS:-3}     # retry count for webhook/email
       #- ALERT_INITIAL_BACKOFF_MS=${ALERT_INITIAL_BACKOFF_MS:-500} # first retry delay
       # GOOGLE_OAUTH_REDIRECT_URL is auto-derived from BASE_URL if

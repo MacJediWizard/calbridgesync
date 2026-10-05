@@ -111,6 +111,26 @@ func validateSourceInput(name, sourceType, syncDirection, conflictStrategy, sour
 	return ""
 }
 
+// validateSyncBounds checks sync_interval against the configured
+// [MinInterval, MaxInterval] and requires sync_days_past >= 1.
+// Returns an error message if validation fails, empty string if valid.
+func (h *Handlers) validateSyncBounds(syncInterval, syncDaysPast int) string {
+	minI, maxI := h.cfg.Sync.MinInterval, h.cfg.Sync.MaxInterval
+	if syncInterval < minI || syncInterval > maxI {
+		return fmt.Sprintf("Sync interval must be between %d and %d seconds", minI, maxI)
+	}
+	if syncDaysPast < 1 {
+		return "Sync past days must be at least 1"
+	}
+	return ""
+}
+
+// clampSyncInterval returns v limited to [minI, maxI]. Used where a 400
+// can't be returned (the Google OAuth callback is a browser redirect).
+func clampSyncInterval(v, minI, maxI int) int {
+	return min(max(v, minI), maxI)
+}
+
 // APISource represents a source in JSON format for the API.
 type APISource struct {
 	ID                string              `json:"id"`
@@ -477,6 +497,15 @@ func (h *Handlers) APIGetVersion(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"version": version.Version})
 }
 
+// APIGetSyncLimits returns the server's accepted sync_interval range so
+// the source forms only offer values the API will accept.
+func (h *Handlers) APIGetSyncLimits(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"min_sync_interval": h.cfg.Sync.MinInterval,
+		"max_sync_interval": h.cfg.Sync.MaxInterval,
+	})
+}
+
 // APIGetLogStats returns aggregate sync log statistics for the
 // Settings page. Shows total count, oldest log, and retention
 // period so operators can gauge log growth. (#136)
@@ -775,6 +804,11 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		return
 	}
 
+	if boundsErr := h.validateSyncBounds(req.SyncInterval, req.SyncDaysPast); boundsErr != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": boundsErr})
+		return
+	}
+
 	// Test source connection
 	ctx := c.Request.Context()
 	if isICS {
@@ -813,17 +847,6 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		return
 	}
 
-	syncInterval := req.SyncInterval
-	if syncInterval < h.cfg.Sync.MinInterval || syncInterval > h.cfg.Sync.MaxInterval {
-		syncInterval = h.cfg.Sync.MinInterval // Use configured minimum instead of hardcoded value
-	}
-
-	// Default sync_days_past to 30 if not set
-	syncDaysPast := req.SyncDaysPast
-	if syncDaysPast <= 0 {
-		syncDaysPast = 30
-	}
-
 	// Convert API calendar configs to DB calendar configs
 	var dbCalendars []db.CalendarConfig
 	for _, c := range req.SelectedCalendars {
@@ -843,8 +866,8 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		DestURL:           req.DestURL,
 		DestUsername:      req.DestUsername,
 		DestPassword:      encDestPwd,
-		SyncInterval:      syncInterval,
-		SyncDaysPast:      syncDaysPast,
+		SyncInterval:      req.SyncInterval,
+		SyncDaysPast:      req.SyncDaysPast,
 		SyncDirection:     db.SyncDirection(req.SyncDirection),
 		ConflictStrategy:  db.ConflictStrategy(req.ConflictStrategy),
 		SelectedCalendars: dbCalendars,
@@ -920,6 +943,11 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 
+	if boundsErr := h.validateSyncBounds(req.SyncInterval, req.SyncDaysPast); boundsErr != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": boundsErr})
+		return
+	}
+
 	// Convert API calendar configs to DB calendar configs
 	var dbCalendars []db.CalendarConfig
 	for _, c := range req.SelectedCalendars {
@@ -940,12 +968,8 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 	source.ConflictStrategy = db.ConflictStrategy(req.ConflictStrategy)
 	source.SelectedCalendars = dbCalendars
 	source.StripAlarms = req.StripAlarms
-	if req.SyncInterval > 0 {
-		source.SyncInterval = req.SyncInterval
-	}
-	if req.SyncDaysPast > 0 {
-		source.SyncDaysPast = req.SyncDaysPast
-	}
+	source.SyncInterval = req.SyncInterval
+	source.SyncDaysPast = req.SyncDaysPast
 
 	// Update passwords if provided
 	if req.SourcePassword != "" {
