@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-ical"
@@ -38,7 +39,7 @@ var (
 )
 
 const (
-	defaultTimeout = 300 * time.Second // 5 minutes default for slow CalDAV servers like iCloud
+	defaultTimeout = 300 * time.Second // CALDAV_REQUEST_TIMEOUT default: 5 minutes for slow CalDAV servers like iCloud
 	minTLSVersion  = tls.VersionTLS12
 
 	// maxCalDAVResponseSize caps every io.ReadAll over a CalDAV
@@ -54,6 +55,24 @@ const (
 	// convention in ics_client.go (which uses 50 MB for ICS feeds). (#119)
 	maxCalDAVResponseSize = 200 * 1024 * 1024
 )
+
+// requestTimeoutNanos holds the per-request HTTP timeout used by
+// NewClient, NewOAuthClient and NewICSClient. It is set once at startup
+// from CALDAV_REQUEST_TIMEOUT (SetRequestTimeout) and read when each
+// client is built; atomic because sync goroutines build clients. (#239)
+var requestTimeoutNanos atomic.Int64
+
+func init() { requestTimeoutNanos.Store(int64(defaultTimeout)) }
+
+// SetRequestTimeout sets the HTTP timeout for CalDAV and ICS clients
+// created after the call. Non-positive values are ignored.
+func SetRequestTimeout(d time.Duration) {
+	if d > 0 {
+		requestTimeoutNanos.Store(int64(d))
+	}
+}
+
+func requestTimeout() time.Duration { return time.Duration(requestTimeoutNanos.Load()) }
 
 // Calendar represents a CalDAV calendar.
 type Calendar struct {
@@ -182,7 +201,7 @@ func NewClient(baseURL, username, password string) (*Client, error) {
 	}
 
 	httpClient := &http.Client{
-		Timeout:   defaultTimeout,
+		Timeout:   requestTimeout(),
 		Transport: transport,
 	}
 
