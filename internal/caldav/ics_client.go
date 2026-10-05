@@ -386,8 +386,11 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		}
 	}
 
-	// Index the feed's VTIMEZONEs in feed order (first definition of a
-	// TZID wins) so each per-UID object can carry the ones it references.
+	// Index the feed's VTIMEZONEs in feed order (first encodable
+	// definition of a TZID wins) so each per-UID object can carry the
+	// ones it references. A VTIMEZONE the encoder rejects is skipped:
+	// copying it would fail the whole UID group's encode and drop the
+	// event, which one-way orphan deletion then removes downstream.
 	var feedTimezones []*ical.Component
 	seenTZID := make(map[string]bool)
 	for _, child := range cal.Children {
@@ -396,6 +399,10 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		}
 		tzid, _ := child.Props.Text(ical.PropTimezoneID)
 		if tzid == "" || seenTZID[tzid] {
+			continue
+		}
+		if err := checkEncodableTimezone(child); err != nil {
+			log.Printf("ICS feed: skipping invalid VTIMEZONE %q: %v", tzid, err)
 			continue
 		}
 		seenTZID[tzid] = true
@@ -450,6 +457,19 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 
 	log.Printf("ICS feed: parsed %d events (%d UIDs grouped from %d VEVENTs)", len(events), len(groups), len(cal.Events()))
 	return events, nil
+}
+
+// checkEncodableTimezone reports whether go-ical can encode tz, by
+// encoding it alone in a throwaway calendar. This applies the encoder's
+// own structural checks (STANDARD/DAYLIGHT children, exactly one TZID,
+// DTSTART/TZOFFSETFROM/TZOFFSETTO once per child) rather than
+// duplicating them.
+func checkEncodableTimezone(tz *ical.Component) error {
+	probe := ical.NewCalendar()
+	probe.Props.SetText(ical.PropVersion, "2.0")
+	probe.Props.SetText(ical.PropProductID, "-//CalBridgeSync//EN")
+	probe.Children = []*ical.Component{tz}
+	return ical.NewEncoder(io.Discard).Encode(probe)
 }
 
 // collectTZIDs records every TZID parameter used by comp's properties
