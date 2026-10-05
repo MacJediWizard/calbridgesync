@@ -95,7 +95,7 @@ func TestSyncCalendar_IgnoresSyncCollection(t *testing.T) {
 	}
 
 	se := NewSyncEngine(database, nil)
-	_ = se.syncCalendar(context.Background(), source, srcClient, dstClient, Calendar{Path: calPath, Name: "Work"}, 1)
+	_ = se.syncCalendar(context.Background(), source, srcClient, dstClient, Calendar{Path: calPath, Name: "Work"}, 1, false)
 
 	mu.Lock()
 	defer mu.Unlock()
