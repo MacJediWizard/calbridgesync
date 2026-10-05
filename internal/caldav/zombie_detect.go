@@ -151,8 +151,10 @@ func FindZombieMasters(events []Event) []ZombieFingerprint {
 		// The `!fakedHere` check prevents a single event from being
 		// counted as both a faked stub AND a live master when the
 		// libical fallback emits the X-MOZ-FAKED-MASTER marker
-		// alongside a synthesized placeholder RRULE.
-		if !fakedHere && containsProperty(data, "RRULE") {
+		// alongside a synthesized placeholder RRULE. VTIMEZONE
+		// STANDARD/DAYLIGHT RRULEs are not a master, so they are
+		// stripped before the check.
+		if !fakedHere && containsProperty(stripVTimezones(data), "RRULE") {
 			cls.hasLiveMaster = true
 		}
 		if containsProperty(data, "RECURRENCE-ID") {
