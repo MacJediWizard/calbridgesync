@@ -8,12 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/macjediwizard/calbridgesync/internal/auth"
+	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/config"
+	"github.com/macjediwizard/calbridgesync/internal/crypto"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 	"github.com/macjediwizard/calbridgesync/internal/scheduler"
 )
@@ -1360,6 +1363,138 @@ func TestAPIDeleteMalformedEvent(t *testing.T) {
 			t.Fatalf("expected status 401, got %d", w.Code)
 		}
 	})
+
+	// The record must only be dropped once the remote DELETE succeeded
+	// (or the object is already gone). Dropping it after a failed
+	// DELETE hides a still-broken event from the user. (PR #90 lesson)
+	cases := []struct {
+		name        string
+		status      int // status the CalDAV stub returns for DELETE
+		password    string
+		wantCode    int
+		wantRecord  bool
+		wantDeletes int
+	}{
+		{"remote 500 keeps record and returns 502", http.StatusInternalServerError, "pw", http.StatusBadGateway, true, 1},
+		{"remote 404 deletes record", http.StatusNotFound, "pw", http.StatusOK, false, 1},
+		{"remote 204 deletes record", http.StatusNoContent, "pw", http.StatusOK, false, 1},
+		{"undecryptable password keeps record and returns 502", http.StatusNoContent, "", http.StatusBadGateway, true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var deletes atomic.Int32
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deletes.Add(1)
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer stub.Close()
+
+			th, enc := setupMalformedDeleteHandlers(t)
+			defer th.cleanup()
+
+			encPW := "not-a-valid-ciphertext"
+			if tc.password != "" {
+				var err error
+				if encPW, err = enc.Encrypt(tc.password); err != nil {
+					t.Fatalf("encrypt: %v", err)
+				}
+			}
+			userID, eventID := createMalformedEventForSource(t, th.db, db.SourceTypeCustom, stub.URL+"/cal/", encPW, "/cal/bad.ics")
+
+			w := callDeleteMalformed(th, userID, eventID)
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body %s)", w.Code, tc.wantCode, w.Body.String())
+			}
+			if got := int(deletes.Load()); got != tc.wantDeletes {
+				t.Errorf("remote DELETE calls = %d, want %d", got, tc.wantDeletes)
+			}
+			_, err := th.db.GetMalformedEventByIDForUser(eventID, userID)
+			if gotRecord := err == nil; gotRecord != tc.wantRecord {
+				t.Errorf("record present = %v, want %v (err %v)", gotRecord, tc.wantRecord, err)
+			}
+		})
+	}
+
+	t.Run("empty event path returns 400 and keeps record", func(t *testing.T) {
+		th, enc := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		encPW, _ := enc.Encrypt("pw")
+		userID, eventID := createMalformedEventForSource(t, th.db, db.SourceTypeCustom, "https://example.invalid/cal/", encPW, "")
+
+		w := callDeleteMalformed(th, userID, eventID)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		if _, err := th.db.GetMalformedEventByIDForUser(eventID, userID); err != nil {
+			t.Errorf("record should survive: %v", err)
+		}
+	})
+
+	t.Run("ICS source returns 400 and keeps record", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, eventID := createMalformedEventForSource(t, th.db, db.SourceTypeICS, "https://example.invalid/feed.ics", "", "/feed.ics#uid")
+
+		w := callDeleteMalformed(th, userID, eventID)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		if _, err := th.db.GetMalformedEventByIDForUser(eventID, userID); err != nil {
+			t.Errorf("record should survive: %v", err)
+		}
+	})
+}
+
+// setupMalformedDeleteHandlers returns test handlers wired with a real
+// encryptor and sync engine, which APIDeleteMalformedEvent needs to
+// reach the source calendar.
+func setupMalformedDeleteHandlers(t *testing.T) (*testHandlers, *crypto.Encryptor) {
+	t.Helper()
+	th := setupTestHandlers(t)
+	enc, err := crypto.NewEncryptor([]byte(strings.Repeat("k", crypto.KeySize)))
+	if err != nil {
+		th.cleanup()
+		t.Fatalf("NewEncryptor: %v", err)
+	}
+	th.handlers.encryptor = enc
+	th.handlers.syncEngine = caldav.NewSyncEngine(th.db, enc)
+	return th, enc
+}
+
+// createMalformedEventForSource creates a user, a source of the given
+// type and one malformed-event record on it; returns user and record IDs.
+func createMalformedEventForSource(t *testing.T, database *db.DB, sourceType db.SourceType, sourceURL, encPassword, eventPath string) (string, string) {
+	t.Helper()
+	userID, source := createTestUserAndSource(t, database, "malformed@example.com", "Malformed Source")
+	source.SourceType = sourceType
+	source.SourceURL = sourceURL
+	source.SourcePassword = encPassword
+	if err := database.UpdateSource(source); err != nil {
+		t.Fatalf("UpdateSource: %v", err)
+	}
+	if err := database.SaveMalformedEvent(source.ID, eventPath, "parse error"); err != nil {
+		t.Fatalf("SaveMalformedEvent: %v", err)
+	}
+	events, err := database.GetMalformedEvents(userID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("GetMalformedEvents: %v (n=%d)", err, len(events))
+	}
+	return userID, events[0].ID
+}
+
+func callDeleteMalformed(th *testHandlers, userID, eventID string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodDelete, "/api/malformed-events/"+eventID, nil)
+	c.Params = gin.Params{{Key: "id", Value: eventID}}
+	setAuthContext(c, userID, "malformed@example.com")
+	th.handlers.APIDeleteMalformedEvent(c)
+	return w
 }
 
 func TestAPIUpdateSource(t *testing.T) {
