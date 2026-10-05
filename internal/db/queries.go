@@ -11,6 +11,9 @@ import (
 )
 
 // GetOrCreateUser returns an existing user by email or creates a new one.
+// It never binds an OIDC subject, so it must not be used to resolve a login:
+// the OIDC callback uses GetOrBindUserBySubject. It remains for unverified
+// logins (via GetOrBindUserBySubject) and for tests that need a user row.
 func (db *DB) GetOrCreateUser(email, name string) (*User, error) {
 	user, err := db.GetUserByEmail(email)
 	if err == nil {
@@ -44,13 +47,26 @@ func (db *DB) GetOrCreateUser(email, name string) (*User, error) {
 // bound user. An email already bound to a different subject is rejected with
 // ErrSubjectMismatch, so a second IdP identity presenting the same email
 // cannot take over the account.
-func (db *DB) GetOrBindUserBySubject(subject, email, name string) (*User, error) {
+//
+// A subject is bound to an email only when emailVerified is true. An
+// unverified login on an unbound or unknown email gets the pre-binding
+// behaviour (the user is found or created by email and left unbound), so an
+// identity with an unverified address cannot permanently claim the account
+// and lock its real owner out.
+//
+// For a user already bound to the subject, the stored name is refreshed from
+// the claims, and so is the email when it is verified and no other user holds
+// it. Alerts and the session then follow the IdP's current address.
+func (db *DB) GetOrBindUserBySubject(subject, email, name string, emailVerified bool) (*User, error) {
 	if subject == "" {
 		return nil, ErrMissingSubject
 	}
 
 	user, err := db.getUserBySubject(subject)
 	if err == nil {
+		if err := db.refreshBoundProfile(user, email, name, emailVerified); err != nil {
+			return nil, err
+		}
 		return user, nil
 	}
 	if !errors.Is(err, ErrNotFound) {
@@ -63,6 +79,9 @@ func (db *DB) GetOrBindUserBySubject(subject, email, name string) (*User, error)
 	case err == nil:
 		if user.OIDCSubject != "" {
 			return nil, ErrSubjectMismatch
+		}
+		if !emailVerified {
+			return user, nil
 		}
 		res, err := db.conn.Exec(
 			`UPDATE users SET oidc_subject = ?, updated_at = ? WHERE id = ? AND oidc_subject IS NULL`,
@@ -85,6 +104,9 @@ func (db *DB) GetOrBindUserBySubject(subject, email, name string) (*User, error)
 		return user, nil
 
 	case errors.Is(err, ErrNotFound):
+		if !emailVerified {
+			return db.GetOrCreateUser(email, name)
+		}
 		user = &User{
 			ID:          uuid.New().String(),
 			Email:       email,
@@ -108,6 +130,43 @@ func (db *DB) GetOrBindUserBySubject(subject, email, name string) (*User, error)
 	default:
 		return nil, err
 	}
+}
+
+// refreshBoundProfile updates a bound user's stored name and email from the
+// login claims and mirrors the change onto user. The email moves only when it
+// is verified, and the conditional UPDATE leaves it alone if another user
+// already holds the address (email is UNIQUE).
+func (db *DB) refreshBoundProfile(user *User, email, name string, emailVerified bool) error {
+	now := time.Now().UTC()
+
+	if name != "" && name != user.Name {
+		if _, err := db.conn.Exec(
+			`UPDATE users SET name = ?, updated_at = ? WHERE id = ?`,
+			name, now, user.ID); err != nil {
+			return fmt.Errorf("failed to refresh user name: %w", err)
+		}
+		user.Name = name
+		user.UpdatedAt = now
+	}
+
+	if emailVerified && email != "" && email != user.Email {
+		res, err := db.conn.Exec(
+			`UPDATE users SET email = ?, updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE email = ?)`,
+			email, now, user.ID, email)
+		if err != nil {
+			return fmt.Errorf("failed to refresh user email: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to refresh user email: %w", err)
+		}
+		if n > 0 {
+			user.Email = email
+			user.UpdatedAt = now
+		}
+	}
+
+	return nil
 }
 
 const userColumns = `id, email, name, oidc_subject, created_at, updated_at`

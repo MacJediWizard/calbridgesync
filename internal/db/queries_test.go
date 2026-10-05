@@ -245,7 +245,7 @@ func TestGetOrBindUserBySubject(t *testing.T) {
 	defer cleanup()
 
 	t.Run("creates new user bound to subject", func(t *testing.T) {
-		user, err := db.GetOrBindUserBySubject("sub-new", "fresh@example.com", "Fresh")
+		user, err := db.GetOrBindUserBySubject("sub-new", "fresh@example.com", "Fresh", true)
 		if err != nil {
 			t.Fatalf("GetOrBindUserBySubject: %v", err)
 		}
@@ -253,7 +253,7 @@ func TestGetOrBindUserBySubject(t *testing.T) {
 			t.Errorf("got email %q subject %q", user.Email, user.OIDCSubject)
 		}
 
-		again, err := db.GetOrBindUserBySubject("sub-new", "fresh@example.com", "Fresh")
+		again, err := db.GetOrBindUserBySubject("sub-new", "fresh@example.com", "Fresh", true)
 		if err != nil {
 			t.Fatalf("second login: %v", err)
 		}
@@ -269,7 +269,7 @@ func TestGetOrBindUserBySubject(t *testing.T) {
 			t.Fatalf("GetOrCreateUser: %v", err)
 		}
 
-		bound, err := db.GetOrBindUserBySubject("sub-legacy", "legacy@example.com", "Legacy")
+		bound, err := db.GetOrBindUserBySubject("sub-legacy", "legacy@example.com", "Legacy", true)
 		if err != nil {
 			t.Fatalf("first login: %v", err)
 		}
@@ -289,13 +289,13 @@ func TestGetOrBindUserBySubject(t *testing.T) {
 		}
 
 		// Same subject logs in again: same user, no rebinding.
-		again, err := db.GetOrBindUserBySubject("sub-legacy", "legacy@example.com", "Legacy")
+		again, err := db.GetOrBindUserBySubject("sub-legacy", "legacy@example.com", "Legacy", true)
 		if err != nil || again.ID != legacy.ID {
 			t.Fatalf("repeat login: user %v err %v", again, err)
 		}
 
 		// A different subject presenting the same email is rejected.
-		_, err = db.GetOrBindUserBySubject("sub-attacker", "legacy@example.com", "Mallory")
+		_, err = db.GetOrBindUserBySubject("sub-attacker", "legacy@example.com", "Mallory", true)
 		if !errors.Is(err, ErrSubjectMismatch) {
 			t.Fatalf("different subject, same email: err = %v, want ErrSubjectMismatch", err)
 		}
@@ -306,22 +306,143 @@ func TestGetOrBindUserBySubject(t *testing.T) {
 	})
 
 	t.Run("bound user keeps access after the IdP email changes", func(t *testing.T) {
-		user, err := db.GetOrBindUserBySubject("sub-mover", "old@example.com", "Mover")
+		user, err := db.GetOrBindUserBySubject("sub-mover", "old@example.com", "Mover", true)
 		if err != nil {
 			t.Fatalf("first login: %v", err)
 		}
-		moved, err := db.GetOrBindUserBySubject("sub-mover", "new@example.com", "Mover")
+		moved, err := db.GetOrBindUserBySubject("sub-mover", "new@example.com", "Mover", true)
 		if err != nil {
 			t.Fatalf("login with new email: %v", err)
 		}
 		if moved.ID != user.ID {
 			t.Errorf("email change created user %q, want %q", moved.ID, user.ID)
 		}
+		// The stored profile follows the IdP, so alerts and the session use
+		// the current address and the old one is released.
+		if moved.Email != "new@example.com" {
+			t.Errorf("returned email = %q, want new@example.com", moved.Email)
+		}
+		stored, err := db.GetUserByID(user.ID)
+		if err != nil {
+			t.Fatalf("GetUserByID: %v", err)
+		}
+		if stored.Email != "new@example.com" {
+			t.Errorf("stored email = %q, want new@example.com", stored.Email)
+		}
+		if _, err := db.GetUserByEmail("old@example.com"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("old email still stored: err = %v", err)
+		}
+	})
+
+	t.Run("bound user name is refreshed from the claims", func(t *testing.T) {
+		user, err := db.GetOrBindUserBySubject("sub-rename", "rename@example.com", "Old Name", true)
+		if err != nil {
+			t.Fatalf("first login: %v", err)
+		}
+		renamed, err := db.GetOrBindUserBySubject("sub-rename", "rename@example.com", "New Name", false)
+		if err != nil {
+			t.Fatalf("second login: %v", err)
+		}
+		stored, _ := db.GetUserByID(user.ID)
+		if renamed.Name != "New Name" || stored.Name != "New Name" {
+			t.Errorf("name returned %q stored %q, want New Name", renamed.Name, stored.Name)
+		}
+	})
+
+	t.Run("bound user email is not changed to an unverified address", func(t *testing.T) {
+		user, err := db.GetOrBindUserBySubject("sub-unv-change", "kept@example.com", "Kept", true)
+		if err != nil {
+			t.Fatalf("first login: %v", err)
+		}
+		again, err := db.GetOrBindUserBySubject("sub-unv-change", "claimed@example.com", "Kept", false)
+		if err != nil {
+			t.Fatalf("second login: %v", err)
+		}
+		if again.ID != user.ID || again.Email != "kept@example.com" {
+			t.Errorf("got user %q email %q, want %q kept@example.com", again.ID, again.Email, user.ID)
+		}
+		if _, err := db.GetUserByEmail("claimed@example.com"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("unverified address was stored: err = %v", err)
+		}
+	})
+
+	t.Run("email change to an address another user holds keeps the old email", func(t *testing.T) {
+		other, err := db.GetOrCreateUser("taken@example.com", "Other")
+		if err != nil {
+			t.Fatalf("GetOrCreateUser: %v", err)
+		}
+		user, err := db.GetOrBindUserBySubject("sub-collide", "mine@example.com", "Mine", true)
+		if err != nil {
+			t.Fatalf("first login: %v", err)
+		}
+		again, err := db.GetOrBindUserBySubject("sub-collide", "taken@example.com", "Mine", true)
+		if err != nil {
+			t.Fatalf("login with colliding email: %v", err)
+		}
+		if again.ID != user.ID || again.Email != "mine@example.com" {
+			t.Errorf("got user %q email %q, want %q mine@example.com", again.ID, again.Email, user.ID)
+		}
+		holder, err := db.GetUserByEmail("taken@example.com")
+		if err != nil || holder.ID != other.ID {
+			t.Errorf("taken@example.com no longer belongs to the other user: %+v, %v", holder, err)
+		}
+	})
+
+	t.Run("unverified email never binds or claims an account", func(t *testing.T) {
+		legacy, err := db.GetOrCreateUser("unverified-legacy@example.com", "Legacy")
+		if err != nil {
+			t.Fatalf("GetOrCreateUser: %v", err)
+		}
+
+		// An unverified login maps to the legacy user as before but does
+		// not bind, so it cannot lock the real owner out.
+		got, err := db.GetOrBindUserBySubject("sub-unverified", "unverified-legacy@example.com", "Legacy", false)
+		if err != nil {
+			t.Fatalf("unverified login: %v", err)
+		}
+		if got.ID != legacy.ID || got.OIDCSubject != "" {
+			t.Errorf("got user %q subject %q, want %q unbound", got.ID, got.OIDCSubject, legacy.ID)
+		}
+		stored, _ := db.GetUserByID(legacy.ID)
+		if stored.OIDCSubject != "" {
+			t.Fatalf("unverified login bound subject %q", stored.OIDCSubject)
+		}
+
+		// The owner's verified login still binds.
+		owner, err := db.GetOrBindUserBySubject("sub-owner", "unverified-legacy@example.com", "Legacy", true)
+		if err != nil {
+			t.Fatalf("verified login: %v", err)
+		}
+		if owner.ID != legacy.ID || owner.OIDCSubject != "sub-owner" {
+			t.Errorf("got user %q subject %q, want %q sub-owner", owner.ID, owner.OIDCSubject, legacy.ID)
+		}
+
+		// Once bound, an unverified identity with the same email is rejected.
+		if _, err := db.GetOrBindUserBySubject("sub-unverified", "unverified-legacy@example.com", "Legacy", false); !errors.Is(err, ErrSubjectMismatch) {
+			t.Errorf("unverified login after bind: err = %v, want ErrSubjectMismatch", err)
+		}
+
+		// A user first created from an unverified email is left unbound,
+		// so the verified owner can still claim it.
+		fresh, err := db.GetOrBindUserBySubject("sub-unverified-new", "unverified-new@example.com", "New", false)
+		if err != nil {
+			t.Fatalf("unverified new user: %v", err)
+		}
+		if fresh.OIDCSubject != "" {
+			t.Errorf("new unverified user bound to %q", fresh.OIDCSubject)
+		}
+		claimed, err := db.GetOrBindUserBySubject("sub-verified-new", "unverified-new@example.com", "New", true)
+		if err != nil {
+			t.Fatalf("verified owner of an unverified-created user was rejected: %v", err)
+		}
+		if claimed.ID != fresh.ID || claimed.OIDCSubject != "sub-verified-new" {
+			t.Errorf("got user %q subject %q, want %q sub-verified-new", claimed.ID, claimed.OIDCSubject, fresh.ID)
+		}
 	})
 
 	t.Run("empty subject is rejected", func(t *testing.T) {
-		if _, err := db.GetOrBindUserBySubject("", "nosub@example.com", "No Sub"); err == nil {
-			t.Fatal("expected error for empty subject")
+		if _, err := db.GetOrBindUserBySubject("", "nosub@example.com", "No Sub", true); !errors.Is(err, ErrMissingSubject) {
+			t.Fatalf("empty subject: err = %v, want ErrMissingSubject", err)
 		}
 		if _, err := db.GetUserByEmail("nosub@example.com"); !errors.Is(err, ErrNotFound) {
 			t.Errorf("user was created despite empty subject: err = %v", err)

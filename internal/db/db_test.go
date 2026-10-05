@@ -69,7 +69,7 @@ func TestMigrate_UpgradeBindsLegacyUser(t *testing.T) {
 	}
 	defer db.Close()
 
-	user, err := db.GetOrBindUserBySubject("sub-old", "old@example.com", "Old")
+	user, err := db.GetOrBindUserBySubject("sub-old", "old@example.com", "Old", true)
 	if err != nil {
 		t.Fatalf("first login: %v", err)
 	}
