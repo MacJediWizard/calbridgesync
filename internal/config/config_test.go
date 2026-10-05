@@ -351,8 +351,8 @@ func TestLoad(t *testing.T) {
 		if cfg.Sync.MinInterval != 30 {
 			t.Errorf("expected default MinInterval 30, got %d", cfg.Sync.MinInterval)
 		}
-		if cfg.Sync.MaxInterval != 3600 {
-			t.Errorf("expected default MaxInterval 3600, got %d", cfg.Sync.MaxInterval)
+		if cfg.Sync.MaxInterval != 86400 {
+			t.Errorf("expected default MaxInterval 86400, got %d", cfg.Sync.MaxInterval)
 		}
 		if cfg.Security.SessionMaxAgeSecs != 86400 {
 			t.Errorf("expected default SessionMaxAgeSecs 86400, got %d", cfg.Security.SessionMaxAgeSecs)
