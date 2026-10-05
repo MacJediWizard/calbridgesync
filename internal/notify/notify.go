@@ -371,9 +371,60 @@ func sanitizeForEmail(s string) string {
 	return s
 }
 
-// IsEnabled returns true if any notification method is enabled.
+// IsEnabled returns true if any GLOBAL notification channel is enabled.
+// It ignores per-user preferences, so it is only the right gate for
+// operator-only alerts that have no owning user. Alerts for a user's
+// source must gate on HasChannelsFor instead. (#222)
 func (n *Notifier) IsEnabled() bool {
 	return n.cfg.WebhookEnabled || n.cfg.EmailEnabled
+}
+
+// alertChannels is the set of channels an alert for one user goes to.
+type alertChannels struct {
+	globalWebhook bool // operator's ALERT_WEBHOOK_URL
+	userWebhook   bool // the user's personal webhook
+	adminEmail    bool // operator's ALERT_SMTP_TO recipients
+	userEmail     bool // the user's own address
+}
+
+func (c alertChannels) any() bool {
+	return c.globalWebhook || c.userWebhook || c.adminEmail || c.userEmail
+}
+
+// channelsFor resolves which channels an alert goes to. Global flags
+// gate only the global channels (global webhook, admin recipients); a
+// user preference can opt out of those but never turns on a channel the
+// operator disabled. Per-user channels follow the user's preference,
+// independent of the global flags: the personal webhook is on when its
+// URL is set unless the user disabled webhooks, and the user's own
+// email follows their email preference (falling back to the global
+// flag when unset) and needs an SMTP host to send through. (#222)
+func (n *Notifier) channelsFor(userPrefs *UserPreferences) alertChannels {
+	var webhookPref, emailPref *bool
+	if userPrefs != nil {
+		webhookPref, emailPref = userPrefs.WebhookEnabled, userPrefs.EmailEnabled
+	}
+	optedOut := func(p *bool) bool { return p != nil && !*p }
+
+	userEmail := n.cfg.EmailEnabled
+	if emailPref != nil {
+		userEmail = *emailPref
+	}
+	smtpConfigured := n.cfg.SMTPHost != ""
+
+	return alertChannels{
+		globalWebhook: n.cfg.WebhookEnabled && n.cfg.WebhookURL != "" && !optedOut(webhookPref),
+		userWebhook:   userPrefs != nil && userPrefs.WebhookURL != "" && !optedOut(webhookPref),
+		adminEmail:    n.cfg.EmailEnabled && smtpConfigured && !optedOut(emailPref),
+		userEmail:     userEmail && smtpConfigured,
+	}
+}
+
+// HasChannelsFor reports whether an alert for a user with these
+// preferences would go to at least one channel. userPrefs may be nil
+// (no preferences saved), in which case only the global channels count.
+func (n *Notifier) HasChannelsFor(userPrefs *UserPreferences) bool {
+	return n.channelsFor(userPrefs).any()
 }
 
 // maxSendAttempts returns the configured retry count for this notifier,
@@ -1017,14 +1068,10 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 	anyAttempted := false
 	anyDelivered := false
 
-	// Determine if webhook is enabled (user pref overrides global)
-	webhookEnabled := n.cfg.WebhookEnabled
-	if userPrefs != nil && userPrefs.WebhookEnabled != nil {
-		webhookEnabled = *userPrefs.WebhookEnabled
-	}
+	channels := n.channelsFor(userPrefs)
 
 	// Send to global webhook if enabled
-	if webhookEnabled && n.cfg.WebhookURL != "" {
+	if channels.globalWebhook {
 		anyAttempted = true
 		if err := n.sendWebhook(ctx, alert); err != nil {
 			log.Printf("[Notify] Webhook error: %v", err)
@@ -1034,29 +1081,18 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 	}
 
 	// Send to user's personal webhook if configured and enabled
-	if userPrefs != nil && userPrefs.WebhookURL != "" {
-		userWebhookEnabled := true // Default to enabled if URL is set
-		if userPrefs.WebhookEnabled != nil {
-			userWebhookEnabled = *userPrefs.WebhookEnabled
-		}
-		if userWebhookEnabled {
-			anyAttempted = true
-			if err := n.sendWebhookToURL(ctx, alert, userPrefs.WebhookURL); err != nil {
-				log.Printf("[Notify] User webhook error: %v", err)
-			} else {
-				anyDelivered = true
-			}
+	if channels.userWebhook {
+		anyAttempted = true
+		if err := n.sendWebhookToURL(ctx, alert, userPrefs.WebhookURL); err != nil {
+			log.Printf("[Notify] User webhook error: %v", err)
+		} else {
+			anyDelivered = true
 		}
 	}
 
-	// Determine if email is enabled (user pref overrides global)
-	emailEnabled := n.cfg.EmailEnabled
-	if userPrefs != nil && userPrefs.EmailEnabled != nil {
-		emailEnabled = *userPrefs.EmailEnabled
-	}
-
-	if emailEnabled {
-		// Build recipient list: user email + admin emails (deduplicated).
+	if channels.userEmail || channels.adminEmail {
+		// Build recipient list: user email and/or admin emails
+		// (deduplicated), each only when its channel is enabled.
 		//
 		// Every address goes through isValidEmail before being added
 		// to the set. User email was already validated; admin emails
@@ -1084,9 +1120,13 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 			recipientSet[strings.ToLower(email)] = struct{}{}
 		}
 
-		addIfValid(alert.UserEmail)
-		for _, email := range n.cfg.SMTPTo {
-			addIfValid(email)
+		if channels.userEmail {
+			addIfValid(alert.UserEmail)
+		}
+		if channels.adminEmail {
+			for _, email := range n.cfg.SMTPTo {
+				addIfValid(email)
+			}
 		}
 
 		// Convert to slice

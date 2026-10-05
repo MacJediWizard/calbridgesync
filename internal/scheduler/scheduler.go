@@ -884,17 +884,19 @@ func (s *Scheduler) executeSync(sourceID string) {
 		// Reset auth failure counter on success
 		s.resetAuthFailCount(sourceID)
 
-		// Send recovery notification if source was previously stale
-		if s.notifier != nil && s.notifier.IsEnabled() {
-			// Look up user email for per-user notifications
-			userEmail := ""
-			if user, err := s.db.GetUserByID(source.UserID); err == nil {
-				userEmail = user.Email
-			}
-
-			// Look up user alert preferences
+		// Send recovery notification if source was previously stale.
+		// Gate on the user's merged preferences, not the global flags,
+		// so a user's own channel works when global alerts are off. (#222)
+		if s.notifier != nil {
 			userPrefs := s.getUserAlertPrefs(source.UserID)
-			s.notifier.SendRecoveryAlertWithPrefs(s.ctx, sourceID, source.Name, userEmail, userPrefs)
+			if s.notifier.HasChannelsFor(userPrefs) {
+				// Look up user email for per-user notifications
+				userEmail := ""
+				if user, err := s.db.GetUserByID(source.UserID); err == nil {
+					userEmail = user.Email
+				}
+				s.notifier.SendRecoveryAlertWithPrefs(s.ctx, sourceID, source.Name, userEmail, userPrefs)
+			}
 		}
 	} else {
 		log.Printf("Sync failed for source %s: %s", source.Name, result.Message)
@@ -967,7 +969,7 @@ func (s *Scheduler) executeSync(sourceID string) {
 // per-source cooldown map prevents alert storms on a persistently broken
 // source.
 func (s *Scheduler) maybeSendFailureAlert(sourceID string, source *db.Source, result *caldav.SyncResult) {
-	if s.notifier == nil || !s.notifier.IsEnabled() {
+	if s.notifier == nil {
 		return
 	}
 
@@ -1004,6 +1006,13 @@ func (s *Scheduler) maybeSendFailureAlert(sourceID string, source *db.Source, re
 		return
 	}
 
+	// Gate on the user's merged preferences, not the global flags, so a
+	// user's own channel works when global alerts are off. (#222)
+	userPrefs := s.getUserAlertPrefs(source.UserID)
+	if !s.notifier.HasChannelsFor(userPrefs) {
+		return
+	}
+
 	// Look up user email for per-user notifications. nil-safe so tests
 	// can exercise this path with a no-DB scheduler; production always
 	// has a real db.
@@ -1013,7 +1022,6 @@ func (s *Scheduler) maybeSendFailureAlert(sourceID string, source *db.Source, re
 			userEmail = user.Email
 		}
 	}
-	userPrefs := s.getUserAlertPrefs(source.UserID)
 
 	s.notifier.SendSyncFailureAlertWithPrefs(
 		s.ctx, sourceID, source.Name, userEmail,
@@ -1184,17 +1192,20 @@ func (s *Scheduler) checkStaleSources() {
 			log.Printf("[STALE WARNING] Source '%s' (ID: %s) hasn't synced in %v (threshold: %v, interval: %v)",
 				source.Name, sourceID, timeSinceSync.Round(time.Minute), staleThreshold, interval)
 
-			// Send notification if notifier is configured
-			if s.notifier != nil && s.notifier.IsEnabled() {
-				// Look up user email for per-user notifications
-				userEmail := ""
-				if user, err := s.db.GetUserByID(source.UserID); err == nil {
-					userEmail = user.Email
-				}
-
-				// Look up user alert preferences
+			// Send notification if the user has any alert channel.
+			// Gate on the user's merged preferences, not the global
+			// flags, so a user's own channel works when global alerts
+			// are off. (#222)
+			if s.notifier != nil {
 				userPrefs := s.getUserAlertPrefs(source.UserID)
-				s.notifier.SendStaleAlertWithPrefs(s.ctx, sourceID, source.Name, userEmail, timeSinceSync, staleThreshold, userPrefs)
+				if s.notifier.HasChannelsFor(userPrefs) {
+					// Look up user email for per-user notifications
+					userEmail := ""
+					if user, err := s.db.GetUserByID(source.UserID); err == nil {
+						userEmail = user.Email
+					}
+					s.notifier.SendStaleAlertWithPrefs(s.ctx, sourceID, source.Name, userEmail, timeSinceSync, staleThreshold, userPrefs)
+				}
 			}
 		}
 	}
