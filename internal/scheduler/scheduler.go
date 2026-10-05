@@ -995,14 +995,22 @@ func (s *Scheduler) cleanupRoutine() {
 }
 
 // runAutomatedBackup runs the daily automated database backup if
-// a backup manager is configured. Errors are logged but not fatal
-// — a failed backup doesn't affect sync operation. (#148)
+// a backup manager is configured. A failure doesn't affect sync
+// operation, but it is sent to the global alert channels so a broken
+// backup can't go unnoticed for months. (#148)
 func (s *Scheduler) runAutomatedBackup() {
 	if s.backupMgr == nil {
 		return
 	}
 	if _, err := s.backupMgr.RunBackup(); err != nil {
 		log.Printf("Automated backup failed: %v", err)
+		if s.notifier != nil {
+			// nil prefs and no user email: global channels only.
+			s.notifier.SendSyncFailureAlertWithPrefs(
+				s.ctx, "system:backup", "Automated database backup", "",
+				"Automated database backup failed", err.Error(), nil,
+			)
+		}
 		return
 	}
 	if _, err := s.backupMgr.PurgeOldBackups(); err != nil {
