@@ -347,6 +347,79 @@ func TestUpdateJobInterval(t *testing.T) {
 	})
 }
 
+// TestUpdateJobIntervalInvalidReleasesLock: a non-positive interval
+// used to reach time.NewTicker while s.mu was held without a defer,
+// so the panic left the scheduler mutex locked forever and every
+// later AddJob/RemoveJob/GetJobCount call blocked.
+func TestUpdateJobIntervalInvalidReleasesLock(t *testing.T) {
+	sched := New(nil, nil, nil)
+	addJobDirectly(sched, "source-1", time.Hour)
+
+	if err := sched.UpdateJobInterval("source-1", 0); err == nil {
+		t.Fatal("expected error for zero interval")
+	}
+
+	// AddJobWithDelay takes the same s.mu as AddJob; the long delay
+	// keeps the job from running a sync against the nil test DB.
+	done := make(chan error, 1)
+	go func() {
+		done <- sched.AddJobWithDelay("source-2", time.Hour, time.Hour)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AddJobWithDelay: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AddJobWithDelay blocked: UpdateJobInterval left s.mu locked")
+	}
+
+	// The rejected update must leave the original job in place.
+	sched.mu.RLock()
+	job, ok := sched.jobs["source-1"]
+	sched.mu.RUnlock()
+	if !ok || job.interval != time.Hour {
+		t.Fatal("rejected UpdateJobInterval should leave the existing job unchanged")
+	}
+
+	sched.RemoveJob("source-1")
+	sched.RemoveJob("source-2")
+}
+
+func TestAddJobRejectsNonPositiveInterval(t *testing.T) {
+	sched := New(nil, nil, nil)
+	for _, interval := range []time.Duration{0, -time.Second} {
+		if err := sched.AddJob("source-1", interval); err == nil {
+			t.Errorf("AddJob(%v): expected error", interval)
+		}
+		if err := sched.AddJobWithDelay("source-1", interval, 0); err == nil {
+			t.Errorf("AddJobWithDelay(%v): expected error", interval)
+		}
+	}
+	if n := sched.GetJobCount(); n != 0 {
+		t.Errorf("expected no jobs after rejected adds, got %d", n)
+	}
+}
+
+// TestRemoveJobKeepsHeldSyncLock: RemoveJob deleted the per-source
+// sync lock even while a sync held it, so a sync started right after
+// (TriggerSync, or re-enabling the source) got a fresh mutex and ran
+// concurrently with the in-flight one.
+func TestRemoveJobKeepsHeldSyncLock(t *testing.T) {
+	sched := New(nil, nil, nil)
+	addJobDirectly(sched, "source-1", time.Hour)
+
+	held := sched.getSyncLock("source-1")
+	held.Lock()
+	defer held.Unlock()
+
+	sched.RemoveJob("source-1")
+
+	if got := sched.getSyncLock("source-1"); got != held {
+		t.Fatal("RemoveJob replaced the in-use sync lock; a new sync could run concurrently with the in-flight one")
+	}
+}
+
 // addJobDirectly adds a job to the scheduler without starting the goroutine.
 // This is for testing purposes only.
 func addJobDirectly(s *Scheduler, sourceID string, interval time.Duration) {
