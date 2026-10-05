@@ -4,6 +4,7 @@ import { createSource, discoverCalendars, prepareGoogleSource } from '../service
 import type { SourceFormData, Calendar } from '../types';
 import { GOOGLE_OAUTH_ERRORS } from '../services/googleOAuthErrors';
 import { stripAlarmsScope } from '../services/stripAlarms';
+import SyncIntervalSelect from '../components/SyncIntervalSelect';
 
 export default function SourceAdd() {
   const navigate = useNavigate();
@@ -236,15 +237,10 @@ export default function SourceAdd() {
                     <label htmlFor="sync_interval" className="block text-sm font-medium text-gray-300 mb-1">
                       Interval
                     </label>
-                    <select name="sync_interval" id="sync_interval" value={form.sync_interval} onChange={handleChange} required className="w-full">
-                      <option value={300}>5 min</option>
-                      <option value={900}>15 min</option>
-                      <option value={1800}>30 min</option>
-                      <option value={3600}>1 hour</option>
-                      <option value={7200}>2 hours</option>
-                      <option value={21600}>6 hours</option>
-                      <option value={86400}>24 hours</option>
-                    </select>
+                    <SyncIntervalSelect
+                      value={form.sync_interval}
+                      onChange={v => setForm(prev => ({ ...prev, sync_interval: v }))}
+                    />
                   </div>
                   <div>
                     <label htmlFor="sync_days_past" className="block text-sm font-medium text-gray-300 mb-1">
@@ -256,7 +252,6 @@ export default function SourceAdd() {
                       <option value={30}>30 days</option>
                       <option value={60}>60 days</option>
                       <option value={90}>90 days</option>
-                      <option value={0}>Unlimited</option>
                     </select>
                   </div>
                 </div>
