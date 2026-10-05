@@ -3,6 +3,7 @@ import { useNavigate, Link, useSearchParams } from 'react-router-dom';
 import { createSource, discoverCalendars, prepareGoogleSource } from '../services/api';
 import type { SourceFormData, Calendar } from '../types';
 import { GOOGLE_OAUTH_ERRORS } from '../services/googleOAuthErrors';
+import { stripAlarmsScope } from '../services/stripAlarms';
 
 export default function SourceAdd() {
   const navigate = useNavigate();
@@ -101,6 +102,11 @@ export default function SourceAdd() {
   // password fields are hidden because they come from Google after
   // the user approves consent, not from the form.
   const isGoogleOAuth = form.source_type === 'google';
+  // "Ignore alarms" only takes effect on one-way calendars (#217). A new
+  // source has no synced events yet, so a flag that would not apply is
+  // shown unchecked and submitted as false.
+  const stripScope = stripAlarmsScope(form.sync_direction, form.selected_calendars);
+  const stripAlarms = form.strip_alarms && stripScope.applies;
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value, type } = e.target;
@@ -152,14 +158,14 @@ export default function SourceAdd() {
           dest_url: form.dest_url,
           dest_username: form.dest_username,
           dest_password: form.dest_password,
-          strip_alarms: form.strip_alarms,
+          strip_alarms: stripAlarms,
           google_client_id: form.google_client_id,
           google_client_secret: form.google_client_secret,
         });
         window.location.href = redirect_url;
         return;
       }
-      await createSource(form);
+      await createSource({ ...form, strip_alarms: stripAlarms });
       navigate('/sources');
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'response' in err) {
@@ -281,8 +287,9 @@ export default function SourceAdd() {
                     type="checkbox"
                     name="strip_alarms"
                     id="strip_alarms"
-                    checked={form.strip_alarms}
+                    checked={stripAlarms}
                     onChange={handleChange}
+                    disabled={!stripScope.applies}
                     className="mt-0.5"
                   />
                   <label htmlFor="strip_alarms" className="text-sm text-gray-300 select-none cursor-pointer">
@@ -290,7 +297,9 @@ export default function SourceAdd() {
                     <span className="block text-xs text-gray-500">
                       Strip VALARM blocks from this source's events before writing to the destination.
                       Useful for subscribed feeds (payroll, billing, sports) where the source's alarms
-                      shouldn't fire on your calendar.
+                      shouldn't fire on your calendar. Applies to one-way sync only: in two-way sync
+                      the alarm-less copy would be written back and erase the alarms on the source.
+                      {stripScope.partial && ' Calendars set to two-way keep their alarms.'}
                     </span>
                   </label>
                 </div>
