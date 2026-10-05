@@ -32,6 +32,7 @@ type fakeIdP struct {
 	gotVerifier   string // code_verifier sent to the token endpoint
 	idTokenNonce  string // nonce to embed in the issued ID token ("" = omit)
 	emailVerified bool
+	omitVerified  bool // leave the email_verified claim out entirely
 }
 
 func newFakeIdP(t *testing.T) *fakeIdP {
@@ -107,6 +108,9 @@ func (f *fakeIdP) signIDToken() string {
 	}
 	if f.idTokenNonce != "" {
 		claims["nonce"] = f.idTokenNonce
+	}
+	if f.omitVerified {
+		delete(claims, "email_verified")
 	}
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT", "kid": "test"})
 	payload, _ := json.Marshal(claims)
@@ -244,5 +248,36 @@ func TestOIDCVerifyIDTokenRejectsMissingNonce(t *testing.T) {
 	// An empty expected nonce must never match an absent claim.
 	if _, err := p.VerifyIDToken(ctx, tok, ""); !errors.Is(err, ErrNonceMismatch) {
 		t.Fatalf("VerifyIDToken with empty expected nonce: err = %v, want ErrNonceMismatch", err)
+	}
+}
+
+func TestOIDCVerifyIDTokenRejectsUnverifiedEmail(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		emailVerified bool
+		omit          bool
+	}{
+		{name: "email_verified=false", emailVerified: false},
+		{name: "email_verified absent", omit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeIdP(t)
+			f.emailVerified = tc.emailVerified
+			f.omitVerified = tc.omit
+			p := newTestProvider(t, f)
+			ctx := context.Background()
+
+			nonce, verifier, _ := GenerateOIDCLoginSecrets()
+			f.startLogin(t, p, "st", nonce, verifier)
+			f.idTokenNonce = nonce
+
+			tok, err := p.Exchange(ctx, "code", verifier)
+			if err != nil {
+				t.Fatalf("Exchange: %v", err)
+			}
+			if _, err := p.VerifyIDToken(ctx, tok, nonce); !errors.Is(err, ErrEmailNotVerified) {
+				t.Fatalf("VerifyIDToken: err = %v, want ErrEmailNotVerified", err)
+			}
+		})
 	}
 }
