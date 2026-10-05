@@ -23,51 +23,58 @@ import "strings"
 // everything outside the VALARM blocks we drop. Re-encoding through
 // go-ical can subtly reformat surrounding properties in ways some servers
 // care about.
+//
+// Matching follows RFC 5545 rather than assuming a tidy encoder: content
+// lines are unfolded before they are inspected (§3.1, a fold may fall
+// anywhere, even inside a property name), names are compared
+// case-insensitively (§2), and each physical line keeps its own line
+// ending, so a CRLF envelope around LF-only lines is still scanned line
+// by line. Kept and dropped regions are copied as the original physical
+// lines, so the output is byte-identical outside the dropped alarms.
 func sanitizeAlarms(data string, stripAll bool) string {
-	if data == "" || !strings.Contains(data, "BEGIN:VALARM") {
+	if data == "" {
 		return data
 	}
 
-	// Mirror the input's line ending so the output matches byte-for-byte
-	// outside the VALARM blocks. iCalendar mandates CRLF, but inputs from
-	// some sources arrive LF-only.
-	lineEnd := "\n"
-	if strings.Contains(data, "\r\n") {
-		lineEnd = "\r\n"
-	}
-	lines := strings.Split(data, lineEnd)
-
-	out := make([]string, 0, len(lines))
-	var alarmBuf []string
+	physical := strings.SplitAfter(data, "\n")
+	var out, alarmBuf strings.Builder
+	out.Grow(len(data))
 	inAlarm := false
 	hasTrigger := false
 
-	for _, line := range lines {
+	for i := 0; i < len(physical); {
+		// Gather one logical content line: the physical line plus any
+		// continuation lines (those starting with a space or tab).
+		j := i + 1
+		for j < len(physical) && isFoldContinuation(physical[j]) {
+			j++
+		}
+		raw := physical[i:j]
+		logical := unfoldContentLine(raw)
+		i = j
+
 		if !inAlarm {
-			if strings.HasPrefix(line, "BEGIN:VALARM") {
+			if isComponentDelimiter(logical, "BEGIN", "VALARM") {
 				inAlarm = true
 				hasTrigger = false
-				alarmBuf = alarmBuf[:0]
-				alarmBuf = append(alarmBuf, line)
+				alarmBuf.Reset()
+				writeAll(&alarmBuf, raw)
 				continue
 			}
-			out = append(out, line)
+			writeAll(&out, raw)
 			continue
 		}
 
-		alarmBuf = append(alarmBuf, line)
-		// Property names are uppercase per RFC 5545. Accept TRIGGER: (no
-		// parameters) and TRIGGER; (with parameters like RELATED=START).
-		if strings.HasPrefix(line, "TRIGGER:") || strings.HasPrefix(line, "TRIGGER;") {
+		writeAll(&alarmBuf, raw)
+		if strings.EqualFold(contentLineName(logical), "TRIGGER") {
 			hasTrigger = true
 		}
-		if strings.HasPrefix(line, "END:VALARM") {
+		if isComponentDelimiter(logical, "END", "VALARM") {
 			inAlarm = false
-			drop := stripAll || !hasTrigger
-			if !drop {
-				out = append(out, alarmBuf...)
+			if !stripAll && hasTrigger {
+				out.WriteString(alarmBuf.String())
 			}
-			alarmBuf = alarmBuf[:0]
+			alarmBuf.Reset()
 		}
 	}
 
@@ -76,10 +83,55 @@ func sanitizeAlarms(data string, stripAll bool) string {
 	// destination will reject it for a different reason and surface that to
 	// the user, which is more honest than disappearing the event.
 	if inAlarm {
-		out = append(out, alarmBuf...)
+		out.WriteString(alarmBuf.String())
 	}
 
-	return strings.Join(out, lineEnd)
+	return out.String()
+}
+
+// isFoldContinuation reports whether a physical line continues the
+// previous content line (RFC 5545 §3.1).
+func isFoldContinuation(line string) bool {
+	return line != "" && (line[0] == ' ' || line[0] == '\t')
+}
+
+// unfoldContentLine joins the physical lines of one content line, dropping
+// line endings and the single leading whitespace of each continuation.
+func unfoldContentLine(lines []string) string {
+	if len(lines) == 1 {
+		return strings.TrimRight(lines[0], "\r\n")
+	}
+	var b strings.Builder
+	for k, l := range lines {
+		l = strings.TrimRight(l, "\r\n")
+		if k > 0 {
+			l = l[1:]
+		}
+		b.WriteString(l)
+	}
+	return b.String()
+}
+
+// contentLineName returns the property or delimiter name of an unfolded
+// content line: everything before the first ';' or ':'.
+func contentLineName(line string) string {
+	if idx := strings.IndexAny(line, ";:"); idx >= 0 {
+		return line[:idx]
+	}
+	return line
+}
+
+// isComponentDelimiter reports whether an unfolded content line is
+// "<keyword>:<component>", compared case-insensitively.
+func isComponentDelimiter(line, keyword, component string) bool {
+	name, value, ok := strings.Cut(line, ":")
+	return ok && strings.EqualFold(name, keyword) && strings.EqualFold(strings.TrimSpace(value), component)
+}
+
+func writeAll(b *strings.Builder, lines []string) {
+	for _, l := range lines {
+		b.WriteString(l)
+	}
 }
 
 // Source ETag markers that fold the "Ignore alarms" policy into the
