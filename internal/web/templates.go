@@ -5,39 +5,20 @@ import (
 	"embed"
 	"fmt"
 	"html/template"
-	"io/fs"
 	"net/http"
-	"path/filepath"
 	"sync"
 
 	"github.com/gin-gonic/gin/render"
 )
 
-//go:embed templates/*.html templates/sources/*.html templates/partials/*.html
+// templatesFS holds the server-rendered pages. The UI is the React SPA in
+// web/; the only server-rendered page left is error.html, which the OIDC
+// login, callback and logout handlers render when sign-in fails.
+//
+//go:embed templates/error.html
 var templatesFS embed.FS
 
-// TemplateFuncs returns custom template functions.
-func TemplateFuncs() template.FuncMap {
-	return template.FuncMap{
-		"divide": func(a, b int) int {
-			if b == 0 {
-				return 0
-			}
-			return a / b
-		},
-		"plus": func(a, b int) int {
-			return a + b
-		},
-		"minus": func(a, b int) int {
-			return a - b
-		},
-		"multiply": func(a, b int) int {
-			return a * b
-		},
-	}
-}
-
-// HTMLTemplates implements gin's render.HTMLRender interface with proper layout support.
+// HTMLTemplates implements gin's render.HTMLRender interface.
 type HTMLTemplates struct {
 	templates map[string]*template.Template
 	mu        sync.RWMutex
@@ -80,77 +61,19 @@ func (t *templateRender) WriteContentType(w http.ResponseWriter) {
 	}
 }
 
-// LoadTemplates loads all templates with layout support.
+// LoadTemplates parses the embedded error.html page. It is a standalone
+// document with no layout and no external assets; handlers pass the
+// message as gin.H{"error": ...}.
 func LoadTemplates() (*HTMLTemplates, error) {
-	h := &HTMLTemplates{
-		templates: make(map[string]*template.Template),
-	}
-
-	// Read the layout template
-	layoutContent, err := templatesFS.ReadFile("templates/layout.html")
+	const name = "error.html"
+	tmpl, err := template.ParseFS(templatesFS, "templates/"+name)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read layout.html: %w", err)
+		return nil, fmt.Errorf("failed to parse %s: %w", name, err)
 	}
 
-	// Walk through all templates
-	err = fs.WalkDir(templatesFS, "templates", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		if filepath.Ext(path) != ".html" {
-			return nil
-		}
-
-		// Skip layout.html itself
-		if path == "templates/layout.html" {
-			return nil
-		}
-
-		content, err := templatesFS.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("failed to read %s: %w", path, err)
-		}
-
-		name := path[len("templates/"):]
-
-		// Check if this is a partial (no layout needed)
-		if filepath.Dir(path) == "templates/partials" {
-			tmpl, err := template.New(name).Funcs(TemplateFuncs()).Parse(string(content))
-			if err != nil {
-				return fmt.Errorf("failed to parse partial %s: %w", name, err)
-			}
-			h.templates[name] = tmpl
-			return nil
-		}
-
-		// For regular templates, combine layout + content
-		// First parse the layout
-		tmpl, err := template.New("layout").Funcs(TemplateFuncs()).Parse(string(layoutContent))
-		if err != nil {
-			return fmt.Errorf("failed to parse layout for %s: %w", name, err)
-		}
-
-		// Then parse the page content (which defines "content" template)
-		_, err = tmpl.Parse(string(content))
-		if err != nil {
-			return fmt.Errorf("failed to parse %s: %w", name, err)
-		}
-
-		h.templates[name] = tmpl
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return h, nil
+	return &HTMLTemplates{
+		templates: map[string]*template.Template{name: tmpl},
+	}, nil
 }
 
 // RenderTemplate renders a template to a bytes.Buffer (useful for testing).

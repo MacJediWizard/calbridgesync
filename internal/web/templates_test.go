@@ -2,8 +2,13 @@ package web
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/macjediwizard/calbridgesync/internal/auth"
+	"github.com/macjediwizard/calbridgesync/internal/config"
 )
 
 func TestLoadTemplates(t *testing.T) {
@@ -16,88 +21,94 @@ func TestLoadTemplates(t *testing.T) {
 		t.Fatal("LoadTemplates() returned nil")
 	}
 
-	// Check that expected templates are loaded
-	expectedTemplates := []string{
-		"login.html",
-		"dashboard.html",
-		"error.html",
-		"logs.html",
-		"sources/list.html",
-		"sources/add.html",
-		"sources/edit.html",
-		"partials/error.html",
-		"partials/sync_triggered.html",
+	if _, ok := templates.templates["error.html"]; !ok {
+		t.Error(`template "error.html" not found`)
+	}
+	if len(templates.templates) != 1 {
+		t.Errorf("expected only error.html to be loaded, got %d templates", len(templates.templates))
+	}
+}
+
+func TestRenderErrorTemplate(t *testing.T) {
+	templates, err := LoadTemplates()
+	if err != nil {
+		t.Fatalf("LoadTemplates() error = %v", err)
 	}
 
-	for _, name := range expectedTemplates {
-		if _, ok := templates.templates[name]; !ok {
-			t.Errorf("Template %q not found", name)
+	t.Run("shows the error passed by the handlers", func(t *testing.T) {
+		buf, err := templates.RenderTemplate("error.html", gin.H{"error": "Invalid state parameter"})
+		if err != nil {
+			t.Fatalf("RenderTemplate() error = %v", err)
 		}
-	}
+		html := buf.String()
+
+		if !strings.Contains(html, "<!DOCTYPE html>") {
+			t.Error("expected a standalone HTML document with a doctype")
+		}
+		if !strings.Contains(html, "Invalid state parameter") {
+			t.Errorf("expected the error text in output, got:\n%s", html)
+		}
+	})
+
+	t.Run("loads no external assets", func(t *testing.T) {
+		buf, err := templates.RenderTemplate("error.html", gin.H{"error": "x"})
+		if err != nil {
+			t.Fatalf("RenderTemplate() error = %v", err)
+		}
+		if strings.Contains(buf.String(), "http") {
+			t.Errorf("expected no http(s) URLs in the error page, got:\n%s", buf.String())
+		}
+		if strings.Contains(buf.String(), "<script") {
+			t.Error("expected no scripts in the error page")
+		}
+	})
+
+	t.Run("escapes the error text", func(t *testing.T) {
+		buf, err := templates.RenderTemplate("error.html", gin.H{"error": "<script>alert(1)</script>"})
+		if err != nil {
+			t.Fatalf("RenderTemplate() error = %v", err)
+		}
+		if strings.Contains(buf.String(), "<script>") {
+			t.Error("expected the error text to be HTML-escaped")
+		}
+	})
+
+	t.Run("falls back to a generic message", func(t *testing.T) {
+		buf, err := templates.RenderTemplate("error.html", gin.H{})
+		if err != nil {
+			t.Fatalf("RenderTemplate() error = %v", err)
+		}
+		if !strings.Contains(buf.String(), "An unexpected error occurred.") {
+			t.Error("expected the generic message when no error is passed")
+		}
+	})
 }
 
-func TestRenderLoginTemplate(t *testing.T) {
+// TestCallbackErrorPageShowsError drives the live OIDC callback through gin
+// with the real renderer: a callback without a matching state cookie must
+// render the error page with the handler's message.
+func TestCallbackErrorPageShowsError(t *testing.T) {
 	templates, err := LoadTemplates()
 	if err != nil {
 		t.Fatalf("LoadTemplates() error = %v", err)
 	}
 
-	data := map[string]interface{}{
-		"Title": "Test Login",
+	sm := auth.NewSessionManager("0123456789abcdef0123456789abcdef", false, 3600, 300)
+	h := NewHandlers(&config.Config{}, nil, nil, sm, nil, nil, nil, nil, nil)
+
+	r := gin.New()
+	r.HTMLRender = templates
+	r.GET("/auth/callback", h.Callback)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/callback?state=bogus&code=x", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
 	}
-
-	buf, err := templates.RenderTemplate("login.html", data)
-	if err != nil {
-		t.Fatalf("RenderTemplate() error = %v", err)
-	}
-
-	html := buf.String()
-
-	// Check that the layout is included
-	if !strings.Contains(html, "<!DOCTYPE html>") {
-		t.Error("Expected HTML doctype in output")
-	}
-
-	// Check that the content is included
-	if !strings.Contains(html, "CalBridgeSync") {
-		t.Error("Expected 'CalBridgeSync' in output")
-	}
-
-	if !strings.Contains(html, "Sign in with SSO") {
-		t.Error("Expected 'Sign in with SSO' button in output")
-	}
-
-	// Check that Tailwind CSS is loaded
-	if !strings.Contains(html, "tailwindcss.com") {
-		t.Error("Expected Tailwind CSS script in output")
-	}
-}
-
-func TestRenderPartialTemplate(t *testing.T) {
-	templates, err := LoadTemplates()
-	if err != nil {
-		t.Fatalf("LoadTemplates() error = %v", err)
-	}
-
-	data := map[string]interface{}{
-		"error": "Test error message",
-	}
-
-	buf, err := templates.RenderTemplate("partials/error.html", data)
-	if err != nil {
-		t.Fatalf("RenderTemplate() error = %v", err)
-	}
-
-	html := buf.String()
-
-	// Partials should NOT include the layout
-	if strings.Contains(html, "<!DOCTYPE html>") {
-		t.Error("Partial should not include DOCTYPE")
-	}
-
-	// But should include the error message
-	if !strings.Contains(html, "Test error message") {
-		t.Error("Expected error message in output")
+	if !strings.Contains(w.Body.String(), "Invalid state parameter") {
+		t.Errorf("expected the handler's error in the page, got:\n%s", w.Body.String())
 	}
 }
 
@@ -109,63 +120,12 @@ func TestRenderTemplateNotFound(t *testing.T) {
 
 	_, err = templates.RenderTemplate("nonexistent.html", nil)
 	if err == nil {
-		t.Error("Expected error for nonexistent template")
+		t.Fatal("Expected error for nonexistent template")
 	}
 
 	if !strings.Contains(err.Error(), "template not found") {
 		t.Errorf("Expected 'template not found' error, got: %v", err)
 	}
-}
-
-func TestTemplateFuncs(t *testing.T) {
-	funcs := TemplateFuncs()
-
-	t.Run("divide function", func(t *testing.T) {
-		divide := funcs["divide"].(func(a, b int) int)
-
-		if divide(10, 2) != 5 {
-			t.Error("divide(10, 2) should equal 5")
-		}
-		if divide(7, 3) != 2 {
-			t.Error("divide(7, 3) should equal 2")
-		}
-		if divide(10, 0) != 0 {
-			t.Error("divide(10, 0) should return 0 for division by zero")
-		}
-	})
-
-	t.Run("plus function", func(t *testing.T) {
-		plus := funcs["plus"].(func(a, b int) int)
-
-		if plus(5, 3) != 8 {
-			t.Error("plus(5, 3) should equal 8")
-		}
-		if plus(-5, 10) != 5 {
-			t.Error("plus(-5, 10) should equal 5")
-		}
-	})
-
-	t.Run("minus function", func(t *testing.T) {
-		minus := funcs["minus"].(func(a, b int) int)
-
-		if minus(10, 3) != 7 {
-			t.Error("minus(10, 3) should equal 7")
-		}
-		if minus(5, 10) != -5 {
-			t.Error("minus(5, 10) should equal -5")
-		}
-	})
-
-	t.Run("multiply function", func(t *testing.T) {
-		multiply := funcs["multiply"].(func(a, b int) int)
-
-		if multiply(5, 3) != 15 {
-			t.Error("multiply(5, 3) should equal 15")
-		}
-		if multiply(-2, 4) != -8 {
-			t.Error("multiply(-2, 4) should equal -8")
-		}
-	})
 }
 
 func TestHTMLTemplatesInstance(t *testing.T) {
@@ -175,7 +135,7 @@ func TestHTMLTemplatesInstance(t *testing.T) {
 	}
 
 	t.Run("returns render for existing template", func(t *testing.T) {
-		render := templates.Instance("login.html", map[string]interface{}{"title": "Test"})
+		render := templates.Instance("error.html", gin.H{"error": "Test"})
 		if render == nil {
 			t.Error("Expected render instance")
 		}
@@ -195,7 +155,7 @@ func TestTemplateRenderWriteContentType(t *testing.T) {
 		t.Fatalf("LoadTemplates() error = %v", err)
 	}
 
-	render := templates.Instance("partials/error.html", map[string]interface{}{"error": "test"})
+	render := templates.Instance("error.html", gin.H{"error": "test"})
 
 	// Create a mock response writer
 	w := &mockResponseWriter{header: make(map[string][]string)}
@@ -217,7 +177,7 @@ func TestTemplateRenderWithExistingContentType(t *testing.T) {
 		t.Fatalf("LoadTemplates() error = %v", err)
 	}
 
-	render := templates.Instance("partials/error.html", map[string]interface{}{"error": "test"})
+	render := templates.Instance("error.html", gin.H{"error": "test"})
 
 	// Create a mock response writer with existing Content-Type
 	w := &mockResponseWriter{header: make(map[string][]string)}

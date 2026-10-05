@@ -182,7 +182,7 @@ func main() {
 	router.Use(web.RequestLogger())
 	router.Use(web.SecurityHeaders())
 
-	// Set custom HTML renderer with layout support
+	// HTML renderer for the OIDC error page (the UI itself is the SPA)
 	router.HTMLRender = templates
 
 	// Setup routes

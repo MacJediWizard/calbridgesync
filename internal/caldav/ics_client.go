@@ -115,6 +115,18 @@ func isICSBlockedIP(ip net.IP) (bool, string) {
 // avoids retrofitting if httptest-based ICS tests get added. (#129)
 var icsDialContext = icsLoopbackOnlyDialContext
 
+// SetICSDialContextForTesting replaces the ICS dial function and
+// returns a func that restores the previous one. It exists only so
+// tests in other packages (e.g. internal/web handler tests against an
+// httptest server on 127.0.0.1) can bypass the SSRF guard; production
+// code must never call it. It affects ICS clients built after the
+// swap. Not safe for use by parallel tests. (#215)
+func SetICSDialContextForTesting(fn func(ctx context.Context, network, addr string) (net.Conn, error)) (restore func()) {
+	orig := icsDialContext
+	icsDialContext = fn
+	return func() { icsDialContext = orig }
+}
+
 // ICSClient fetches and parses ICS calendar feeds over HTTP.
 type ICSClient struct {
 	feedURL    string
