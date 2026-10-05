@@ -151,6 +151,54 @@ func TestUnreadable_TwoWay_RowKeptWhenUnreadableOnSourceAndGoneFromDest(t *testi
 	}
 }
 
+// Two-way with deletion passes blocked: the user deleted B on dest,
+// but an unmappable source object stopped the source delete this
+// cycle. The forward loop must not re-create B on dest, or the user's
+// delete is undone for good (same failure as #182). B's row stays so
+// the next readable cycle performs the source delete.
+func TestUnreadable_TwoWay_BlockedDeletesDoNotRecreateDestDelete(t *testing.T) {
+	h := newFlowHarness(t, db.SyncDirectionTwoWay, db.ConflictSourceWins, 0)
+	opaque := flowSrcCal + "opaque-1.ics"
+	h.src.seedAt(opaque, "A", "Event A", flowStart)
+	h.src.seed(flowSrcCal, "B", "Event B", flowStart)
+	h.src.seed(flowSrcCal, "C", "Event C", flowStart)
+	h.cycle()
+	assertNoWarnings(t, "steady", h.cycle())
+
+	h.src.failReadOn(opaque, errFake500)
+	h.dst.remove(destPath("B"))
+	r := h.cycle()
+
+	if !hasWarning(r, "skipping all deletion passes") {
+		t.Errorf("cycle3: warnings = %v, want a skipped-deletion warning", r.Warnings)
+	}
+	assertPaths(t, "cycle3", "source DELETEs", h.src.deleteLog())
+	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog())
+	if _, ok := h.rows()["B"]; !ok {
+		t.Errorf("cycle3: tracking row B was removed while deletes were blocked")
+	}
+
+	// Next cycle the object reads again: the deferred source delete runs.
+	h.src.failReadOn(opaque, nil)
+	r = h.cycle()
+	assertNoWarnings(t, "cycle4", r)
+	assertPaths(t, "cycle4", "source DELETEs", h.src.deleteLog(), srcPath("B"))
+	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
+}
+
+// Two-way: a destination object that cannot be read is not missing, so
+// the forward loop must not re-PUT over it; it may hold dest-side
+// edits this cycle could not see.
+func TestUnreadable_TwoWay_UnreadableDestObjectIsNotOverwritten(t *testing.T) {
+	h := twoWaySetup(t, 0)
+
+	h.dst.failReadOn(destPath("B"), errFake500)
+	h.cycle()
+
+	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "cycle3", "source DELETEs", h.src.deleteLog())
+}
+
 func TestUIDFromObjectPath(t *testing.T) {
 	tests := map[string]string{
 		"/cal/abc.ics":                   "abc",

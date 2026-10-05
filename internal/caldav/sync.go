@@ -1709,6 +1709,20 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// is undone for good. Their tracking rows are kept so the next
 	// cycle outside the window performs the source delete. (#182)
 	deferredSourceDelete := make(map[string]bool)
+	// A tracked event missing from the destination view is withheld
+	// from the source-deletion pass when deletes are blocked or its
+	// destination object was unreadable (#206). Defer it the same way,
+	// so the forward pass neither undoes a dest-side delete nor PUTs
+	// over a destination object it could not read.
+	if syncDirection == db.SyncDirectionTwoWay {
+		for uid := range previouslySyncedMap {
+			_, onSource := sourceEventMap[uid]
+			_, onDest := destEventMap[uid]
+			if onSource && !onDest && (blockDeletes || unreadableUIDs[uid]) {
+				deferredSourceDelete[uid] = true
+			}
+		}
+	}
 	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil && !blockDeletes {
 		// Step 1: dest-deletion via planTwoWayDeletion. The helper's
 		// three guards subsume the previous shouldSkipTwoWayDeletion
