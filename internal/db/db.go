@@ -31,8 +31,19 @@ func New(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("%w: failed to create directory: %w", ErrDatabaseInit, err)
 	}
 
-	// Open the database
-	conn, err := sql.Open("sqlite", dbPath)
+	// Open the database. PRAGMAs are connection-scoped in SQLite, so they are
+	// passed in the DSN: the modernc driver applies each _pragma, in order, to
+	// every connection it opens. Exec-ing them on the pool would only reach
+	// whichever single connection ran the statement. busy_timeout comes first
+	// so the journal_mode switch waits on a locked database instead of failing.
+	// The path must not use a "file:" prefix; modernc strips the query string
+	// from a plain path before opening.
+	dsn := dbPath + "?_pragma=busy_timeout(30000)" + // 30s for concurrent sync operations
+		"&_pragma=foreign_keys(1)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=secure_delete(1)" +
+		"&_pragma=synchronous(NORMAL)"
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to open database: %w", ErrDatabaseInit, err)
 	}
@@ -45,22 +56,6 @@ func New(dbPath string) (*DB, error) {
 	conn.SetConnMaxLifetime(0) // Connections are reused forever
 	conn.SetConnMaxIdleTime(0) // Idle connections are kept forever
 
-	// Configure SQLite for optimal performance and security
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=30000", // 30 seconds to handle concurrent sync operations
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA secure_delete=ON",
-		"PRAGMA synchronous=NORMAL",
-	}
-
-	for _, pragma := range pragmas {
-		if _, err := conn.Exec(pragma); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("%w: failed to set pragma: %w", ErrDatabaseInit, err)
-		}
-	}
-
 	db := &DB{conn: conn}
 
 	// Run migrations
@@ -69,11 +64,17 @@ func New(dbPath string) (*DB, error) {
 		return nil, err
 	}
 
-	// Set file permissions (0600 for security)
-	if err := os.Chmod(dbPath, 0600); err != nil {
-		// Log warning but don't fail - file might not exist yet in WAL mode
-		// or we may not have permission to change it (e.g., running in container)
-		log.Printf("WARNING: Could not set database file permissions to 0600: %v", err)
+	// Set file permissions (0600 for security). The WAL and shared-memory
+	// sidecar files hold the same data as the main file, so restrict them too.
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0600); err != nil {
+			if p != dbPath && errors.Is(err, os.ErrNotExist) {
+				continue // sidecar not created yet
+			}
+			// Log warning but don't fail - we may not have permission to
+			// change it (e.g., running in container)
+			log.Printf("WARNING: Could not set database file permissions to 0600: %v", err)
+		}
 	}
 
 	return db, nil
