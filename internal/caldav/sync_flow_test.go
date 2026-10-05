@@ -218,17 +218,26 @@ func TestSyncFlow_OneWay_CreateUpdateOrphanDelete(t *testing.T) {
 	assertPaths(t, "cycle4", "dest DELETEs", h.dst.deleteLog(), destPath("C"))
 	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle4", "dest contents", h.dst.paths(), destPath("A"), destPath("B"), destPath("Z"))
-	// TODAY (#181): the one-way orphan delete does not remove C's
-	// synced_events row (only the two-way paths do), so the row leaks.
-	// The fix for #181 flips this to rows A, B.
-	assertRowUIDs(t, "cycle4", h.rows(), "A", "B", "C")
+	// The orphan delete also drops C's tracking row (#181).
+	assertRowUIDs(t, "cycle4", h.rows(), "A", "B")
 
-	// Cycle 5: steady again; the leaked row causes no further writes.
+	// Cycle 5: steady again, no further writes.
 	r = h.cycle()
 	assertNoWarnings(t, "cycle5", r)
 	assertCounts(t, "cycle5", r, counts{EventsProcessed: 2})
 	assertPaths(t, "cycle5", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle5", "dest DELETEs", h.dst.deleteLog())
+
+	// Cycle 6: UID C shows up on the destination again, written by
+	// someone else. This source no longer owns it, so it must not be
+	// deleted (with a leaked row it was deleted again, #181).
+	h.dst.seed(flowDestCal, "C", "Restored C", flowStart)
+	r = h.cycle()
+	assertNoWarnings(t, "cycle6", r)
+	assertCounts(t, "cycle6", r, counts{EventsProcessed: 2})
+	assertPaths(t, "cycle6", "dest DELETEs", h.dst.deleteLog())
+	assertPaths(t, "cycle6", "dest contents", h.dst.paths(), destPath("A"), destPath("B"), destPath("C"), destPath("Z"))
+	assertRowUIDs(t, "cycle6", h.rows(), "A", "B")
 }
 
 // twoWaySetup runs the first two cycles shared by the two-way tests:
