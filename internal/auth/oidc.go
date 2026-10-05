@@ -90,7 +90,8 @@ func (p *OIDCProvider) Exchange(ctx context.Context, code, verifier string) (*oa
 }
 
 // VerifyIDToken verifies the ID token, checks that its nonce matches the
-// one issued for this login attempt, and extracts claims.
+// one issued for this login attempt, extracts claims, and requires
+// email_verified=true.
 func (p *OIDCProvider) VerifyIDToken(ctx context.Context, token *oauth2.Token, nonce string) (*OIDCClaims, error) {
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
@@ -113,6 +114,12 @@ func (p *OIDCProvider) VerifyIDToken(ctx context.Context, token *oauth2.Token, n
 
 	if claims.Email == "" {
 		return nil, ErrMissingEmail
+	}
+
+	// Users are matched by email, so an address the IdP has not verified
+	// must not log in. A missing claim decodes to false and is rejected too.
+	if !claims.EmailVerified {
+		return nil, ErrEmailNotVerified
 	}
 
 	return &claims, nil

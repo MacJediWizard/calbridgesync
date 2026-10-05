@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -152,6 +153,12 @@ func (h *Handlers) Callback(c *gin.Context) {
 
 	// Verify ID token and get claims
 	claims, err := h.oidc.VerifyIDToken(c.Request.Context(), token, loginState.Nonce)
+	if errors.Is(err, auth.ErrEmailNotVerified) {
+		c.HTML(http.StatusForbidden, "error.html", gin.H{
+			"error": "Your email address is not verified with the identity provider",
+		})
+		return
+	}
 	if err != nil {
 		c.HTML(http.StatusBadRequest, "error.html", gin.H{
 			"error": "Failed to verify token",
