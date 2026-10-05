@@ -1769,6 +1769,17 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			}
 			result.EventsProcessed++
 			updateProgress()
+		} else if syncDirection == db.SyncDirectionTwoWay &&
+			source.ConflictStrategy == db.ConflictDestWins &&
+			shouldUpdateDestFromSource(sourceEvent.ETag, previouslySyncedMap[sourceEvent.UID]) &&
+			isRealConflictSourceWins(previouslySyncedMap[sourceEvent.UID], destEvent.ETag) {
+			// Both sides moved since the last sync and the user chose
+			// dest_wins. Do not PUT the source copy over the
+			// destination edit, and leave currentUIDs alone: the
+			// dest_wins pass below owns this UID and records it after
+			// it pushes the destination copy back to the source.
+			result.EventsProcessed++
+			updateProgress()
 		} else if shouldUpdateDestFromSource(sourceEvent.ETag, previouslySyncedMap[sourceEvent.UID]) {
 			// Source ETag has changed since the last recorded sync
 			// (or this is a first-time update with tracked ETags).
@@ -2020,9 +2031,15 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					}
 					// Record the dest ETag we just propagated back
 					// to source so the next cycle can detect another
-					// dest-side change. We don't know the new source
-					// ETag PutEvent just created — next read cycle
-					// will populate it. (#79)
+					// dest-side change. PutEvent does not return the
+					// new source ETag, so sourceETag stays empty. The
+					// next cycle heals it: shouldUpdateDestFromSource
+					// skips an empty stored ETag, so the forward loop
+					// takes the unchanged branch and records both
+					// current ETags. Do not carry prev.SourceETag
+					// forward here: it would differ from the ETag our
+					// own PUT just minted and trigger a pointless
+					// source→dest PUT next cycle (#79 class).
 					currentUIDs[destEvent.UID] = syncETagEntry{
 						destETag: destEvent.ETag,
 					}
