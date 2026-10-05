@@ -49,6 +49,7 @@ func NewOAuthClient(ctx context.Context, baseURL string, oauthConfig *oauth2.Con
 		MaxIdleConns:        10,
 		IdleConnTimeout:     30 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext:         dialCalDAV, // SSRF guard (#200)
 	}
 
 	// oauth2.Transport wraps baseTransport and injects the bearer

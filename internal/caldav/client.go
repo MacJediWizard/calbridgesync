@@ -178,6 +178,7 @@ func NewClient(baseURL, username, password string) (*Client, error) {
 		MaxIdleConns:        10,
 		IdleConnTimeout:     30 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext:         dialCalDAV, // SSRF guard (#200)
 	}
 
 	httpClient := &http.Client{

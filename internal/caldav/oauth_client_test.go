@@ -72,6 +72,7 @@ func TestNewOAuthClient_RejectsMissingRefreshToken(t *testing.T) {
 // mock CalDAV server that inspects the header and a mock OAuth2
 // token endpoint that returns a canned access token. (#70)
 func TestOAuthClient_InjectsBearerToken(t *testing.T) {
+	allowLoopbackDial(t)
 	var caldavAuthHeader atomic.Value
 	caldavServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		caldavAuthHeader.Store(r.Header.Get("Authorization"))
@@ -130,6 +131,7 @@ func TestOAuthClient_InjectsBearerToken(t *testing.T) {
 // with the stored refresh token. This is the happy-path scenario
 // for long-running Google sources that sit idle between syncs. (#70)
 func TestOAuthClient_RefreshHitsTokenEndpoint(t *testing.T) {
+	allowLoopbackDial(t)
 	var tokenHits atomic.Int32
 	var receivedRefreshToken atomic.Value
 

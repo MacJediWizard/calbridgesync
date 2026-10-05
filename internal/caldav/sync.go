@@ -2152,7 +2152,18 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		}
 		toDelete = slices.DeleteFunc(toDelete, func(e Event) bool { return unreadableUIDs[e.UID] }) // #206
 		for _, event := range toDelete {
-			if err := destClient.DeleteEvent(ctx, event.Path); err != nil {
+			// Same success-only cleanup invariant as the two-way
+			// deletion passes: a leaked row would keep this source
+			// "owning" the UID and delete it again if it reappears. (#181)
+			if err := performDeletionAndCleanup(
+				ctx,
+				destClient,
+				se.db,
+				event.Path,
+				source.ID,
+				calendar.Path,
+				event.UID,
+			); err != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to delete orphan event: %v", err))
 			} else {
 				result.Deleted++
@@ -2494,6 +2505,12 @@ func (se *SyncEngine) TestICSConnection(ctx context.Context, url, username, pass
 const finishSyncPersistenceWarningPrefix = "sync persistence failure: "
 
 func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
+	// Scrub dial failures to non-public addresses before the text
+	// reaches the sync log, the activity tracker or (via the returned
+	// result) scheduler alerts. (#200 review)
+	result.Errors = scrubInternalDialErrors(result.Errors)
+	result.Warnings = scrubInternalDialErrors(result.Warnings)
+
 	// Determine status: error > partial > success
 	var status db.SyncStatus
 	if !result.Success {
