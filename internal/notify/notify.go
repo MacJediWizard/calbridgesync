@@ -371,9 +371,60 @@ func sanitizeForEmail(s string) string {
 	return s
 }
 
-// IsEnabled returns true if any notification method is enabled.
+// IsEnabled returns true if any GLOBAL notification channel is enabled.
+// It ignores per-user preferences, so it is only the right gate for
+// operator-only alerts that have no owning user. Alerts for a user's
+// source must gate on HasChannelsFor instead. (#222)
 func (n *Notifier) IsEnabled() bool {
 	return n.cfg.WebhookEnabled || n.cfg.EmailEnabled
+}
+
+// alertChannels is the set of channels an alert for one user goes to.
+type alertChannels struct {
+	globalWebhook bool // operator's ALERT_WEBHOOK_URL
+	userWebhook   bool // the user's personal webhook
+	adminEmail    bool // operator's ALERT_SMTP_TO recipients
+	userEmail     bool // the user's own address
+}
+
+func (c alertChannels) any() bool {
+	return c.globalWebhook || c.userWebhook || c.adminEmail || c.userEmail
+}
+
+// channelsFor resolves which channels an alert goes to. Global flags
+// gate only the global channels (global webhook, admin recipients); a
+// user preference can opt out of those but never turns on a channel the
+// operator disabled. Per-user channels follow the user's preference,
+// independent of the global flags: the personal webhook is on when its
+// URL is set unless the user disabled webhooks, and the user's own
+// email follows their email preference (falling back to the global
+// flag when unset) and needs an SMTP host to send through. (#222)
+func (n *Notifier) channelsFor(userPrefs *UserPreferences) alertChannels {
+	var webhookPref, emailPref *bool
+	if userPrefs != nil {
+		webhookPref, emailPref = userPrefs.WebhookEnabled, userPrefs.EmailEnabled
+	}
+	optedOut := func(p *bool) bool { return p != nil && !*p }
+
+	userEmail := n.cfg.EmailEnabled
+	if emailPref != nil {
+		userEmail = *emailPref
+	}
+	smtpConfigured := n.cfg.SMTPHost != ""
+
+	return alertChannels{
+		globalWebhook: n.cfg.WebhookEnabled && n.cfg.WebhookURL != "" && !optedOut(webhookPref),
+		userWebhook:   userPrefs != nil && userPrefs.WebhookURL != "" && !optedOut(webhookPref),
+		adminEmail:    n.cfg.EmailEnabled && smtpConfigured && !optedOut(emailPref),
+		userEmail:     userEmail && smtpConfigured,
+	}
+}
+
+// HasChannelsFor reports whether an alert for a user with these
+// preferences would go to at least one channel. userPrefs may be nil
+// (no preferences saved), in which case only the global channels count.
+func (n *Notifier) HasChannelsFor(userPrefs *UserPreferences) bool {
+	return n.channelsFor(userPrefs).any()
 }
 
 // maxSendAttempts returns the configured retry count for this notifier,
@@ -635,24 +686,15 @@ func (n *Notifier) sendEmail(ctx context.Context, alert Alert, recipients []stri
 		auth = smtp.PlainAuth("", n.cfg.SMTPUsername, n.cfg.SMTPPassword, n.cfg.SMTPHost)
 	}
 
-	// Retry transient SMTP failures. SMTP errors are mostly transient
-	// (connection drops, TLS hiccups, temporary server rejection) and
-	// the isTransientSMTPError classifier is intentionally permissive —
-	// the outer cooldown loop (PR #34) will eventually give up on
-	// persistently broken destinations by not retrying for another
-	// full cooldown window.
+	// Retry transient SMTP failures (connection drops, timeouts, 4xx
+	// replies). isTransientSMTPError treats 5xx replies as permanent so
+	// a rejected recipient or bad credentials fail fast; the outer
+	// cooldown loop (PR #34) retries those on a later cycle.
 	//
-	// Context is honored during backoff sleeps via retryTransient.
-	// Note: the stdlib smtp.SendMail itself does not take a context,
-	// so a mid-attempt cancellation only affects the sleep between
-	// attempts, not the send in progress.
+	// Each attempt is bounded by smtpTimeout and by ctx (sendEmailOnce
+	// closes the connection when ctx is cancelled).
 	return retryTransient(ctx, n.maxSendAttempts(), n.initialBackoff(), func(ctx context.Context) error {
-		var err error
-		if n.cfg.SMTPTLS {
-			err = n.sendEmailTLS(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
-		} else {
-			err = smtp.SendMail(addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
-		}
+		err := n.sendEmailOnce(ctx, addr, auth, n.cfg.SMTPFrom, recipients, []byte(msg))
 		if err != nil {
 			return fmt.Errorf("send email: %w", err)
 		}
@@ -661,24 +703,65 @@ func (n *Notifier) sendEmail(ctx context.Context, alert Alert, recipients []stri
 	}, isTransientSMTPError)
 }
 
-// sendEmailTLS sends email over TLS (for port 465).
-func (n *Notifier) sendEmailTLS(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+// smtpTimeout bounds a single SMTP send attempt: dial plus the whole
+// conversation. Without it a server that accepts the connection but
+// never answers hangs the send forever. A var so tests can shorten it.
+var smtpTimeout = 30 * time.Second
+
+// sendEmailOnce performs one SMTP send. With SMTPTLS it dials implicit
+// TLS (port 465); otherwise it dials plain TCP and upgrades with
+// STARTTLS when the server offers it, matching smtp.SendMail. The dial
+// and the whole conversation share one deadline of smtpTimeout (or
+// ctx's deadline, if sooner), and the connection is closed if ctx is
+// cancelled, so a silent or stalled server cannot hang the caller.
+func (n *Notifier) sendEmailOnce(ctx context.Context, addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
+	deadline := time.Now().Add(smtpTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	dialCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	tlsConfig := &tls.Config{
 		ServerName: n.cfg.SMTPHost,
 		MinVersion: tls.VersionTLS12, // Require TLS 1.2 or higher for security
 	}
+	netDialer := &net.Dialer{}
 
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
-	if err != nil {
-		return fmt.Errorf("dial TLS: %w", err)
+	var conn net.Conn
+	var err error
+	if n.cfg.SMTPTLS {
+		conn, err = (&tls.Dialer{NetDialer: netDialer, Config: tlsConfig}).DialContext(dialCtx, "tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dial TLS: %w", err)
+		}
+	} else {
+		conn, err = netDialer.DialContext(dialCtx, "tcp", addr)
+		if err != nil {
+			return fmt.Errorf("dial: %w", err)
+		}
 	}
 	defer conn.Close()
+
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	client, err := smtp.NewClient(conn, n.cfg.SMTPHost)
 	if err != nil {
 		return fmt.Errorf("create SMTP client: %w", err)
 	}
 	defer client.Close()
+
+	if !n.cfg.SMTPTLS {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(tlsConfig); err != nil {
+				return fmt.Errorf("starttls: %w", err)
+			}
+		}
+	}
 
 	if auth != nil {
 		if err := client.Auth(auth); err != nil {
@@ -985,14 +1068,10 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 	anyAttempted := false
 	anyDelivered := false
 
-	// Determine if webhook is enabled (user pref overrides global)
-	webhookEnabled := n.cfg.WebhookEnabled
-	if userPrefs != nil && userPrefs.WebhookEnabled != nil {
-		webhookEnabled = *userPrefs.WebhookEnabled
-	}
+	channels := n.channelsFor(userPrefs)
 
 	// Send to global webhook if enabled
-	if webhookEnabled && n.cfg.WebhookURL != "" {
+	if channels.globalWebhook {
 		anyAttempted = true
 		if err := n.sendWebhook(ctx, alert); err != nil {
 			log.Printf("[Notify] Webhook error: %v", err)
@@ -1002,29 +1081,18 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 	}
 
 	// Send to user's personal webhook if configured and enabled
-	if userPrefs != nil && userPrefs.WebhookURL != "" {
-		userWebhookEnabled := true // Default to enabled if URL is set
-		if userPrefs.WebhookEnabled != nil {
-			userWebhookEnabled = *userPrefs.WebhookEnabled
-		}
-		if userWebhookEnabled {
-			anyAttempted = true
-			if err := n.sendWebhookToURL(ctx, alert, userPrefs.WebhookURL); err != nil {
-				log.Printf("[Notify] User webhook error: %v", err)
-			} else {
-				anyDelivered = true
-			}
+	if channels.userWebhook {
+		anyAttempted = true
+		if err := n.sendWebhookToURL(ctx, alert, userPrefs.WebhookURL); err != nil {
+			log.Printf("[Notify] User webhook error: %v", err)
+		} else {
+			anyDelivered = true
 		}
 	}
 
-	// Determine if email is enabled (user pref overrides global)
-	emailEnabled := n.cfg.EmailEnabled
-	if userPrefs != nil && userPrefs.EmailEnabled != nil {
-		emailEnabled = *userPrefs.EmailEnabled
-	}
-
-	if emailEnabled {
-		// Build recipient list: user email + admin emails (deduplicated).
+	if channels.userEmail || channels.adminEmail {
+		// Build recipient list: user email and/or admin emails
+		// (deduplicated), each only when its channel is enabled.
 		//
 		// Every address goes through isValidEmail before being added
 		// to the set. User email was already validated; admin emails
@@ -1052,9 +1120,13 @@ func (n *Notifier) sendWithPrefs(ctx context.Context, alert Alert, userPrefs *Us
 			recipientSet[strings.ToLower(email)] = struct{}{}
 		}
 
-		addIfValid(alert.UserEmail)
-		for _, email := range n.cfg.SMTPTo {
-			addIfValid(email)
+		if channels.userEmail {
+			addIfValid(alert.UserEmail)
+		}
+		if channels.adminEmail {
+			for _, email := range n.cfg.SMTPTo {
+				addIfValid(email)
+			}
 		}
 
 		// Convert to slice

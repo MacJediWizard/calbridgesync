@@ -1,6 +1,10 @@
 package scheduler
 
 import (
+	"net"
+	"net/textproto"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -844,14 +848,14 @@ func newTestSchedulerWithNotifier(t *testing.T) (*Scheduler, *notify.Notifier) {
 		EmailEnabled:   false,
 		CooldownPeriod: time.Hour,
 	})
-	// Notifier must be "enabled" for the scheduler to call it. With both
-	// channels disabled, IsEnabled() returns false — so to exercise the
-	// path we enable webhook but do not set a URL. sendWithPrefs then
-	// no-ops on the empty URL branch.
+	// The notifier must have a channel for the scheduler to call it
+	// (HasChannelsFor). Enable global email with an SMTP host but no
+	// admin recipients: with a nil DB there is no user email either, so
+	// sendWithPrefs builds an empty recipient list and never dials.
 	n = notify.New(&notify.Config{
-		WebhookEnabled: true,
-		WebhookURL:     "", // empty URL — send is a no-op
-		EmailEnabled:   false,
+		WebhookEnabled: false,
+		EmailEnabled:   true,
+		SMTPHost:       "smtp.invalid", // never dialed: no recipients
 		CooldownPeriod: time.Hour,
 	})
 	sched := New(nil, nil, n)
@@ -1011,5 +1015,114 @@ func TestIsAuthError_GoogleInvalidGrant(t *testing.T) {
 	}
 	if sched.isAuthError(notAuth) {
 		t.Error("a network timeout must not be classified as an auth error")
+	}
+}
+
+// recordingSMTPServer runs a minimal plaintext SMTP server (no STARTTLS,
+// no AUTH) and sends the RCPT TO addresses of every accepted message on
+// the returned channel.
+func recordingSMTPServer(t *testing.T) (port int, messages <-chan []string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	out := make(chan []string, 4)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				tp := textproto.NewConn(c)
+				_ = tp.PrintfLine("220 fake ESMTP")
+				var rcpts []string
+				for {
+					line, err := tp.ReadLine()
+					if err != nil {
+						return
+					}
+					cmd := strings.ToUpper(line)
+					switch {
+					case strings.HasPrefix(cmd, "RCPT TO:"):
+						addr := strings.Trim(strings.TrimSpace(line[len("RCPT TO:"):]), "<>")
+						rcpts = append(rcpts, strings.ToLower(addr))
+						_ = tp.PrintfLine("250 ok")
+					case strings.HasPrefix(cmd, "DATA"):
+						_ = tp.PrintfLine("354 go ahead")
+						if _, err := tp.ReadDotLines(); err != nil {
+							return
+						}
+						out <- rcpts
+						_ = tp.PrintfLine("250 queued")
+					case strings.HasPrefix(cmd, "QUIT"):
+						_ = tp.PrintfLine("221 bye")
+						return
+					default:
+						_ = tp.PrintfLine("250 ok")
+					}
+				}
+			}(c)
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port, out
+}
+
+// TestMaybeSendFailureAlert_UserChannelFiresWhenGlobalDisabled verifies
+// that a user's own alert channel works even when the server-wide alert
+// flags are off. Previously the scheduler gated every per-user alert on
+// notifier.IsEnabled(), which reads only the global flags, so a user who
+// enabled alerts in Settings never received one. Global flags gate only
+// the global channels, so the admin ALERT_SMTP_TO list must not be
+// emailed either. (#222)
+func TestMaybeSendFailureAlert_UserChannelFiresWhenGlobalDisabled(t *testing.T) {
+	database, err := db.New(filepath.Join(t.TempDir(), "alerts.db"))
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	defer database.Close()
+
+	user, err := database.GetOrCreateUser("user@example.com", "User")
+	if err != nil {
+		t.Fatalf("GetOrCreateUser: %v", err)
+	}
+	enabled := true
+	if err := database.UpsertUserAlertPreferences(&db.UserAlertPreferences{
+		UserID:       user.ID,
+		EmailEnabled: &enabled,
+	}); err != nil {
+		t.Fatalf("UpsertUserAlertPreferences: %v", err)
+	}
+
+	port, messages := recordingSMTPServer(t)
+	n := notify.New(&notify.Config{
+		WebhookEnabled:  false,
+		EmailEnabled:    false, // global email channel off
+		SMTPHost:        "127.0.0.1",
+		SMTPPort:        port,
+		SMTPFrom:        "calbridgesync@example.com",
+		SMTPTo:          []string{"admin@example.com"},
+		CooldownPeriod:  time.Hour,
+		MaxSendAttempts: 1,
+	})
+	sched := New(database, nil, n)
+	defer sched.cancel()
+
+	source := &db.Source{ID: "src-user-channel", Name: "User Source", UserID: user.ID}
+	sched.maybeSendFailureAlert(source.ID, source, &caldav.SyncResult{
+		Success: false,
+		Message: "sync failed",
+	})
+
+	select {
+	case rcpts := <-messages:
+		if len(rcpts) != 1 || rcpts[0] != "user@example.com" {
+			t.Errorf("alert recipients = %v, want only [user@example.com] (admin list is a disabled global channel)", rcpts)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no alert reached the user's email channel while global alert flags were off")
 	}
 }

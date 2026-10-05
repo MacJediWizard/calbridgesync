@@ -1706,6 +1706,154 @@ func TestAPICreateSource(t *testing.T) {
 	})
 }
 
+// syncBoundsCfg is the config used by the interval/days-past bounds tests.
+func syncBoundsCfg() *config.Config {
+	return &config.Config{Sync: config.SyncConfig{MinInterval: 30, MaxInterval: 86400}}
+}
+
+const syncBoundsUpdateBase = `"name": "Test Source", "source_type": "custom", "source_url": "https://example.com/caldav", "source_username": "user", "dest_url": "https://dest.com/caldav", "dest_username": "destuser", "sync_direction": "one_way", "conflict_strategy": "source_wins"`
+
+func doSyncBoundsUpdate(t *testing.T, th *testHandlers, userID, sourceID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/"+sourceID, strings.NewReader(body))
+	c.Params = gin.Params{{Key: "id", Value: sourceID}}
+	setAuthContext(c, userID, "test@example.com")
+	th.handlers.APIUpdateSource(c)
+	return w
+}
+
+// TestAPISourceSyncBounds: out-of-range sync_interval and sync_days_past < 1
+// are rejected with 400 instead of being silently clamped to MIN (create) or
+// ignored (update).
+func TestAPISourceSyncBounds(t *testing.T) {
+	updateCases := []struct {
+		name     string
+		interval int
+		daysPast int
+	}{
+		{"interval above max", 86401, 30},
+		{"interval below min", 29, 30},
+		{"interval zero", 0, 30},
+		{"days past zero", 3600, 0},
+		{"days past negative", 3600, -5},
+	}
+	for _, tc := range updateCases {
+		t.Run("update rejects "+tc.name, func(t *testing.T) {
+			th := setupTestHandlers(t)
+			defer th.cleanup()
+			th.handlers.cfg = syncBoundsCfg()
+
+			userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+			body := fmt.Sprintf(`{%s, "sync_interval": %d, "sync_days_past": %d}`, syncBoundsUpdateBase, tc.interval, tc.daysPast)
+			w := doSyncBoundsUpdate(t, th, userID, source.ID, body)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+
+	t.Run("update accepts values at the bounds", func(t *testing.T) {
+		th := setupTestHandlers(t)
+		defer th.cleanup()
+		th.handlers.cfg = syncBoundsCfg()
+
+		userID, source := createTestUserAndSource(t, th.db, "test@example.com", "Test Source")
+		body := fmt.Sprintf(`{%s, "sync_interval": 86400, "sync_days_past": 1}`, syncBoundsUpdateBase)
+		w := doSyncBoundsUpdate(t, th, userID, source.ID, body)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		stored, err := th.db.GetSourceByIDForUser(source.ID, userID)
+		if err != nil {
+			t.Fatalf("reload source: %v", err)
+		}
+		if stored.SyncInterval != 86400 || stored.SyncDaysPast != 1 {
+			t.Errorf("expected interval 86400 / days 1, got %d / %d", stored.SyncInterval, stored.SyncDaysPast)
+		}
+	})
+
+	createCases := []struct {
+		name     string
+		interval int
+		daysPast int
+		wantErr  string
+	}{
+		{"interval above max", 86401, 30, "interval"},
+		{"interval below min", 10, 30, "interval"},
+		{"days past zero", 3600, 0, "past"},
+	}
+	for _, tc := range createCases {
+		t.Run("create rejects "+tc.name, func(t *testing.T) {
+			th := setupTestHandlers(t)
+			defer th.cleanup()
+			th.handlers.cfg = syncBoundsCfg()
+
+			user, _ := th.db.GetOrCreateUser("test@example.com", "Test User")
+			// The bounds check runs before the connection test, so this
+			// unreachable URL is never dialed.
+			body := fmt.Sprintf(`{"name": "Test", "source_type": "custom", "source_url": "https://127.0.0.1:1/caldav", "source_username": "user", "source_password": "pass", "sync_interval": %d, "sync_days_past": %d}`, tc.interval, tc.daysPast)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/sources", strings.NewReader(body))
+			setAuthContext(c, user.ID, "test@example.com")
+
+			th.handlers.APICreateSource(c)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(strings.ToLower(w.Body.String()), tc.wantErr) {
+				t.Fatalf("expected a %q validation error, got %s", tc.wantErr, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestAPIGetSyncLimits(t *testing.T) {
+	th := setupTestHandlers(t)
+	defer th.cleanup()
+	th.handlers.cfg = syncBoundsCfg()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/settings/sync-limits", nil)
+	setAuthContext(c, "u1", "test@example.com")
+
+	th.handlers.APIGetSyncLimits(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var got map[string]int
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["min_sync_interval"] != 30 || got["max_sync_interval"] != 86400 {
+		t.Errorf("unexpected limits: %v", got)
+	}
+}
+
+func TestClampSyncInterval(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{0, 30},
+		{29, 30},
+		{30, 30},
+		{3600, 3600},
+		{86400, 86400},
+		{86401, 86400},
+		{9223372037, 86400},
+	}
+	for _, tc := range cases {
+		if got := clampSyncInterval(tc.in, 30, 86400); got != tc.want {
+			t.Errorf("clampSyncInterval(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestAPIDiscoverCalendars(t *testing.T) {
 	t.Run("returns bad request for invalid JSON", func(t *testing.T) {
 		th := setupTestHandlers(t)
@@ -2011,6 +2159,7 @@ func updateSourceBody(src *db.Source) map[string]any {
 		"dest_url":          src.DestURL,
 		"dest_username":     src.DestUsername,
 		"sync_interval":     src.SyncInterval,
+		"sync_days_past":    30, // fixtures store 0, which #225 rejects
 		"sync_direction":    string(src.SyncDirection),
 		"conflict_strategy": string(src.ConflictStrategy),
 	}
@@ -2027,6 +2176,10 @@ func callUpdateSource(t *testing.T, th *testHandlers, userID, sourceID string, b
 	c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/"+sourceID, strings.NewReader(string(raw)))
 	c.Params = gin.Params{{Key: "id", Value: sourceID}}
 	setAuthContext(c, userID, "test@example.com")
+	if th.handlers.cfg == nil {
+		// The update path validates interval bounds against cfg. (#225)
+		th.handlers.cfg = syncBoundsCfg()
+	}
 	th.handlers.APIUpdateSource(c)
 	return w
 }

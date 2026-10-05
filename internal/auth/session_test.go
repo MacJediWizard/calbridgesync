@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -769,6 +770,57 @@ func TestContextKeySession(t *testing.T) {
 	t.Run("constant has expected value", func(t *testing.T) {
 		if ContextKeySession != "session" {
 			t.Errorf("expected ContextKeySession to be 'session', got %q", ContextKeySession)
+		}
+	})
+}
+
+func TestOIDCLoginState(t *testing.T) {
+	sm := NewSessionManager("test-secret-key-at-least-32-chars", false, 86400, 300)
+
+	carry := func(w *httptest.ResponseRecorder) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		for _, cookie := range w.Result().Cookies() {
+			r.AddCookie(cookie)
+		}
+		return r
+	}
+
+	t.Run("round-trips state, nonce and verifier", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		want := &OIDCLoginState{State: "s", Nonce: "n", Verifier: "v"}
+		if err := sm.SetOIDCLoginState(w, httptest.NewRequest(http.MethodGet, "/", nil), want); err != nil {
+			t.Fatalf("SetOIDCLoginState: %v", err)
+		}
+		got, err := sm.GetOIDCLoginState(httptest.NewRecorder(), carry(w))
+		if err != nil {
+			t.Fatalf("GetOIDCLoginState: %v", err)
+		}
+		if *got != *want {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("rejects a state-only cookie from the Google flow", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		if err := sm.SetOAuthState(w, httptest.NewRequest(http.MethodGet, "/", nil), "google:abc"); err != nil {
+			t.Fatalf("SetOAuthState: %v", err)
+		}
+		if _, err := sm.GetOIDCLoginState(httptest.NewRecorder(), carry(w)); !errors.Is(err, ErrInvalidSession) {
+			t.Fatalf("err = %v, want ErrInvalidSession", err)
+		}
+	})
+
+	t.Run("SetOAuthState drops a leftover login nonce and verifier", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		if err := sm.SetOIDCLoginState(w, httptest.NewRequest(http.MethodGet, "/", nil), &OIDCLoginState{State: "s", Nonce: "n", Verifier: "v"}); err != nil {
+			t.Fatalf("SetOIDCLoginState: %v", err)
+		}
+		w2 := httptest.NewRecorder()
+		if err := sm.SetOAuthState(w2, carry(w), "google:abc"); err != nil {
+			t.Fatalf("SetOAuthState: %v", err)
+		}
+		if _, err := sm.GetOIDCLoginState(httptest.NewRecorder(), carry(w2)); !errors.Is(err, ErrInvalidSession) {
+			t.Fatalf("err = %v, want ErrInvalidSession", err)
 		}
 	})
 }

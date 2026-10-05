@@ -56,10 +56,13 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	}
 
 	// Protected API routes with rate limiting, origin validation, and content-type validation
+	// CSRF origin check, built once from Config.Server.AllowedOrigins (#239).
+	originCheck := ValidateOrigin(h.cfg.Server.AllowedOrigins)
+
 	protectedAPI := r.Group("/api")
 	protectedAPI.Use(apiRateLimiter)
 	protectedAPI.Use(auth.RequireAuth(sm))
-	protectedAPI.Use(ValidateOrigin())         // CSRF protection via origin check
+	protectedAPI.Use(originCheck)              // CSRF protection via origin check
 	protectedAPI.Use(RequireJSONContentType()) // Validate Content-Type header
 	{
 		protectedAPI.GET("/dashboard/stats", h.APIDashboardStats)
@@ -78,6 +81,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		protectedAPI.GET("/settings/alerts", h.APIGetAlertPreferences)
 		protectedAPI.PUT("/settings/alerts", h.APIUpdateAlertPreferences)
 		protectedAPI.GET("/settings/log-stats", h.APIGetLogStats)
+		protectedAPI.GET("/settings/sync-limits", h.APIGetSyncLimits)
 		protectedAPI.GET("/audit-logs", h.APIGetAuditLogs)
 		protectedAPI.GET("/sources/:id/destinations", h.APIListDestinations)
 		protectedAPI.POST("/sources/:id/destinations", h.APICreateDestination)
@@ -91,7 +95,7 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	expensiveAPI := r.Group("/api")
 	expensiveAPI.Use(expensiveRateLimiter)
 	expensiveAPI.Use(auth.RequireAuth(sm))
-	expensiveAPI.Use(ValidateOrigin())
+	expensiveAPI.Use(originCheck)
 	expensiveAPI.Use(RequireJSONContentType())
 	{
 		expensiveAPI.POST("/sources", h.APICreateSource)                               // Tests connections to CalDAV servers

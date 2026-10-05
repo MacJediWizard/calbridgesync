@@ -81,7 +81,7 @@ func (h *flowHarness) cycle() *SyncResult {
 	h.t.Helper()
 	h.src.resetLog()
 	h.dst.resetLog()
-	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1)
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1, false)
 	if len(res.Errors) > 0 {
 		h.t.Fatalf("fullSync returned errors: %v", res.Errors)
 	}
@@ -301,44 +301,30 @@ func TestSyncFlow_TwoWay_CreateReverseCreateAndDeletes(t *testing.T) {
 	assertPaths(t, "cycle3", "source PUTs", h.src.putLog())
 	assertRowUIDs(t, "cycle3", h.rows(), "B", "C", "D", "X")
 
-	// Cycle 4: deleted on dest -> deleted from source.
-	//
-	// TODAY (audit 2026-10-03, remediation PR-08): the forward loop
-	// iterates the sourceEvents slice, not sourceEventMap, so B is
-	// deleted from source and then re-created on dest in the same
-	// cycle. Its tracking row survives through the forward-pass upsert.
+	// Cycle 4: deleted on dest -> deleted from source. The forward
+	// loop must not re-create B on dest in the same cycle (#220): dest
+	// sees zero PUTs and B's tracking row is gone.
 	h.dst.remove(destPath("B"))
 	r = h.cycle()
 	assertNoWarnings(t, "cycle4", r)
-	assertCounts(t, "cycle4", r, counts{Created: 1, Deleted: 1, EventsProcessed: 4})
+	assertCounts(t, "cycle4", r, counts{Deleted: 1, EventsProcessed: 3})
 	assertPaths(t, "cycle4", "source DELETEs", h.src.deleteLog(), srcPath("B"))
 	assertPaths(t, "cycle4", "dest DELETEs", h.dst.deleteLog())
-	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog(), destPath("B"))
+	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle4", "source PUTs", h.src.putLog())
-	assertRowUIDs(t, "cycle4", h.rows(), "B", "C", "D", "X")
+	assertRowUIDs(t, "cycle4", h.rows(), "C", "D", "X")
 	assertPaths(t, "cycle4", "source contents", h.src.paths(), srcPath("C"), srcPath("D"), srcPath("X"))
-	assertPaths(t, "cycle4", "dest contents", h.dst.paths(), destPath("B"), destPath("C"), destPath("D"), destPath("X"))
+	assertPaths(t, "cycle4", "dest contents", h.dst.paths(), destPath("C"), destPath("D"), destPath("X"))
 
-	// Cycle 5: TODAY the re-created dest copy of B is now "deleted on
-	// source", so the dest-deletion pass removes it and the row goes.
+	// Cycle 5: steady; there is no re-created copy to undo.
 	r = h.cycle()
 	assertNoWarnings(t, "cycle5", r)
-	assertCounts(t, "cycle5", r, counts{Deleted: 1, EventsProcessed: 3})
-	assertPaths(t, "cycle5", "dest DELETEs", h.dst.deleteLog(), destPath("B"))
-	assertPaths(t, "cycle5", "source DELETEs", h.src.deleteLog())
+	assertCounts(t, "cycle5", r, counts{EventsProcessed: 3})
 	assertPaths(t, "cycle5", "dest PUTs", h.dst.putLog())
 	assertPaths(t, "cycle5", "source PUTs", h.src.putLog())
+	assertPaths(t, "cycle5", "dest DELETEs", h.dst.deleteLog())
+	assertPaths(t, "cycle5", "source DELETEs", h.src.deleteLog())
 	assertRowUIDs(t, "cycle5", h.rows(), "C", "D", "X")
-	assertPaths(t, "cycle5", "dest contents", h.dst.paths(), destPath("C"), destPath("D"), destPath("X"))
-
-	// Cycle 6: steady.
-	r = h.cycle()
-	assertNoWarnings(t, "cycle6", r)
-	assertCounts(t, "cycle6", r, counts{EventsProcessed: 3})
-	assertPaths(t, "cycle6", "dest PUTs", h.dst.putLog())
-	assertPaths(t, "cycle6", "source PUTs", h.src.putLog())
-	assertPaths(t, "cycle6", "dest DELETEs", h.dst.deleteLog())
-	assertPaths(t, "cycle6", "source DELETEs", h.src.deleteLog())
 }
 
 func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
@@ -349,16 +335,36 @@ func TestSyncFlow_TwoWay_SourceDeleteBlockedBySafetyThreshold(t *testing.T) {
 	h.dst.remove(destPath("B"))
 	r := h.cycle()
 	assertNoWarnings(t, "cycle3", r)
-	// TODAY (#182): the source delete is skipped by the safety
-	// threshold and the forward pass then re-creates B on dest, because
-	// B is still on source and no longer on dest. The user's dest-side
-	// delete is undone. The fix for #182 flips this to no dest PUT.
-	assertCounts(t, "cycle3", r, counts{Created: 1, EventsProcessed: 5})
+	// The source delete is deferred by the safety threshold, and the
+	// forward pass must not re-create B on dest: that would undo the
+	// user's dest-side delete for good (#182). B's row stays so the
+	// next cycle outside the window can perform the source delete.
+	assertCounts(t, "cycle3", r, counts{EventsProcessed: 5})
 	assertPaths(t, "cycle3", "source DELETEs", h.src.deleteLog())
-	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog(), destPath("B"))
+	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog())
 	assertRowUIDs(t, "cycle3", h.rows(), "A", "B", "C", "D", "X")
 	if _, ok := h.src.get(srcPath("B")); !ok {
 		t.Errorf("cycle3: source B was deleted despite the safety threshold")
+	}
+	if _, ok := h.dst.get(destPath("B")); ok {
+		t.Errorf("cycle3: dest B was re-created while its source delete was deferred")
+	}
+
+	// Cycle 4: outside the window, the deferred source delete happens
+	// and the forward loop does not re-PUT B to dest (#220).
+	h.source.SyncInterval = 0
+	r = h.cycle()
+	assertNoWarnings(t, "cycle4", r)
+	if r.Deleted != 1 {
+		t.Errorf("cycle4: Deleted = %d, want 1", r.Deleted)
+	}
+	assertPaths(t, "cycle4", "source DELETEs", h.src.deleteLog(), srcPath("B"))
+	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
+	if _, ok := h.src.get(srcPath("B")); ok {
+		t.Errorf("cycle4: source B still present after the window passed")
+	}
+	if _, ok := h.dst.get(destPath("B")); ok {
+		t.Errorf("cycle4: dest B was re-created after its source delete")
 	}
 }
 
@@ -407,10 +413,74 @@ func TestSyncEventsToDestination_TypedNilSourceClientIsTreatedAsNil(t *testing.T
 			t.Fatalf("syncEventsToDestination panicked with a typed-nil source client: %v", p)
 		}
 	}()
-	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, h.cal, 1, db.SyncDirectionTwoWay)
+	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, FetchReport{}, h.cal, 1, db.SyncDirectionTwoWay, false)
 	if len(r.Errors) > 0 {
 		t.Fatalf("errors: %v", r.Errors)
 	}
 	assertPaths(t, "typed-nil", "source DELETEs", h.src.deleteLog())
 	assertPaths(t, "typed-nil", "source PUTs", h.src.putLog())
+}
+
+// TestFlow_TrackingReadErrorAbortsCalendar: when the synced_events rows
+// can't be read, the calendar pass must fail before any write. Running
+// on with an empty prior state would reverse-create every
+// destination-only event on the source, re-PUT every source event, and
+// disable the ratio guards (they key off len(previouslySynced)).
+func TestFlow_TrackingReadErrorAbortsCalendar(t *testing.T) {
+	h := newFlowHarness(t, db.SyncDirectionTwoWay, db.ConflictSourceWins, 60)
+	h.src.seed(flowSrcCal, "A", "Source A", flowStart)
+	h.dst.seed(flowDestCal, "B", "Dest only B", "20300202T100000Z")
+
+	if err := h.db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1, false)
+
+	if len(res.Errors) == 0 {
+		t.Fatalf("expected an error when tracking rows can't be read, got none (warnings: %v)", res.Warnings)
+	}
+	if !strings.Contains(strings.Join(res.Errors, "\n"), "synced events") {
+		t.Errorf("errors = %v, want one naming the synced-events read", res.Errors)
+	}
+	assertPaths(t, "tracking read error", "source PUTs", h.src.putLog())
+	assertPaths(t, "tracking read error", "source DELETEs", h.src.deleteLog())
+	assertPaths(t, "tracking read error", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "tracking read error", "dest DELETEs", h.dst.deleteLog())
+	assertCounts(t, "tracking read error", res, counts{})
+}
+
+// TestFlow_DestFetchErrorAbortsCalendar: when the destination
+// GetEvents call fails, the calendar pass must fail before any planner
+// or write. Proceeding with an empty destination view re-PUTs every
+// source event to the destination and runs the deletion planners
+// against a destination that only looks empty.
+func TestFlow_DestFetchErrorAbortsCalendar(t *testing.T) {
+	h := twoWaySetup(t, 0)
+	// A source edit that would otherwise be pushed forward, and a
+	// tracked event gone from the source that would otherwise be
+	// deleted from the destination.
+	h.src.edit(srcPath("A"), "Event A edited")
+	h.src.remove(srcPath("B"))
+	h.dst.failOn(flowDestCal, fakeErr("500 Internal Server Error"))
+	rowsBefore := h.rows()
+
+	h.src.resetLog()
+	h.dst.resetLog()
+	res := h.se.fullSync(context.Background(), h.source, h.src, h.dst, h.cal, 1, false)
+
+	if len(res.Errors) == 0 {
+		t.Fatalf("expected an error when destination events can't be fetched, got none (warnings: %v)", res.Warnings)
+	}
+	if !strings.Contains(strings.Join(res.Errors, "\n"), "destination events") {
+		t.Errorf("errors = %v, want one naming the destination fetch", res.Errors)
+	}
+	assertPaths(t, "dest fetch error", "source PUTs", h.src.putLog())
+	assertPaths(t, "dest fetch error", "source DELETEs", h.src.deleteLog())
+	assertPaths(t, "dest fetch error", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "dest fetch error", "dest DELETEs", h.dst.deleteLog())
+	assertCounts(t, "dest fetch error", res, counts{})
+	if rowsAfter := h.rows(); !reflect.DeepEqual(rowsAfter, rowsBefore) {
+		t.Errorf("dest fetch error: synced_events changed: before %v, after %v", rowsBefore, rowsAfter)
+	}
 }

@@ -518,12 +518,9 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		return
 	}
 
-	// Defaults for the sync interval + days past — same clamping as
-	// APICreateSource.
-	syncInterval := pending.SyncInterval
-	if syncInterval < h.cfg.Sync.MinInterval || syncInterval > h.cfg.Sync.MaxInterval {
-		syncInterval = h.cfg.Sync.MinInterval
-	}
+	// The callback is a browser redirect, so an out-of-range interval is
+	// clamped to the nearest bound rather than rejected with a 400.
+	syncInterval := clampSyncInterval(pending.SyncInterval, h.cfg.Sync.MinInterval, h.cfg.Sync.MaxInterval)
 	syncDaysPast := pending.SyncDaysPast
 	if syncDaysPast <= 0 {
 		syncDaysPast = 30

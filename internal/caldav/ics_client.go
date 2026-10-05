@@ -257,7 +257,7 @@ func NewICSClient(feedURL, username, password string) (*ICSClient, error) {
 	}
 
 	httpClient := &http.Client{
-		Timeout:   defaultTimeout,
+		Timeout:   requestTimeout(),
 		Transport: transport,
 	}
 

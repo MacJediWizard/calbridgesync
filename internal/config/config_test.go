@@ -201,45 +201,6 @@ func TestGetEnvFunctions(t *testing.T) {
 			t.Error("expected error for invalid integer")
 		}
 	})
-
-	t.Run("getEnvFloat returns default when not set", func(t *testing.T) {
-		restore := cleanup([]string{"TEST_FLOAT"})
-		defer restore()
-
-		os.Unsetenv("TEST_FLOAT")
-		result, err := getEnvFloat("TEST_FLOAT", 3.14)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result != 3.14 {
-			t.Errorf("expected 3.14, got %f", result)
-		}
-	})
-
-	t.Run("getEnvFloat parses float value", func(t *testing.T) {
-		restore := cleanup([]string{"TEST_FLOAT"})
-		defer restore()
-
-		os.Setenv("TEST_FLOAT", "2.718")
-		result, err := getEnvFloat("TEST_FLOAT", 3.14)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result != 2.718 {
-			t.Errorf("expected 2.718, got %f", result)
-		}
-	})
-
-	t.Run("getEnvFloat returns error for invalid float", func(t *testing.T) {
-		restore := cleanup([]string{"TEST_FLOAT"})
-		defer restore()
-
-		os.Setenv("TEST_FLOAT", "not-a-float")
-		_, err := getEnvFloat("TEST_FLOAT", 3.14)
-		if err == nil {
-			t.Error("expected error for invalid float")
-		}
-	})
 }
 
 func TestEnvironmentConstants(t *testing.T) {
@@ -319,7 +280,7 @@ func TestLoad(t *testing.T) {
 		"ENCRYPTION_KEY", "SESSION_SECRET", "SESSION_MAX_AGE_SECS", "OAUTH_STATE_MAX_AGE_SECS",
 		"DATABASE_PATH",
 		"DEFAULT_DEST_URL",
-		"RATE_LIMIT_RPS", "RATE_LIMIT_BURST",
+		"CALDAV_REQUEST_TIMEOUT", "ALLOWED_ORIGINS",
 		"MIN_SYNC_INTERVAL", "MAX_SYNC_INTERVAL",
 		"TRUSTED_PROXIES",
 	}
@@ -387,17 +348,11 @@ func TestLoad(t *testing.T) {
 		if cfg.Database.Path != "./data/calbridgesync.db" {
 			t.Errorf("expected default database path, got %q", cfg.Database.Path)
 		}
-		if cfg.RateLimiting.RPS != 10.0 {
-			t.Errorf("expected default RPS 10.0, got %f", cfg.RateLimiting.RPS)
-		}
-		if cfg.RateLimiting.Burst != 20 {
-			t.Errorf("expected default Burst 20, got %d", cfg.RateLimiting.Burst)
-		}
 		if cfg.Sync.MinInterval != 30 {
 			t.Errorf("expected default MinInterval 30, got %d", cfg.Sync.MinInterval)
 		}
-		if cfg.Sync.MaxInterval != 3600 {
-			t.Errorf("expected default MaxInterval 3600, got %d", cfg.Sync.MaxInterval)
+		if cfg.Sync.MaxInterval != 86400 {
+			t.Errorf("expected default MaxInterval 86400, got %d", cfg.Sync.MaxInterval)
 		}
 		if cfg.Security.SessionMaxAgeSecs != 86400 {
 			t.Errorf("expected default SessionMaxAgeSecs 86400, got %d", cfg.Security.SessionMaxAgeSecs)
@@ -416,8 +371,6 @@ func TestLoad(t *testing.T) {
 		os.Setenv("PORT", "9000")
 		os.Setenv("ENVIRONMENT", "development")
 		os.Setenv("DATABASE_PATH", "/custom/path.db")
-		os.Setenv("RATE_LIMIT_RPS", "5.5")
-		os.Setenv("RATE_LIMIT_BURST", "10")
 		os.Setenv("MIN_SYNC_INTERVAL", "60")
 		os.Setenv("MAX_SYNC_INTERVAL", "7200")
 		os.Setenv("SESSION_MAX_AGE_SECS", "3600")
@@ -436,12 +389,6 @@ func TestLoad(t *testing.T) {
 		}
 		if cfg.Database.Path != "/custom/path.db" {
 			t.Errorf("expected custom database path, got %q", cfg.Database.Path)
-		}
-		if cfg.RateLimiting.RPS != 5.5 {
-			t.Errorf("expected RPS 5.5, got %f", cfg.RateLimiting.RPS)
-		}
-		if cfg.RateLimiting.Burst != 10 {
-			t.Errorf("expected Burst 10, got %d", cfg.RateLimiting.Burst)
 		}
 		if cfg.Sync.MinInterval != 60 {
 			t.Errorf("expected MinInterval 60, got %d", cfg.Sync.MinInterval)
@@ -583,38 +530,6 @@ func TestLoad(t *testing.T) {
 		}
 		if !errors.Is(err, ErrSessionSecretSize) {
 			t.Errorf("expected ErrSessionSecretSize, got %v", err)
-		}
-	})
-
-	t.Run("returns error for invalid RATE_LIMIT_RPS", func(t *testing.T) {
-		restore := cleanup()
-		defer restore()
-		clearAllEnvVars()
-		setRequiredEnvVars()
-		os.Setenv("RATE_LIMIT_RPS", "not-a-float")
-
-		_, err := Load()
-		if err == nil {
-			t.Fatal("expected error for invalid RATE_LIMIT_RPS")
-		}
-		if !errors.Is(err, ErrInvalidConfig) {
-			t.Errorf("expected ErrInvalidConfig, got %v", err)
-		}
-	})
-
-	t.Run("returns error for invalid RATE_LIMIT_BURST", func(t *testing.T) {
-		restore := cleanup()
-		defer restore()
-		clearAllEnvVars()
-		setRequiredEnvVars()
-		os.Setenv("RATE_LIMIT_BURST", "not-an-int")
-
-		_, err := Load()
-		if err == nil {
-			t.Fatal("expected error for invalid RATE_LIMIT_BURST")
-		}
-		if !errors.Is(err, ErrInvalidConfig) {
-			t.Errorf("expected ErrInvalidConfig, got %v", err)
 		}
 	})
 
@@ -778,19 +693,6 @@ func TestConfigStructs(t *testing.T) {
 		}
 	})
 
-	t.Run("RateLimitConfig has expected fields", func(t *testing.T) {
-		rlc := RateLimitConfig{
-			RPS:   10.0,
-			Burst: 20,
-		}
-		if rlc.RPS != 10.0 {
-			t.Error("RPS field not working")
-		}
-		if rlc.Burst != 20 {
-			t.Error("Burst field not working")
-		}
-	})
-
 	t.Run("SyncConfig has expected fields", func(t *testing.T) {
 		sc := SyncConfig{
 			MinInterval: 30,
@@ -806,13 +708,12 @@ func TestConfigStructs(t *testing.T) {
 
 	t.Run("Config has all sub-configs", func(t *testing.T) {
 		cfg := Config{
-			Server:       ServerConfig{Port: 8080},
-			OIDC:         OIDCConfig{Issuer: "https://auth.example.com"},
-			Security:     SecurityConfig{SessionSecret: "secret"},
-			Database:     DatabaseConfig{Path: "/path"},
-			CalDAV:       CalDAVConfig{DefaultDestURL: "https://caldav.example.com"},
-			RateLimiting: RateLimitConfig{RPS: 10.0},
-			Sync:         SyncConfig{MinInterval: 30},
+			Server:   ServerConfig{Port: 8080},
+			OIDC:     OIDCConfig{Issuer: "https://auth.example.com"},
+			Security: SecurityConfig{SessionSecret: "secret"},
+			Database: DatabaseConfig{Path: "/path"},
+			CalDAV:   CalDAVConfig{DefaultDestURL: "https://caldav.example.com"},
+			Sync:     SyncConfig{MinInterval: 30},
 		}
 		if cfg.Server.Port != 8080 {
 			t.Error("Server sub-config not working")
@@ -828,9 +729,6 @@ func TestConfigStructs(t *testing.T) {
 		}
 		if cfg.CalDAV.DefaultDestURL != "https://caldav.example.com" {
 			t.Error("CalDAV sub-config not working")
-		}
-		if cfg.RateLimiting.RPS != 10.0 {
-			t.Error("RateLimiting sub-config not working")
 		}
 		if cfg.Sync.MinInterval != 30 {
 			t.Error("Sync sub-config not working")
@@ -873,82 +771,229 @@ func TestGoogleOAuthConfig_Enabled(t *testing.T) {
 // TestValidateAllowedOriginsForProd covers the production-mode
 // hard-fail from #101: if ENVIRONMENT=production and ALLOWED_ORIGINS
 // is unset, Config.Validate must return an error. Development mode
-// and explicitly-set production values must pass cleanly.
+// and explicitly-set production values must pass cleanly. The input
+// is the parsed Config.Server.AllowedOrigins list (#239), so a
+// whitespace-only env value arrives here as an empty list and fails.
 func TestValidateAllowedOriginsForProd(t *testing.T) {
 	cases := []struct {
-		name        string
-		isProd      bool
-		envVar      string
-		wantErr     bool
-		wantErrType error
+		name    string
+		isProd  bool
+		origins []string
+		wantErr bool
 	}{
-		{
-			name:    "dev mode + empty is OK (localhost defaults)",
-			isProd:  false,
-			envVar:  "",
-			wantErr: false,
-		},
-		{
-			name:    "dev mode + explicit is OK",
-			isProd:  false,
-			envVar:  "http://localhost:3000",
-			wantErr: false,
-		},
-		{
-			name:        "prod mode + empty is a hard fail",
-			isProd:      true,
-			envVar:      "",
-			wantErr:     true,
-			wantErrType: ErrValidationFailed,
-		},
-		{
-			name:    "prod mode + single origin is OK",
-			isProd:  true,
-			envVar:  "https://calbridgesync.example.com",
-			wantErr: false,
-		},
-		{
-			name:    "prod mode + multiple origins is OK",
-			isProd:  true,
-			envVar:  "https://calbridgesync.example.com,https://admin.example.com",
-			wantErr: false,
-		},
-		{
-			// The validator only checks "non-empty." Format
-			// validation (isValidOrigin) happens later in
-			// middleware.go's getAllowedOrigins. A whitespace-only
-			// value makes it past this check but then gets logged
-			// as invalid by middleware and falls back to empty,
-			// which in turn blocks all non-empty origins. That's
-			// a deployment bug but not our job to catch here —
-			// the goal of this check is the far-more-common
-			// "operator forgot to set it" case.
-			name:    "prod mode + whitespace-only env passes (not our layer to format-check)",
-			isProd:  true,
-			envVar:  "   ",
-			wantErr: false,
-		},
+		{name: "dev mode + empty is OK (localhost defaults)", isProd: false, origins: nil},
+		{name: "dev mode + explicit is OK", isProd: false, origins: []string{"http://localhost:3000"}},
+		{name: "prod mode + empty is a hard fail", isProd: true, origins: nil, wantErr: true},
+		{name: "prod mode + single origin is OK", isProd: true, origins: []string{"https://calbridgesync.example.com"}},
+		{name: "prod mode + multiple origins is OK", isProd: true, origins: []string{"https://calbridgesync.example.com", "https://admin.example.com"}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateAllowedOriginsForProd(tc.isProd, tc.envVar)
+			err := validateAllowedOriginsForProd(tc.isProd, tc.origins)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want error, got nil")
 				}
-				if tc.wantErrType != nil && !errors.Is(err, tc.wantErrType) {
-					t.Errorf("want error type %v, got %v", tc.wantErrType, err)
+				if !errors.Is(err, ErrValidationFailed) {
+					t.Errorf("want ErrValidationFailed, got %v", err)
 				}
 				// The error message should mention ALLOWED_ORIGINS so
 				// operators can grep the startup logs and find it.
 				if !strings.Contains(err.Error(), "ALLOWED_ORIGINS") {
 					t.Errorf("error message must mention ALLOWED_ORIGINS for operator grep-ability, got: %v", err)
 				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
+			} else if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// validProdConfig returns a production Config that passes Validate.
+func validProdConfig() *Config {
+	return &Config{
+		Server: ServerConfig{
+			BaseURL:        "https://calbridgesync.example.com",
+			Environment:    EnvProduction,
+			AllowedOrigins: []string{"https://calbridgesync.example.com"},
+		},
+		OIDC: OIDCConfig{
+			Issuer:      "https://auth.example.com",
+			RedirectURL: "https://calbridgesync.example.com/auth/callback",
+		},
+		CalDAV: CalDAVConfig{DefaultDestURL: "https://caldav.example.com/dav/"},
+	}
+}
+
+// TestConfigValidate covers the startup validation wired in #239.
+func TestConfigValidate(t *testing.T) {
+	t.Run("valid production config passes", func(t *testing.T) {
+		if err := validProdConfig().Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("unreachable issuer passes because there is no network call", func(t *testing.T) {
+		cfg := validProdConfig()
+		// .invalid is reserved (RFC 2606) and never resolves.
+		cfg.OIDC.Issuer = "https://idp.unreachable.invalid/realms/x"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("http issuer fails", func(t *testing.T) {
+		cfg := validProdConfig()
+		cfg.OIDC.Issuer = "http://auth.example.com"
+		err := cfg.Validate()
+		if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), "OIDC_ISSUER") {
+			t.Fatalf("want OIDC_ISSUER validation error, got %v", err)
+		}
+	})
+
+	t.Run("production with empty origins fails", func(t *testing.T) {
+		cfg := validProdConfig()
+		cfg.Server.AllowedOrigins = nil
+		err := cfg.Validate()
+		if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), "ALLOWED_ORIGINS") {
+			t.Fatalf("want ALLOWED_ORIGINS validation error, got %v", err)
+		}
+	})
+
+	t.Run("production http BASE_URL fails", func(t *testing.T) {
+		cfg := validProdConfig()
+		cfg.Server.BaseURL = "http://calbridgesync.example.com"
+		err := cfg.Validate()
+		if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), "BASE_URL") {
+			t.Fatalf("want BASE_URL validation error, got %v", err)
+		}
+	})
+
+	t.Run("production http OIDC_REDIRECT_URL fails", func(t *testing.T) {
+		cfg := validProdConfig()
+		cfg.OIDC.RedirectURL = "http://calbridgesync.example.com/auth/callback"
+		err := cfg.Validate()
+		if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), "OIDC_REDIRECT_URL") {
+			t.Fatalf("want OIDC_REDIRECT_URL validation error, got %v", err)
+		}
+	})
+
+	t.Run("development allows http everywhere and empty origins", func(t *testing.T) {
+		cfg := validProdConfig()
+		cfg.Server.Environment = EnvDevelopment
+		cfg.Server.BaseURL = "http://localhost:8080"
+		cfg.OIDC.RedirectURL = "http://localhost:8080/auth/callback"
+		cfg.CalDAV.DefaultDestURL = "http://caldav.example.com/dav/"
+		cfg.Server.AllowedOrigins = nil
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	destCases := []struct {
+		url     string
+		wantErr bool
+	}{
+		{"http://192.168.1.20:20000/SOGo/dav/", false},
+		{"http://10.0.0.5/dav/", false},
+		{"http://172.18.0.3:20000/SOGo/dav/", false},
+		{"http://127.0.0.1:8800/dav/", false},
+		{"http://[::1]:8800/dav/", false},
+		{"http://[fd00::5]/dav/", false},
+		{"http://localhost:20000/dav/", false},
+		{"http://sogo:20000/SOGo/dav/", false}, // single-label (docker service) name
+		{"https://caldav.example.com/dav/", false},
+		{"http://caldav.example.com/dav/", true},
+		{"http://8.8.8.8/dav/", true},
+		{"http://169.254.169.254/dav/", true},
+		{"ftp://192.168.1.20/dav/", true},
+	}
+	for _, tc := range destCases {
+		t.Run("production DEFAULT_DEST_URL "+tc.url, func(t *testing.T) {
+			cfg := validProdConfig()
+			cfg.CalDAV.DefaultDestURL = tc.url
+			err := cfg.Validate()
+			if tc.wantErr {
+				if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), "DEFAULT_DEST_URL") {
+					t.Fatalf("want DEFAULT_DEST_URL validation error, got %v", err)
 				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadStrictSettings covers the Load-time checks added in #239.
+func TestLoadStrictSettings(t *testing.T) {
+	setRequired := func(t *testing.T) {
+		t.Setenv("BASE_URL", "https://example.com")
+		t.Setenv("OIDC_ISSUER", "https://auth.example.com")
+		t.Setenv("OIDC_CLIENT_ID", "client-id")
+		t.Setenv("OIDC_CLIENT_SECRET", "client-secret")
+		t.Setenv("OIDC_REDIRECT_URL", "https://example.com/callback")
+		t.Setenv("ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+		t.Setenv("SESSION_SECRET", "this-is-a-session-secret-that-is-at-least-32-chars")
+		t.Setenv("DEFAULT_DEST_URL", "https://caldav.example.com")
+		t.Setenv("ENVIRONMENT", "")
+		t.Setenv("ALLOWED_ORIGINS", "")
+		t.Setenv("CALDAV_REQUEST_TIMEOUT", "")
+	}
+
+	for _, env := range []string{"prod", "dev", "staging", "test"} {
+		t.Run("ENVIRONMENT="+env+" fails", func(t *testing.T) {
+			setRequired(t)
+			t.Setenv("ENVIRONMENT", env)
+			_, err := Load()
+			if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "ENVIRONMENT") {
+				t.Fatalf("want ENVIRONMENT ErrInvalidConfig, got %v", err)
+			}
+		})
+	}
+
+	t.Run("ALLOWED_ORIGINS is parsed onto Config", func(t *testing.T) {
+		setRequired(t)
+		t.Setenv("ALLOWED_ORIGINS", " https://a.example.com , ,https://b.example.com")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"https://a.example.com", "https://b.example.com"}
+		if strings.Join(cfg.Server.AllowedOrigins, "|") != strings.Join(want, "|") {
+			t.Fatalf("AllowedOrigins = %q, want %q", cfg.Server.AllowedOrigins, want)
+		}
+	})
+
+	t.Run("whitespace-only ALLOWED_ORIGINS fails production validation", func(t *testing.T) {
+		setRequired(t)
+		t.Setenv("ALLOWED_ORIGINS", "   ")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := cfg.Validate(); !errors.Is(err, ErrValidationFailed) {
+			t.Fatalf("want validation error, got %v", err)
+		}
+	})
+
+	t.Run("CALDAV_REQUEST_TIMEOUT defaults to 300", func(t *testing.T) {
+		setRequired(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.CalDAV.RequestTimeoutSecs != 300 {
+			t.Fatalf("RequestTimeoutSecs = %d, want 300", cfg.CalDAV.RequestTimeoutSecs)
+		}
+	})
+
+	for _, v := range []string{"0", "-5"} {
+		t.Run("CALDAV_REQUEST_TIMEOUT="+v+" fails", func(t *testing.T) {
+			setRequired(t)
+			t.Setenv("CALDAV_REQUEST_TIMEOUT", v)
+			if _, err := Load(); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("want ErrInvalidConfig, got %v", err)
 			}
 		})
 	}

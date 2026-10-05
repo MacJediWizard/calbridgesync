@@ -41,6 +41,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
+	// Fail fast on bad URLs and missing production settings (#239).
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
+	caldav.SetRequestTimeout(time.Duration(cfg.CalDAV.RequestTimeoutSecs) * time.Second)
 
 	// Set Gin mode
 	if cfg.IsProduction() {
