@@ -1520,7 +1520,6 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		key := e.DedupeKey()
 		if key != "|" {
 			destDedupeMap[key] = true
-			log.Printf("Dest dedupe key: %q (UID: %s)", key, e.UID)
 		}
 	}
 
