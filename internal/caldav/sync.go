@@ -5,6 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"path"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -673,6 +677,101 @@ func planOrphanDeletion(
 	return candidates, ""
 }
 
+// planUnreadableExclusions turns the objects a fetch listed but could
+// not read into UIDs the deletion planners must not act on. (#206)
+//
+// A failed object has a path but no parsed UID, and every planner is
+// UID-keyed, so each object is mapped to UIDs by:
+//
+//   - its "<uid>.ics" basename, accepted only when that UID is tracked
+//     in previouslySyncedMap. Every planner only deletes tracked UIDs,
+//     so an untracked basename proves nothing: the object could be any
+//     event on a server whose object names are not UIDs.
+//   - for malformed or empty objects, the raw "UID:" line the client
+//     recovered (UnreadableObject.UID).
+//
+// blockDeletes is true when a transient failure (on either side)
+// cannot be mapped: the unreadable object could be any tracked event,
+// so no deletion pass may run this cycle. A malformed object that
+// cannot be mapped does not block (it would block every cycle until
+// someone repairs it, and it is already recorded in malformed_events);
+// it gets a Warning stating the residual risk.
+func planUnreadableExclusions(
+	sourceUnreadable, destUnreadable []UnreadableObject,
+	previouslySyncedMap map[string]*db.SyncedEvent,
+) (exclude map[string]bool, blockDeletes bool, warnings []string) {
+	exclude = make(map[string]bool)
+	sides := []struct {
+		name string
+		objs []UnreadableObject
+	}{
+		{"source", sourceUnreadable},
+		{"destination", destUnreadable},
+	}
+	for _, side := range sides {
+		var mapped, unmappedTransient, unmappedMalformed []string
+		for _, u := range side.objs {
+			var uids []string
+			if u.UID != "" {
+				uids = append(uids, u.UID)
+			}
+			if uid := uidFromObjectPath(u.Path); uid != "" && uid != u.UID {
+				if _, tracked := previouslySyncedMap[uid]; tracked {
+					uids = append(uids, uid)
+				}
+			}
+			if len(uids) == 0 {
+				if u.Kind == UnreadableTransient {
+					unmappedTransient = append(unmappedTransient, u.Path)
+				} else {
+					unmappedMalformed = append(unmappedMalformed, u.Path)
+				}
+				continue
+			}
+			for _, uid := range uids {
+				exclude[uid] = true
+				mapped = append(mapped, uid)
+			}
+		}
+		if len(mapped) > 0 {
+			sort.Strings(mapped)
+			warnings = append(warnings, fmt.Sprintf(
+				"%d unreadable %s object(s) excluded from deletion this cycle (UIDs: %s)",
+				len(mapped), side.name, strings.Join(mapped, ", ")))
+		}
+		if len(unmappedTransient) > 0 {
+			blockDeletes = true
+			sort.Strings(unmappedTransient)
+			warnings = append(warnings, fmt.Sprintf(
+				"%d unreadable %s object(s) could not be matched to an event UID (first: %s) - "+
+					"skipping all deletion passes for this calendar this cycle",
+				len(unmappedTransient), side.name, unmappedTransient[0]))
+		}
+		if len(unmappedMalformed) > 0 {
+			sort.Strings(unmappedMalformed)
+			warnings = append(warnings, fmt.Sprintf(
+				"%d malformed or empty %s object(s) could not be matched to an event UID (first: %s) - "+
+					"deletion passes still run; if one of them is a synced event, its copy on the other side may be deleted",
+				len(unmappedMalformed), side.name, unmappedMalformed[0]))
+		}
+	}
+	return exclude, blockDeletes, warnings
+}
+
+// uidFromObjectPath returns the UID a "<uid>.ics" object path names,
+// or "" when the path does not end in .ics.
+func uidFromObjectPath(p string) string {
+	base := path.Base(strings.TrimRight(p, "/"))
+	if len(base) <= len(".ics") || !strings.EqualFold(base[len(base)-len(".ics"):], ".ics") {
+		return ""
+	}
+	base = base[:len(base)-len(".ics")]
+	if decoded, err := url.PathUnescape(base); err == nil {
+		base = decoded
+	}
+	return base
+}
+
 // caldavEventDeleter is the narrow CalDAV client surface that
 // performDeletionAndCleanup needs. Defined as an interface so the
 // unit test for the helper can mock it without spinning up an
@@ -696,6 +795,7 @@ type calendarClient interface {
 	FindCalendarsGoogle(ctx context.Context) ([]Calendar, error)
 	GetCalendarPath() string
 	GetEvents(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, error)
+	GetEventsWithReport(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, FetchReport, error)
 	GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	PutEvent(ctx context.Context, calendarPath string, event *Event) error
 	DeleteEvent(ctx context.Context, eventPath string) error
@@ -1319,7 +1419,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 
 	// Get all events from source
 	updateStatus("fetching source events")
-	sourceEvents, err := sourceClient.GetEvents(ctx, calendar.Path, malformedCollector)
+	sourceEvents, sourceReport, err := sourceClient.GetEventsWithReport(ctx, calendar.Path, malformedCollector)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to get source events: %v", err))
 		return result
@@ -1378,13 +1478,16 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	}
 
 	// Delegate to shared sync logic
-	return se.syncEventsToDestination(ctx, source, sourceClient, destClient, sourceEvents, calendar, calendarIndex, syncDirection)
+	return se.syncEventsToDestination(ctx, source, sourceClient, destClient, sourceEvents, sourceReport, calendar, calendarIndex, syncDirection)
 }
 
 // syncEventsToDestination handles the comparison, creation, update, and deletion of events
 // between source events and a destination CalDAV calendar. This is shared by both CalDAV
 // full sync and ICS feed sync paths.
-func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
+//
+// sourceReport lists source objects that were listed but could not be
+// read; the ICS path passes an empty report. (#206)
+func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.Source, sourceClient, destClient calendarClient, sourceEvents []Event, sourceReport FetchReport, calendar Calendar, calendarIndex int, syncDirection db.SyncDirection) *SyncResult {
 	sourceClient = nilIfTypedNil(sourceClient)
 	result := &SyncResult{
 		Errors:   make([]string, 0),
@@ -1473,7 +1576,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 
 	// Get all events from destination (no collector needed - we only track source issues)
 	updateStatus("fetching destination events")
-	destEvents, err := destClient.GetEvents(ctx, destCalendarPath, nil)
+	destEvents, destReport, err := destClient.GetEventsWithReport(ctx, destCalendarPath, nil)
 	if err != nil {
 		// Abort this calendar before any planner or write. Proceeding
 		// with an empty destination view (the #93 behavior) re-PUTs
@@ -1520,6 +1623,22 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	for _, syncedEvt := range previouslySynced {
 		previouslySyncedMap[syncedEvt.EventUID] = syncedEvt
 	}
+
+	// Objects either side listed but could not read are NOT deleted
+	// events (#206). Their UIDs are filtered out of every deletion
+	// plan below; if a transient failure cannot be tied to a UID at
+	// all, every deletion pass is skipped for this calendar this cycle.
+	// Creates and updates still run.
+	unreadableUIDs, blockDeletes, unreadableWarnings := planUnreadableExclusions(
+		sourceReport.Unreadable,
+		destReport.Unreadable,
+		previouslySyncedMap,
+	)
+	for _, w := range unreadableWarnings {
+		log.Printf("WARNING: %s", w)
+		result.Warnings = append(result.Warnings, w)
+	}
+	isUnreadableUID := func(uid string) bool { return unreadableUIDs[uid] }
 
 	// Create maps for comparison by UID
 	sourceEventMap := make(map[string]Event)
@@ -1590,7 +1709,21 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// is undone for good. Their tracking rows are kept so the next
 	// cycle outside the window performs the source delete. (#182)
 	deferredSourceDelete := make(map[string]bool)
-	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil {
+	// A tracked event missing from the destination view is withheld
+	// from the source-deletion pass when deletes are blocked or its
+	// destination object was unreadable (#206). Defer it the same way,
+	// so the forward pass neither undoes a dest-side delete nor PUTs
+	// over a destination object it could not read.
+	if syncDirection == db.SyncDirectionTwoWay {
+		for uid := range previouslySyncedMap {
+			_, onSource := sourceEventMap[uid]
+			_, onDest := destEventMap[uid]
+			if onSource && !onDest && (blockDeletes || unreadableUIDs[uid]) {
+				deferredSourceDelete[uid] = true
+			}
+		}
+	}
+	if syncDirection == db.SyncDirectionTwoWay && sourceClient != nil && !blockDeletes {
 		// Step 1: dest-deletion via planTwoWayDeletion. The helper's
 		// three guards subsume the previous shouldSkipTwoWayDeletion
 		// check for this direction and add empty-source + ratio
@@ -1605,6 +1738,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			log.Printf("WARNING: %s", deletionWarning)
 			result.Warnings = append(result.Warnings, deletionWarning)
 		}
+		toDeleteFromDest = slices.DeleteFunc(toDeleteFromDest, isUnreadableUID) // #206
 		// Track which UIDs the dest-deletion pass already handled so
 		// the source-deletion pass below skips them.
 		handledByDestDelete := make(map[string]bool, len(toDeleteFromDest))
@@ -1655,6 +1789,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			log.Printf("WARNING: %s", sourceDelWarning)
 			result.Warnings = append(result.Warnings, sourceDelWarning)
 		}
+		toDeleteFromSource = slices.DeleteFunc(toDeleteFromSource, isUnreadableUID) // #206
 		// Track UIDs handled by either deletion pass so the cleanup
 		// loop below skips them when reaping orphan synced_events.
 		handledBySourceDelete := make(map[string]bool, len(toDeleteFromSource))
@@ -1712,7 +1847,8 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 		// either deletion pass above to avoid double-deletes from
 		// synced_events.
 		for uid, syncedEvent := range previouslySyncedMap {
-			if handledByDestDelete[uid] || handledBySourceDelete[uid] {
+			// An unreadable UID is not "deleted from both". (#206)
+			if handledByDestDelete[uid] || handledBySourceDelete[uid] || unreadableUIDs[uid] {
 				continue
 			}
 			_, existsOnSource := sourceEventMap[uid]
@@ -2066,7 +2202,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// destination event whenever the source returned 0 events (auth failure,
 	// broken URL, filter wipeout) or whenever multiple sources shared a
 	// destination (each source would delete the others' events on every cycle).
-	if syncDirection == db.SyncDirectionOneWay && source.ConflictStrategy == db.ConflictSourceWins {
+	if syncDirection == db.SyncDirectionOneWay && source.ConflictStrategy == db.ConflictSourceWins && !blockDeletes {
 		toDelete, warning := planOrphanDeletion(
 			destEventMap,
 			len(sourceEvents),
@@ -2077,6 +2213,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			log.Printf("WARNING: %s", warning)
 			result.Warnings = append(result.Warnings, warning)
 		}
+		toDelete = slices.DeleteFunc(toDelete, func(e Event) bool { return unreadableUIDs[e.UID] }) // #206
 		for _, event := range toDelete {
 			// Same success-only cleanup invariant as the two-way
 			// deletion passes: a leaked row would keep this source
@@ -2345,7 +2482,7 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	se.tracker.UpdateCalendar(source.ID, calendar.Name, 1)
 
 	// Use shared sync logic — ICS is always one-way, sourceClient is nil (no write-back)
-	syncResult := se.syncEventsToDestination(ctx, source, nil, destClient, sourceEvents, calendar, 1, db.SyncDirectionOneWay)
+	syncResult := se.syncEventsToDestination(ctx, source, nil, destClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay)
 
 	result.Created = syncResult.Created
 	result.Updated = syncResult.Updated
@@ -2385,7 +2522,7 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 			result.Warnings = append(result.Warnings, fmt.Sprintf("Connection test failed for additional dest %q: %v", dest.Name, testErr))
 			continue
 		}
-		extraResult := se.syncEventsToDestination(ctx, source, nil, extraDestClient, sourceEvents, calendar, 1, db.SyncDirectionOneWay)
+		extraResult := se.syncEventsToDestination(ctx, source, nil, extraDestClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay)
 		result.Created += extraResult.Created
 		result.Updated += extraResult.Updated
 		result.Deleted += extraResult.Deleted

@@ -413,7 +413,7 @@ func TestSyncEventsToDestination_TypedNilSourceClientIsTreatedAsNil(t *testing.T
 			t.Fatalf("syncEventsToDestination panicked with a typed-nil source client: %v", p)
 		}
 	}()
-	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, h.cal, 1, db.SyncDirectionTwoWay)
+	r := h.se.syncEventsToDestination(context.Background(), h.source, nilClient, h.dst, events, FetchReport{}, h.cal, 1, db.SyncDirectionTwoWay)
 	if len(r.Errors) > 0 {
 		t.Fatalf("errors: %v", r.Errors)
 	}
