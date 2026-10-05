@@ -1,6 +1,7 @@
 package web
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -372,7 +373,9 @@ func (h *Handlers) testAndCreateSource(c *gin.Context, userID string, form *sour
 		return err
 	}
 
-	h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to schedule source %s: %v", source.ID, err)
+	}
 	return nil
 }
 
@@ -456,7 +459,9 @@ func (h *Handlers) UpdateSource(c *gin.Context) {
 	}
 
 	// Update scheduler
-	h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to reschedule source %s: %v", source.ID, err)
+	}
 
 	if isHTMX(c) {
 		c.Header("HX-Redirect", "/")
@@ -542,7 +547,9 @@ func (h *Handlers) ToggleSource(c *gin.Context) {
 
 	// Update scheduler
 	if source.Enabled {
-		h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+		if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+			log.Printf("Failed to schedule source %s: %v", source.ID, err)
+		}
 	} else {
 		h.scheduler.RemoveJob(source.ID)
 	}

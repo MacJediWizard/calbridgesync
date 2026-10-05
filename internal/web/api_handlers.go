@@ -840,7 +840,9 @@ func (h *Handlers) APICreateSource(c *gin.Context) {
 		return
 	}
 
-	h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to schedule source %s: %v", source.ID, err)
+	}
 
 	c.JSON(http.StatusCreated, h.sourceToAPIWithScheduler(source))
 }
@@ -952,7 +954,9 @@ func (h *Handlers) APIUpdateSource(c *gin.Context) {
 		return
 	}
 
-	h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second)
+	if err := h.scheduler.UpdateJobInterval(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+		log.Printf("Failed to reschedule source %s: %v", source.ID, err)
+	}
 
 	c.JSON(http.StatusOK, h.sourceToAPIWithScheduler(source))
 }
@@ -1007,7 +1011,9 @@ func (h *Handlers) APIToggleSource(c *gin.Context) {
 	}
 
 	if source.Enabled {
-		h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second)
+		if err := h.scheduler.AddJob(source.ID, time.Duration(source.SyncInterval)*time.Second); err != nil {
+			log.Printf("Failed to schedule source %s: %v", source.ID, err)
+		}
 	} else {
 		h.scheduler.RemoveJob(source.ID)
 	}
@@ -1024,20 +1030,8 @@ func (h *Handlers) APITriggerSync(c *gin.Context) {
 	}
 
 	sourceID := c.Param("id")
-	source, err := h.db.GetSourceByIDForUser(sourceID, session.UserID)
-	if err != nil {
+	if _, err := h.db.GetSourceByIDForUser(sourceID, session.UserID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
-		return
-	}
-
-	// Dry-run mode: run the sync synchronously with a dry-run
-	// context so PutEvent/DeleteEvent are no-ops. Returns the
-	// SyncResult as JSON so the user can preview what would
-	// happen without actually changing any data. (#150)
-	if c.Query("dry_run") == "true" {
-		ctx := caldav.WithDryRun(c.Request.Context())
-		result := h.syncEngine.SyncSource(ctx, source)
-		c.JSON(http.StatusOK, result)
 		return
 	}
 
