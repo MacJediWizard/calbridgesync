@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2124,4 +2125,382 @@ func TestAPIDeleteDestinationCrossUser(t *testing.T) {
 	if len(dests) != 1 || dests[0].ID != dest.ID {
 		t.Fatalf("owner's destination must survive cross-user delete, got %+v", dests)
 	}
+}
+
+// principalStub answers the PROPFIND that caldav.Client.TestConnection
+// sends (FindCurrentUserPrincipal) when status is 207; any other status
+// is returned bare, which makes the connection test fail.
+func principalStub(t *testing.T, status int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if status != http.StatusMultiStatus {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMultiStatus)
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:"><d:response><d:href>%s</d:href><d:propstat><d:prop>
+<d:current-user-principal><d:href>/principals/user/</d:href></d:current-user-principal>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// updateSourceBody returns an update request body that leaves every
+// field of src as stored; callers override what they want to change.
+func updateSourceBody(src *db.Source) map[string]any {
+	return map[string]any{
+		"name":              src.Name,
+		"source_type":       string(src.SourceType),
+		"source_url":        src.SourceURL,
+		"source_username":   src.SourceUsername,
+		"dest_url":          src.DestURL,
+		"dest_username":     src.DestUsername,
+		"sync_interval":     src.SyncInterval,
+		"sync_days_past":    30, // fixtures store 0, which #225 rejects
+		"sync_direction":    string(src.SyncDirection),
+		"conflict_strategy": string(src.ConflictStrategy),
+	}
+}
+
+func callUpdateSource(t *testing.T, th *testHandlers, userID, sourceID string, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPut, "/api/sources/"+sourceID, strings.NewReader(string(raw)))
+	c.Params = gin.Params{{Key: "id", Value: sourceID}}
+	setAuthContext(c, userID, "test@example.com")
+	if th.handlers.cfg == nil {
+		// The update path validates interval bounds against cfg. (#225)
+		th.handlers.cfg = syncBoundsCfg()
+	}
+	th.handlers.APIUpdateSource(c)
+	return w
+}
+
+// assertSourceUnchanged fails if the stored source differs from want
+// in any field the update handler writes.
+func assertSourceUnchanged(t *testing.T, database *db.DB, want *db.Source) {
+	t.Helper()
+	got, err := database.GetSourceByID(want.ID)
+	if err != nil {
+		t.Fatalf("GetSourceByID: %v", err)
+	}
+	if got.Name != want.Name || got.SourceType != want.SourceType ||
+		got.SourceURL != want.SourceURL || got.SourceUsername != want.SourceUsername ||
+		got.SourcePassword != want.SourcePassword || got.DestURL != want.DestURL ||
+		got.DestUsername != want.DestUsername || got.DestPassword != want.DestPassword ||
+		got.SyncDirection != want.SyncDirection {
+		t.Errorf("source was written: got %+v, want %+v", got, want)
+	}
+}
+
+// icsStubURL routes ICS dials to stub and returns a base URL on a
+// non-loopback hostname, because validateICSFeedURL refuses 127.0.0.1
+// before any dial. (#215)
+func icsStubURL(t *testing.T, stub *httptest.Server) string {
+	t.Helper()
+	addr := stub.Listener.Addr().String()
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	t.Cleanup(caldav.SetICSDialContextForTesting(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return d.DialContext(ctx, network, addr)
+	}))
+	return "http://feed.test"
+}
+
+// TestAPIUpdateSourceSafety covers the update-path checks: a host
+// change needs the password re-entered and a passing connection test,
+// and the source type cannot change. (PR-26)
+func TestAPIUpdateSourceSafety(t *testing.T) {
+	// The stubs bind to 127.0.0.1, which the CalDAV SSRF guard refuses. (#200)
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	t.Cleanup(caldav.SetDialContextForTesting(d.DialContext))
+
+	t.Run("same host without password still saves", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["name"] = "Renamed"
+		body["source_url"] = "https://EXAMPLE.com/other/path"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+		}
+		got, _ := th.db.GetSourceByID(src.ID)
+		if got.Name != "Renamed" || got.SourcePassword != src.SourcePassword {
+			t.Errorf("got name %q password %q", got.Name, got.SourcePassword)
+		}
+	})
+
+	t.Run("source host change without password returns 400", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["source_url"] = "https://attacker.example.net/caldav"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "re-enter") {
+			t.Errorf("body %s should ask to re-enter the password", w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("source scheme downgrade without password returns 400", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["source_url"] = "http://example.com/caldav"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("dest host change without password returns 400", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["dest_url"] = "https://other-dest.example.net/caldav"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("source type change returns 400", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["source_type"] = string(db.SourceTypeICS)
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("ICS two-way returns 400", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+		src.SourceType = db.SourceTypeICS
+		src.SourceURL = "https://example.com/feed.ics"
+		src.SourceUsername = ""
+		if err := th.db.UpdateSource(src); err != nil {
+			t.Fatalf("UpdateSource: %v", err)
+		}
+
+		body := updateSourceBody(src)
+		body["sync_direction"] = string(db.SyncDirectionTwoWay)
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("source host change with failing connection test returns 400", func(t *testing.T) {
+		stub := principalStub(t, http.StatusUnauthorized)
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["source_url"] = stub.URL + "/caldav/"
+		body["source_password"] = "new-password"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("dest host change with failing connection test returns 400", func(t *testing.T) {
+		stub := principalStub(t, http.StatusUnauthorized)
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		body := updateSourceBody(src)
+		body["dest_url"] = stub.URL + "/caldav/"
+		body["dest_password"] = "new-password"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	t.Run("ICS per-calendar two-way returns 400", func(t *testing.T) {
+		th, _ := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+		src.SourceType = db.SourceTypeICS
+		src.SourceURL = "https://example.com/feed.ics"
+		src.SourceUsername = ""
+		if err := th.db.UpdateSource(src); err != nil {
+			t.Fatalf("UpdateSource: %v", err)
+		}
+
+		body := updateSourceBody(src)
+		body["selected_calendars"] = []map[string]any{
+			{"path": "/feed", "sync_direction": string(db.SyncDirectionTwoWay)},
+		}
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", w.Code, w.Body.String())
+		}
+		assertSourceUnchanged(t, th.db, src)
+	})
+
+	// Issue #215 review: an ICS origin change without a username skips
+	// the password prompt, so the old password must not survive it.
+	// Otherwise a second edit that only adds a username (same origin,
+	// no check) makes the next sync send Basic auth with the old
+	// password to the new host.
+	t.Run("ICS host change without password clears stored password", func(t *testing.T) {
+		var sawAuth atomic.Bool
+		feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "" {
+				sawAuth.Store(true)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(feed.Close)
+		feedURL := icsStubURL(t, feed)
+
+		th, enc := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+		oldPw, err := enc.Encrypt("old-feed-password")
+		if err != nil {
+			t.Fatalf("Encrypt: %v", err)
+		}
+		src.SourceType = db.SourceTypeICS
+		src.SourceURL = "https://example.com/feed.ics"
+		src.SourceUsername = "victim"
+		src.SourcePassword = oldPw
+		if err := th.db.UpdateSource(src); err != nil {
+			t.Fatalf("UpdateSource: %v", err)
+		}
+
+		// Step 1: move to a new host with no username and no password.
+		newURL := feedURL + "/feed.ics"
+		body := updateSourceBody(src)
+		body["source_url"] = newURL
+		body["source_username"] = ""
+		w := callUpdateSource(t, th, userID, src.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("step 1 status = %d, want 200 (body %s)", w.Code, w.Body.String())
+		}
+		if sawAuth.Load() {
+			t.Error("connection test sent credentials to the new host")
+		}
+		got, _ := th.db.GetSourceByID(src.ID)
+		if got.SourceURL != newURL {
+			t.Errorf("source_url = %q, want %q", got.SourceURL, newURL)
+		}
+		if got.SourcePassword != "" {
+			t.Fatalf("stored password kept across ICS host change: %q", got.SourcePassword)
+		}
+
+		// Step 2: same origin, add the username back without a password.
+		body = updateSourceBody(got)
+		body["source_username"] = "victim"
+		w = callUpdateSource(t, th, userID, src.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("step 2 status = %d, want 200 (body %s)", w.Code, w.Body.String())
+		}
+		got, _ = th.db.GetSourceByID(src.ID)
+		if got.SourcePassword != "" {
+			t.Errorf("old password reattached to new host: %q", got.SourcePassword)
+		}
+	})
+
+	t.Run("ICS host change with new password stores it", func(t *testing.T) {
+		feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if u, p, ok := r.BasicAuth(); !ok || u != "victim" || p != "new-feed-password" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(feed.Close)
+		feedURL := icsStubURL(t, feed)
+
+		th, enc := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+		src.SourceType = db.SourceTypeICS
+		src.SourceURL = "https://example.com/feed.ics"
+		src.SourceUsername = "victim"
+		if err := th.db.UpdateSource(src); err != nil {
+			t.Fatalf("UpdateSource: %v", err)
+		}
+
+		body := updateSourceBody(src)
+		body["source_url"] = feedURL + "/feed.ics"
+		body["source_password"] = "new-feed-password"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+		}
+		got, _ := th.db.GetSourceByID(src.ID)
+		if pw, err := enc.Decrypt(got.SourcePassword); err != nil || pw != "new-feed-password" {
+			t.Errorf("stored password = %q (err %v), want new-feed-password", pw, err)
+		}
+	})
+
+	t.Run("source host change with password and passing test saves", func(t *testing.T) {
+		stub := principalStub(t, http.StatusMultiStatus)
+		th, enc := setupMalformedDeleteHandlers(t)
+		defer th.cleanup()
+		userID, src := createTestUserAndSource(t, th.db, "test@example.com", "S")
+
+		newURL := stub.URL + "/caldav/"
+		body := updateSourceBody(src)
+		body["source_url"] = newURL
+		body["source_password"] = "new-password"
+		w := callUpdateSource(t, th, userID, src.ID, body)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+		}
+		got, _ := th.db.GetSourceByID(src.ID)
+		if got.SourceURL != newURL {
+			t.Errorf("source_url = %q, want %q", got.SourceURL, newURL)
+		}
+		if pw, err := enc.Decrypt(got.SourcePassword); err != nil || pw != "new-password" {
+			t.Errorf("stored password = %q (err %v), want new-password", pw, err)
+		}
+	})
 }
