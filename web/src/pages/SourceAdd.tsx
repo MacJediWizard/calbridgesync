@@ -283,6 +283,7 @@ export default function SourceAdd() {
                     id="strip_alarms"
                     checked={form.strip_alarms}
                     onChange={handleChange}
+                    disabled={form.sync_direction === 'two_way'}
                     className="mt-0.5"
                   />
                   <label htmlFor="strip_alarms" className="text-sm text-gray-300 select-none cursor-pointer">
@@ -290,7 +291,8 @@ export default function SourceAdd() {
                     <span className="block text-xs text-gray-500">
                       Strip VALARM blocks from this source's events before writing to the destination.
                       Useful for subscribed feeds (payroll, billing, sports) where the source's alarms
-                      shouldn't fire on your calendar.
+                      shouldn't fire on your calendar. Applies to one-way sync only: in two-way sync
+                      the alarm-less copy would be written back and erase the alarms on the source.
                     </span>
                   </label>
                 </div>

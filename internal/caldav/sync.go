@@ -1395,11 +1395,22 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// alarms (missing the RFC-required TRIGGER) so RFC-strict destinations
 	// like SOGo don't 501 the whole calendar object. When the user has
 	// flipped "Ignore alarms" for this source, strip every VALARM.
+	//
+	// "Ignore alarms" only applies to one-way syncs. In two-way mode the
+	// alarm-less destination copy is written back over the source by the
+	// reverse pass, which would erase the user's own alarms on the source.
+	//
+	// When stripping, the policy is folded into the source ETag so that
+	// toggling the flag re-PUTs already-synced events once.
+	stripAll := source.StripAlarms && syncDirection == db.SyncDirectionOneWay
 	for i := range sourceEvents {
 		if sourceEvents[i].Data == "" {
 			continue
 		}
-		sourceEvents[i].Data = sanitizeAlarms(sourceEvents[i].Data, source.StripAlarms)
+		sourceEvents[i].Data = sanitizeAlarms(sourceEvents[i].Data, stripAll)
+		if stripAll {
+			sourceEvents[i].ETag = stripAlarmsETag(sourceEvents[i].ETag)
+		}
 	}
 
 	// Helper to update activity tracker with current progress

@@ -81,3 +81,22 @@ func sanitizeAlarms(data string, stripAll bool) string {
 
 	return strings.Join(out, lineEnd)
 }
+
+// stripAlarmsETagSuffix marks a source ETag whose event was synced with
+// every VALARM stripped.
+const stripAlarmsETagSuffix = ";strip-alarms"
+
+// stripAlarmsETag folds the "Ignore alarms" policy into the source ETag
+// that the sync engine records and compares. The destination copy of an
+// event depends on both the source content and this policy, so flipping
+// the flag must look like a source change: every already-synced event
+// then gets re-PUT once with (or without) its alarms. Empty ETags stay
+// empty so the legacy-record skip in shouldUpdateDestFromSource keeps
+// its meaning, and marking is idempotent because the same source events
+// can be synced to more than one destination.
+func stripAlarmsETag(etag string) string {
+	if etag == "" || strings.HasSuffix(etag, stripAlarmsETagSuffix) {
+		return etag
+	}
+	return etag + stripAlarmsETagSuffix
+}
