@@ -82,21 +82,32 @@ func sanitizeAlarms(data string, stripAll bool) string {
 	return strings.Join(out, lineEnd)
 }
 
-// stripAlarmsETagSuffix marks a source ETag whose event was synced with
-// every VALARM stripped.
-const stripAlarmsETagSuffix = ";strip-alarms"
+// Source ETag markers that fold the "Ignore alarms" policy into the
+// ETag the sync engine records and compares. The destination copy of an
+// event depends on both the source content and this policy, so changing
+// the effective policy must look like a source change: every
+// already-synced event then gets re-PUT once with (or without) its
+// alarms.
+const (
+	// stripAlarmsETagSuffix marks an event synced with every VALARM
+	// stripped (one-way + "Ignore alarms").
+	stripAlarmsETagSuffix = ";strip-alarms"
+	// alarmsKeptETagSuffix marks an event whose source has "Ignore
+	// alarms" set but synced with its alarms because the calendar is
+	// two-way. Rows written before the two-way scoping fix hold the raw
+	// ETag next to a stripped destination copy; this distinct marker
+	// forces one re-PUT that restores the alarms there, before a
+	// dest_wins edit can write the stripped copy back over the source.
+	alarmsKeptETagSuffix = ";alarms-kept"
+)
 
-// stripAlarmsETag folds the "Ignore alarms" policy into the source ETag
-// that the sync engine records and compares. The destination copy of an
-// event depends on both the source content and this policy, so flipping
-// the flag must look like a source change: every already-synced event
-// then gets re-PUT once with (or without) its alarms. Empty ETags stay
-// empty so the legacy-record skip in shouldUpdateDestFromSource keeps
-// its meaning, and marking is idempotent because the same source events
-// can be synced to more than one destination.
-func stripAlarmsETag(etag string) string {
-	if etag == "" || strings.HasSuffix(etag, stripAlarmsETagSuffix) {
+// markSourceETag appends suffix to a source ETag. Empty ETags stay empty
+// so the legacy-record skip in shouldUpdateDestFromSource keeps its
+// meaning, and marking is idempotent because the same source events can
+// be synced to more than one destination.
+func markSourceETag(etag, suffix string) string {
+	if etag == "" || strings.HasSuffix(etag, suffix) {
 		return etag
 	}
-	return etag + stripAlarmsETagSuffix
+	return etag + suffix
 }

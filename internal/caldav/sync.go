@@ -1400,16 +1400,27 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	// alarm-less destination copy is written back over the source by the
 	// reverse pass, which would erase the user's own alarms on the source.
 	//
-	// When stripping, the policy is folded into the source ETag so that
-	// toggling the flag re-PUTs already-synced events once.
+	// The effective policy is folded into the source ETag so that
+	// toggling the flag (or the calendar's direction) re-PUTs
+	// already-synced events once. A two-way calendar whose source has
+	// the flag set gets its own marker: rows synced before this scoping
+	// fix hold the raw ETag next to a stripped destination copy, and the
+	// marker forces the one re-PUT that restores the alarms there.
 	stripAll := source.StripAlarms && syncDirection == db.SyncDirectionOneWay
+	etagSuffix := ""
+	switch {
+	case stripAll:
+		etagSuffix = stripAlarmsETagSuffix
+	case source.StripAlarms:
+		etagSuffix = alarmsKeptETagSuffix
+	}
 	for i := range sourceEvents {
 		if sourceEvents[i].Data == "" {
 			continue
 		}
 		sourceEvents[i].Data = sanitizeAlarms(sourceEvents[i].Data, stripAll)
-		if stripAll {
-			sourceEvents[i].ETag = stripAlarmsETag(sourceEvents[i].ETag)
+		if etagSuffix != "" {
+			sourceEvents[i].ETag = markSourceETag(sourceEvents[i].ETag, etagSuffix)
 		}
 	}
 

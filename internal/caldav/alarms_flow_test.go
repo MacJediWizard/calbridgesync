@@ -87,6 +87,58 @@ func TestSyncFlow_TwoWay_StripAlarmsDoesNotEraseSourceAlarms(t *testing.T) {
 	}
 }
 
+// A two-way source that was synced with strip_alarms=1 before the
+// two-way scoping fix has alarm-less destination copies and synced_events
+// rows holding the raw source ETag. Without a marker, the forward pass
+// sees "no source change" and never restores the alarms, so the next
+// dest edit under dest_wins writes the alarm-less copy back over the
+// source. The "alarms kept" marker must force one restoring re-PUT.
+func TestSyncFlow_TwoWay_StripAlarmsPreFixStateIsRepaired(t *testing.T) {
+	h := newFlowHarness(t, db.SyncDirectionOneWay, db.ConflictDestWins, 3600)
+	h.source.StripAlarms = true
+	h.src.seedWithAlarm(flowSrcCal, "A", "Event A", flowStart)
+
+	// Reproduce the pre-fix state: dest copy stripped, row records the
+	// RAW source ETag (pre-fix code did not mark it).
+	h.cycle()
+	h.cycle()
+	if hasAlarm(t, h.dst, destPath("A")) {
+		t.Fatal("setup: dest A should be alarm-less")
+	}
+	src, _ := h.src.get(srcPath("A"))
+	row := h.rows()["A"]
+	row.SourceETag = src.ETag
+	if err := h.db.UpsertSyncedEvent(row); err != nil {
+		t.Fatalf("UpsertSyncedEvent: %v", err)
+	}
+
+	// Deploy: the source is two-way with the flag still set.
+	h.source.SyncDirection = db.SyncDirectionTwoWay
+	r := h.cycle()
+	assertPaths(t, "first post-fix cycle", "dest PUTs", h.dst.putLog(), destPath("A"))
+	if r.Updated < 1 {
+		t.Errorf("first post-fix cycle: Updated = %d, want >= 1", r.Updated)
+	}
+	if !hasAlarm(t, h.dst, destPath("A")) {
+		t.Fatal("first post-fix cycle: dest A alarm was not restored")
+	}
+
+	// Settle, then the user edits on dest; dest_wins pushes it back.
+	h.cycle()
+	r = h.cycle()
+	assertPaths(t, "steady", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "steady", "source PUTs", h.src.putLog())
+
+	h.dst.touch(destPath("A"), "Event A (edited on dest)")
+	h.cycle()
+	if got, _ := h.src.get(srcPath("A")); got.Summary != "Event A (edited on dest)" {
+		t.Fatalf("dest edit did not propagate to source; source summary = %q", got.Summary)
+	}
+	if !hasAlarm(t, h.src, srcPath("A")) {
+		t.Error("pre-fix two-way state: dest edit erased the VALARM from the SOURCE event")
+	}
+}
+
 // Toggling "Ignore alarms" on an existing one-way source must apply to
 // events that were already synced, not only to events whose source
 // copy changes later. Toggling it off must restore the alarms.
@@ -126,15 +178,20 @@ func TestSyncFlow_OneWay_StripAlarmsToggleAppliesToSyncedEvents(t *testing.T) {
 	assertPaths(t, "steady off", "dest PUTs", h.dst.putLog())
 }
 
-func TestStripAlarmsETag(t *testing.T) {
-	if got := stripAlarmsETag(""); got != "" {
-		t.Errorf("empty ETag must stay empty (legacy/ICS semantics), got %q", got)
+func TestMarkSourceETag(t *testing.T) {
+	for _, suffix := range []string{stripAlarmsETagSuffix, alarmsKeptETagSuffix} {
+		if got := markSourceETag("", suffix); got != "" {
+			t.Errorf("%s: empty ETag must stay empty (legacy/ICS semantics), got %q", suffix, got)
+		}
+		once := markSourceETag(`"etag-1"`, suffix)
+		if once == `"etag-1"` {
+			t.Errorf("%s: non-empty ETag must be marked", suffix)
+		}
+		if twice := markSourceETag(once, suffix); twice != once {
+			t.Errorf("%s: marking must be idempotent: %q -> %q", suffix, once, twice)
+		}
 	}
-	once := stripAlarmsETag(`"etag-1"`)
-	if once == `"etag-1"` {
-		t.Error("non-empty ETag must be marked")
-	}
-	if twice := stripAlarmsETag(once); twice != once {
-		t.Errorf("marking must be idempotent: %q -> %q", once, twice)
+	if markSourceETag(`"e"`, stripAlarmsETagSuffix) == markSourceETag(`"e"`, alarmsKeptETagSuffix) {
+		t.Error("strip and kept markers must differ so switching direction re-PUTs")
 	}
 }
