@@ -126,3 +126,82 @@ func TestSanitizeAlarms_EmptyAndAlarmless(t *testing.T) {
 		t.Errorf("input without VALARM should be returned unchanged")
 	}
 }
+
+// RFC 5545 §3.1: a content line may be folded at any point, including
+// inside the property name. A valid alarm whose TRIGGER name is folded
+// must not be mistaken for a malformed one and dropped.
+func TestSanitizeAlarms_FoldedTriggerNameKept(t *testing.T) {
+	in := strings.Join([]string{
+		"BEGIN:VEVENT",
+		"UID:fold",
+		"BEGIN:VALARM",
+		"ACTION:DISPLAY",
+		"TRIG",
+		" GER:-PT5M",
+		"END:VALARM",
+		"END:VEVENT",
+		"",
+	}, "\r\n")
+
+	if got := sanitizeAlarms(in, false); got != in {
+		t.Errorf("valid alarm with folded TRIGGER name was altered:\nin=%q\nout=%q", in, got)
+	}
+	if got := sanitizeAlarms(in, true); strings.Contains(got, "VALARM") {
+		t.Errorf("stripAll=true left a VALARM behind:\n%q", got)
+	}
+}
+
+// RFC 5545 §2: property names and component names are case-insensitive.
+func TestSanitizeAlarms_LowercaseNames(t *testing.T) {
+	in := strings.Join([]string{
+		"BEGIN:VEVENT",
+		"UID:lower",
+		"begin:valarm",
+		"action:DISPLAY",
+		"trigger:-PT5M",
+		"end:valarm",
+		"Begin:VAlarm",
+		"action:DISPLAY",
+		"description:no trigger",
+		"End:VAlarm",
+		"END:VEVENT",
+		"",
+	}, "\r\n")
+
+	got := sanitizeAlarms(in, false)
+	if !strings.Contains(got, "trigger:-PT5M") {
+		t.Errorf("valid lowercase alarm was dropped:\n%q", got)
+	}
+	if strings.Contains(got, "no trigger") {
+		t.Errorf("malformed lowercase alarm was not stripped:\n%q", got)
+	}
+	if got := sanitizeAlarms(in, true); strings.Contains(strings.ToUpper(got), "VALARM") {
+		t.Errorf("stripAll=true left a lowercase VALARM behind:\n%q", got)
+	}
+}
+
+// A CRLF envelope around LF-only component lines must still be scanned
+// line by line, and every byte outside dropped alarms preserved.
+func TestSanitizeAlarms_MixedLineEndings(t *testing.T) {
+	in := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\nUID:mixed\nBEGIN:VALARM\nACTION:DISPLAY\nEND:VALARM\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	want := "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\nUID:mixed\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+	if got := sanitizeAlarms(in, false); got != want {
+		t.Errorf("malformed alarm in mixed line endings not stripped cleanly:\nwant=%q\ngot =%q", want, got)
+	}
+	if got := sanitizeAlarms(in, true); got != want {
+		t.Errorf("stripAll=true with mixed line endings:\nwant=%q\ngot =%q", want, got)
+	}
+}
+
+// Dropping one alarm must leave every other byte, including folded
+// lines elsewhere in the event, exactly as received.
+func TestSanitizeAlarms_PreservesBytesOutsideDroppedAlarm(t *testing.T) {
+	head := "BEGIN:VEVENT\r\nUID:bytes\r\nDESCRIPTION:a long\r\n  folded value\r\n"
+	alarm := "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nEND:VALARM\r\n"
+	tail := "END:VEVENT\r\n"
+
+	if got := sanitizeAlarms(head+alarm+tail, true); got != head+tail {
+		t.Errorf("unexpected output:\nwant=%q\ngot =%q", head+tail, got)
+	}
+}
