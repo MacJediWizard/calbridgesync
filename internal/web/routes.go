@@ -94,11 +94,12 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 	expensiveAPI.Use(ValidateOrigin())
 	expensiveAPI.Use(RequireJSONContentType())
 	{
-		expensiveAPI.POST("/sources", h.APICreateSource)                       // Tests connections to CalDAV servers
-		expensiveAPI.POST("/sources/google/prepare", h.APIPrepareGoogleSource) // Tests dest + stashes pending Google source (#70)
-		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars)       // Discovers calendars via network
-		expensiveAPI.POST("/settings/alerts/test-webhook", h.APITestWebhook)   // Tests webhook via network
-		expensiveAPI.GET("/export/calendars", h.APIExportCalendars)            // Exports all user calendars as ICS
+		expensiveAPI.POST("/sources", h.APICreateSource)                               // Tests connections to CalDAV servers
+		expensiveAPI.POST("/sources/google/prepare", h.APIPrepareGoogleSource)         // Tests dest + stashes pending Google source (#70)
+		expensiveAPI.POST("/sources/:id/google/reconnect", h.APIReconnectGoogleSource) // Re-authorize an existing Google source (#192)
+		expensiveAPI.POST("/calendars/discover", h.APIDiscoverCalendars)               // Discovers calendars via network
+		expensiveAPI.POST("/settings/alerts/test-webhook", h.APITestWebhook)           // Tests webhook via network
+		expensiveAPI.GET("/export/calendars", h.APIExportCalendars)                    // Exports all user calendars as ICS
 	}
 
 	// Serve React app static files

@@ -906,3 +906,37 @@ func TestMaybeSendFailureAlert_NilNotifierSafe(t *testing.T) {
 	// Must not panic.
 	sched.maybeSendFailureAlert(source.ID, source, result)
 }
+
+// TestIsAuthError_GoogleInvalidGrant reproduces #192: the prod Google
+// source failed 719/719 syncs with an oauth2 invalid_grant error that
+// isAuthError did not recognize, so the credential-expiry alert never
+// fired. Both shapes the sync engine can produce must classify as auth
+// failures: the per-calendar GetEvents error (token died mid-sync) and
+// the connection-test error (token rejected up front).
+func TestIsAuthError_GoogleInvalidGrant(t *testing.T) {
+	sched := New(nil, nil, nil)
+
+	cases := map[string]*caldav.SyncResult{
+		"prod GetEvents error": {
+			Message: "Sync failed with 1 errors",
+			Errors:  []string{`Failed to get source events: connection failed: Propfind "https://apidata.googleusercontent.com/caldav/v2/x/events/": oauth2: "invalid_grant" "Bad Request"`},
+		},
+		"connection test error": {
+			Message: caldav.GoogleAuthExpiredMessage,
+			Errors:  []string{`authentication failed: oauth2: "invalid_grant" "Bad Request"`},
+		},
+	}
+	for name, result := range cases {
+		if !sched.isAuthError(result) {
+			t.Errorf("%s: expected isAuthError to be true", name)
+		}
+	}
+
+	notAuth := &caldav.SyncResult{
+		Message: "Sync failed with 1 errors",
+		Errors:  []string{"Failed to get source events: connection failed: dial tcp: i/o timeout"},
+	}
+	if sched.isAuthError(notAuth) {
+		t.Error("a network timeout must not be classified as an auth error")
+	}
+}

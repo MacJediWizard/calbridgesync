@@ -145,6 +145,7 @@ export default function SourcesList() {
                         {source.enabled && (
                           <>
                             <span
+                              title={source.last_sync_message || undefined}
                               className={`text-xs ${
                                 source.sync_status === 'success'
                                   ? 'text-green-400'
@@ -174,6 +175,15 @@ export default function SourcesList() {
                               >
                                 Stale
                               </span>
+                            )}
+                            {source.needs_reauth && (
+                              <Link
+                                to={`/sources/${source.id}/edit`}
+                                className="text-xs text-yellow-400 hover:text-yellow-300"
+                                title={source.last_sync_message}
+                              >
+                                Reconnect
+                              </Link>
                             )}
                           </>
                         )}

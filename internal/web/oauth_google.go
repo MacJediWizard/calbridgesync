@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -46,8 +48,37 @@ const googleOAuthStatePrefix = "google:"
 
 // googleUserinfoURL is the Google API endpoint used to fetch the
 // authenticated user's primary email after OAuth consent. Scoped by
-// "https://www.googleapis.com/auth/userinfo.email".
-const googleUserinfoURL = "https://www.googleapis.com/oauth2/v2/userinfo"
+// "https://www.googleapis.com/auth/userinfo.email". A var (not const)
+// only so tests can point it at a fake server.
+var googleUserinfoURL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+// googleOAuthEndpoint is Google's OAuth2 endpoint. A var only so tests
+// can point the code exchange at a fake token server.
+var googleOAuthEndpoint = google.Endpoint
+
+// googleCalDAVSourceURL builds the Google CalDAV base URL for an
+// account. Google's documented format is
+// https://apidata.googleusercontent.com/caldav/v2/<email>/user; the
+// sync engine derives the events collection from it.
+func googleCalDAVSourceURL(email string) string {
+	return fmt.Sprintf("https://apidata.googleusercontent.com/caldav/v2/%s/user", email)
+}
+
+// googleAuthCodeURL returns the consent-screen URL for cfg.
+//
+// access_type=offline tells Google to return a refresh_token.
+// prompt=consent forces the consent screen to appear on every
+// authorization, which also forces a fresh refresh_token. Without
+// prompt=consent, Google may return no refresh_token on
+// re-authorization, which breaks the sync engine. Shared by the
+// add-source and reconnect flows so the two cannot drift. (#192)
+func googleAuthCodeURL(cfg *oauth2.Config, state string) string {
+	return cfg.AuthCodeURL(
+		state,
+		oauth2.AccessTypeOffline,
+		oauth2.SetAuthURLParam("prompt", "consent"),
+	)
+}
 
 // googleUserinfo is the subset of Google's /userinfo response that
 // we care about.
@@ -76,7 +107,7 @@ func (h *Handlers) buildGoogleOAuthConfig(clientID, clientSecret string) *oauth2
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		RedirectURL:  h.cfg.GoogleOAuth.RedirectURL,
-		Endpoint:     google.Endpoint,
+		Endpoint:     googleOAuthEndpoint,
 		Scopes: []string{
 			"https://www.googleapis.com/auth/calendar",
 			"https://www.googleapis.com/auth/userinfo.email",
@@ -244,18 +275,82 @@ func (h *Handlers) APIPrepareGoogleSource(c *gin.Context) {
 		return
 	}
 
-	// access_type=offline tells Google to return a refresh_token.
-	// prompt=consent forces the consent screen to appear on every
-	// re-authorization, which also forces a fresh refresh_token.
-	// Without prompt=consent, Google may return no refresh_token on
-	// re-authorization, which breaks the sync engine.
-	redirectURL := cfg.AuthCodeURL(
-		state,
-		oauth2.AccessTypeOffline,
-		oauth2.SetAuthURLParam("prompt", "consent"),
-	)
+	c.JSON(http.StatusOK, APIPrepareGoogleSourceResponse{RedirectURL: googleAuthCodeURL(cfg, state)})
+}
 
-	c.JSON(http.StatusOK, APIPrepareGoogleSourceResponse{RedirectURL: redirectURL})
+// APIReconnectGoogleSource re-runs Google OAuth for an EXISTING Google
+// source whose refresh token was revoked or expired (invalid_grant).
+// It uses the source's stored client credentials, stashes a pending
+// reconnect (state + source ID) in the session, and returns the
+// consent URL. The callback then replaces only the refresh token, so
+// the source ID, tracking rows and settings are preserved. (#192)
+func (h *Handlers) APIReconnectGoogleSource(c *gin.Context) {
+	session := auth.GetCurrentUser(c)
+	if session == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	if !h.cfg.GoogleOAuth.Enabled() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Google OAuth is not configured on this server (BASE_URL / GOOGLE_OAUTH_REDIRECT_URL must be set).",
+		})
+		return
+	}
+
+	// Ownership-scoped lookup: another user's source is a plain 404.
+	source, err := h.db.GetSourceByIDForUser(c.Param("id"), session.UserID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Source not found"})
+		return
+	}
+	if source.SourceType != db.SourceTypeGoogle {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only Google sources can be reconnected"})
+		return
+	}
+	if source.GoogleClientID == "" || source.GoogleClientSecret == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "This source has no stored Google OAuth client credentials. Delete it and add it again.",
+		})
+		return
+	}
+
+	clientSecret, err := h.encryptor.Decrypt(source.GoogleClientSecret)
+	if err != nil {
+		log.Printf("Google reconnect: failed to decrypt client secret for source %s: %v", source.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read stored Google credentials"})
+		return
+	}
+	cfg := h.buildGoogleOAuthConfig(source.GoogleClientID, clientSecret)
+	if cfg == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid stored Google OAuth credentials"})
+		return
+	}
+
+	state, err := auth.GenerateState()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate state"})
+		return
+	}
+	if err := h.session.SetOAuthState(c.Writer, c.Request, googleOAuthStatePrefix+state); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save OAuth state"})
+		return
+	}
+
+	// The stored secret is already encrypted with the same encryptor,
+	// so it goes into the cookie as-is.
+	pending := &auth.PendingGoogleSource{
+		State:                 state,
+		ReconnectSourceID:     source.ID,
+		GoogleClientID:        source.GoogleClientID,
+		GoogleClientSecretEnc: source.GoogleClientSecret,
+	}
+	if err := h.session.SetPendingGoogleSource(c.Writer, c.Request, pending); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending reconnect"})
+		return
+	}
+
+	c.JSON(http.StatusOK, APIPrepareGoogleSourceResponse{RedirectURL: googleAuthCodeURL(cfg, state)})
 }
 
 // GoogleOAuthStart is a convenience redirect that exists so operators
@@ -309,30 +404,36 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		return
 	}
 
+	// Read back (and clear — consume-once semantics) the pending form
+	// data right after the state check. Every exit path below must
+	// clear it anyway, and knowing whether this is a reconnect of an
+	// existing source (#192) decides which page errors go back to.
+	pending, pendingErr := h.session.GetPendingGoogleSource(c.Writer, c.Request)
+	fail := func(code string) {
+		if pendingErr == nil && pending.ReconnectSourceID != "" {
+			c.Redirect(http.StatusFound, "/sources/"+url.PathEscape(pending.ReconnectSourceID)+"/edit?error="+code)
+			return
+		}
+		c.Redirect(http.StatusFound, "/sources/add?error="+code)
+	}
+
 	// Google can report its own error (user denied consent, etc.)
 	if errParam := c.Query("error"); errParam != "" {
 		log.Printf("Google OAuth callback: Google reported error: %s", errParam)
-		// Clear any stashed pending source so we don't leave it
-		// lying around to interfere with a retry.
-		_, _ = h.session.GetPendingGoogleSource(c.Writer, c.Request)
-		c.Redirect(http.StatusFound, "/sources/add?error=google_denied")
+		fail("google_denied")
 		return
 	}
 
 	code := c.Query("code")
 	if code == "" {
-		_, _ = h.session.GetPendingGoogleSource(c.Writer, c.Request)
-		c.Redirect(http.StatusFound, "/sources/add?error=missing_code")
+		fail("missing_code")
 		return
 	}
 
-	// Read back the pending form data BEFORE exchanging the code, so
-	// we have the per-source client_id and client_secret to build the
-	// oauth2.Config that the exchange call needs. GetPendingGoogleSource
-	// also clears the cookie (consume-once semantics).
-	pending, err := h.session.GetPendingGoogleSource(c.Writer, c.Request)
-	if err != nil {
-		log.Printf("Google OAuth callback: no pending source in session: %v", err)
+	// The pending data carries the per-source client_id and
+	// client_secret needed to build the oauth2.Config for the exchange.
+	if pendingErr != nil {
+		log.Printf("Google OAuth callback: no pending source in session: %v", pendingErr)
 		c.Redirect(http.StatusFound, "/sources/add?error=pending_expired")
 		return
 	}
@@ -343,13 +444,13 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 	googleClientSecret, err := h.encryptor.Decrypt(pending.GoogleClientSecretEnc)
 	if err != nil {
 		log.Printf("Google OAuth callback: failed to decrypt pending Google client secret: %v", err)
-		c.Redirect(http.StatusFound, "/sources/add?error=encrypt_failed")
+		fail("encrypt_failed")
 		return
 	}
 	cfg := h.buildGoogleOAuthConfig(pending.GoogleClientID, googleClientSecret)
 	if cfg == nil {
 		log.Printf("Google OAuth callback: pending source had invalid Google credentials")
-		c.Redirect(http.StatusFound, "/sources/add?error=google_not_configured")
+		fail("google_not_configured")
 		return
 	}
 
@@ -359,7 +460,7 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 	token, err := cfg.Exchange(c.Request.Context(), code)
 	if err != nil {
 		log.Printf("Google OAuth callback: code exchange failed: %v", err)
-		c.Redirect(http.StatusFound, "/sources/add?error=exchange_failed")
+		fail("exchange_failed")
 		return
 	}
 
@@ -370,7 +471,7 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		// can't proceed — a source without a refresh token can't
 		// sync past the first access token expiry.
 		log.Printf("Google OAuth callback: Google did not return a refresh token")
-		c.Redirect(http.StatusFound, "/sources/add?error=no_refresh_token")
+		fail("no_refresh_token")
 		return
 	}
 
@@ -380,7 +481,7 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 	email, err := fetchGoogleUserEmail(c.Request.Context(), cfg, token)
 	if err != nil {
 		log.Printf("Google OAuth callback: failed to fetch user email: %v", err)
-		c.Redirect(http.StatusFound, "/sources/add?error=userinfo_failed")
+		fail("userinfo_failed")
 		return
 	}
 
@@ -391,7 +492,7 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 	// controllable, pending.State is server-side secret. (#113)
 	if subtle.ConstantTimeCompare([]byte(pending.State), []byte(queryState)) != 1 {
 		log.Printf("Google OAuth callback: pending state mismatch (pending=%q query=%q)", pending.State, queryState)
-		c.Redirect(http.StatusFound, "/sources/add?error=state_mismatch")
+		fail("state_mismatch")
 		return
 	}
 
@@ -402,12 +503,13 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 		return
 	}
 
+	if pending.ReconnectSourceID != "" {
+		h.finishGoogleReconnect(c, session.UserID, pending.ReconnectSourceID, email, token.RefreshToken, fail)
+		return
+	}
+
 	// Build the Google CalDAV URL for the user's primary calendar.
-	// Google's documented format is:
-	//   https://apidata.googleusercontent.com/caldav/v2/<email>/user
-	// for principal discovery. The sync engine's FindCurrentUserPrincipal
-	// call is happy with this as the base URL.
-	sourceURL := fmt.Sprintf("https://apidata.googleusercontent.com/caldav/v2/%s/user", email)
+	sourceURL := googleCalDAVSourceURL(email)
 
 	encRefreshToken, err := h.encryptor.Encrypt(token.RefreshToken)
 	if err != nil {
@@ -479,6 +581,53 @@ func (h *Handlers) GoogleOAuthCallback(c *gin.Context) {
 	// Full-page navigation back to the SPA, which will load /sources
 	// and show the new source.
 	c.Redirect(http.StatusFound, "/sources?google_oauth=success")
+}
+
+// finishGoogleReconnect completes a reconnect of an existing Google
+// source (#192): it replaces only the encrypted refresh token on the
+// caller's own source row, so the source ID, tracking rows and settings
+// are preserved, then triggers a sync so the user sees the result.
+func (h *Handlers) finishGoogleReconnect(c *gin.Context, userID, sourceID, email, refreshToken string, fail func(string)) {
+	// Re-check ownership with the signed-in user: the pending cookie
+	// alone is not trusted to authorize writing to a source.
+	source, err := h.db.GetSourceByIDForUser(sourceID, userID)
+	if err != nil || source.SourceType != db.SourceTypeGoogle {
+		log.Printf("Google reconnect: source %s not found for user %s: %v", sourceID, userID, err)
+		c.Redirect(http.StatusFound, "/sources?error=reconnect_source_not_found")
+		return
+	}
+
+	// The source's CalDAV URL is keyed by the Google account email.
+	// Authorizing a different account would point the existing tracking
+	// rows at another calendar (and on a two-way source could delete
+	// events), so require the same account.
+	if !strings.EqualFold(source.SourceURL, googleCalDAVSourceURL(email)) {
+		log.Printf("Google reconnect: account mismatch for source %s (authorized %s)", source.ID, email)
+		fail("google_account_mismatch")
+		return
+	}
+
+	encRefreshToken, err := h.encryptor.Encrypt(refreshToken)
+	if err != nil {
+		log.Printf("Google reconnect: failed to encrypt refresh token: %v", err)
+		fail("encrypt_failed")
+		return
+	}
+	if err := h.db.UpdateSourceOAuthRefreshToken(source.ID, userID, encRefreshToken); err != nil {
+		log.Printf("Google reconnect: failed to store refresh token for source %s: %v", source.ID, err)
+		fail("reconnect_failed")
+		return
+	}
+
+	// Clear the "authorization expired" status so the UI stops asking
+	// for a reconnect; the triggered sync writes the real outcome.
+	if err := h.db.UpdateSourceSyncStatus(source.ID, db.SyncStatusPending, "Google account reconnected; waiting for the next sync"); err != nil {
+		log.Printf("Google reconnect: failed to reset sync status for source %s: %v", source.ID, err)
+	}
+	h.scheduler.TriggerSync(source.ID)
+
+	log.Printf("Google reconnect: refreshed authorization for source %s", source.ID)
+	c.Redirect(http.StatusFound, "/sources/"+url.PathEscape(source.ID)+"/edit?google_oauth=reconnected")
 }
 
 // fetchGoogleUserEmail makes a GET /userinfo call against Google using

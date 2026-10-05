@@ -498,3 +498,23 @@ func TestActiveAdditionalDestinations_PausedReturnsNone(t *testing.T) {
 		t.Fatalf("activeAdditionalDestinations(nil) returned %d destination(s), want 0", len(got))
 	}
 }
+
+// TestSyncFailureMessage_GoogleInvalidGrant pins the #192 behavior:
+// a Google source whose sync errors include the prod invalid_grant
+// text gets the actionable reconnect message instead of the generic
+// "Sync failed with N errors", which told the user nothing for a month.
+func TestSyncFailureMessage_GoogleInvalidGrant(t *testing.T) {
+	prodErr := `Failed to get source events: connection failed: Propfind "https://apidata.googleusercontent.com/caldav/v2/x/events/": oauth2: "invalid_grant" "Bad Request"`
+	google := &db.Source{SourceType: db.SourceTypeGoogle}
+
+	if got := syncFailureMessage(google, []string{prodErr}); got != GoogleAuthExpiredMessage {
+		t.Errorf("google + invalid_grant: got %q, want GoogleAuthExpiredMessage", got)
+	}
+	if got := syncFailureMessage(google, []string{"some other error", "and another"}); got != "Sync failed with 2 errors" {
+		t.Errorf("google + unrelated errors: got %q", got)
+	}
+	caldavSrc := &db.Source{SourceType: db.SourceTypeCustom}
+	if got := syncFailureMessage(caldavSrc, []string{prodErr}); got != "Sync failed with 1 errors" {
+		t.Errorf("non-google source must keep the generic message, got %q", got)
+	}
+}
