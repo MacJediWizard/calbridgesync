@@ -24,9 +24,8 @@ services:
       - DATABASE_PATH=/app/data/calbridgesync.db
       - DEFAULT_DEST_URL=${DEFAULT_DEST_URL}
       # REQUIRED in production mode (#101). Comma-separated list of
-      # allowed origins for CSRF validation. Without this, the
-      # server falls back to localhost-only defaults which block
-      # every non-localhost origin. Example:
+      # allowed origins for CSRF validation. Startup fails in
+      # production if it is empty (#239). Example:
       #   ALLOWED_ORIGINS=https://calbridgesync.example.com
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       # Comma-separated IPs/CIDRs of reverse proxies allowed to set
@@ -55,8 +54,6 @@ services:
       #- SESSION_MAX_AGE_SECS=${SESSION_MAX_AGE_SECS:-86400}       # 24h
       #- OAUTH_STATE_MAX_AGE_SECS=${OAUTH_STATE_MAX_AGE_SECS:-300} # 5m
       #- CALDAV_REQUEST_TIMEOUT=${CALDAV_REQUEST_TIMEOUT:-300}     # 5m per HTTP call
-      #- RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-10.0}                    # requests/sec per client
-      #- RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-20}
       #- MIN_SYNC_INTERVAL=${MIN_SYNC_INTERVAL:-30}                # seconds
       #- MAX_SYNC_INTERVAL=${MAX_SYNC_INTERVAL:-3600}              # seconds
       #- ALERT_MAX_SEND_ATTEMPTS=${ALERT_MAX_SEND_ATTEMPTS:-3}     # retry count for webhook/email
