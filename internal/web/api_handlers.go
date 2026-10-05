@@ -2,8 +2,10 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -33,6 +35,12 @@ func categorizeConnectionError(err error) string {
 	if err == nil {
 		return "Connection failed"
 	}
+	// Blocked dials and dial failures against non-public addresses all
+	// get one message, so refused/timeout/unreachable differences can't
+	// be used to probe hosts and ports on the server's network. (#200)
+	if isInternalDialFailure(err) {
+		return "Could not connect to the server. Please check the URL."
+	}
 	errStr := strings.ToLower(err.Error())
 
 	// Categorize without exposing internal details
@@ -54,6 +62,33 @@ func categorizeConnectionError(err error) string {
 	default:
 		return "Connection failed. Please check your settings."
 	}
+}
+
+// cgnatRange is RFC 6598 shared address space, which net.IP.IsPrivate
+// does not cover.
+var cgnatRange = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+// isInternalDialFailure reports whether err is a dial refused by the
+// CalDAV SSRF guard, or a dial (refused, timed out, unreachable) whose
+// target address is not publicly routable. (#200)
+func isInternalDialFailure(err error) bool {
+	if errors.Is(err, caldav.ErrBlockedDestination) {
+		return true
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || opErr.Op != "dial" || opErr.Addr == nil {
+		return false
+	}
+	host, _, splitErr := net.SplitHostPort(opErr.Addr.String())
+	if splitErr != nil {
+		host = opErr.Addr.String()
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || cgnatRange.Contains(ip)
 }
 
 // Input validation constants

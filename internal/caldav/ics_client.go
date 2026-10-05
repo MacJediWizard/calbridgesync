@@ -78,7 +78,7 @@ func icsLoopbackOnlyDialContext(ctx context.Context, network, addr string) (net.
 	// defensive posture as the webhook dial.
 	for _, ip := range ips {
 		if blocked, reason := isICSBlockedIP(ip); blocked {
-			return nil, fmt.Errorf("blocked destination: %s resolves to %s (%s)", host, ip.String(), reason)
+			return nil, fmt.Errorf("%w: %s resolves to %s (%s)", ErrBlockedDestination, host, ip.String(), reason)
 		}
 	}
 

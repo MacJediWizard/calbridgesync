@@ -3,16 +3,21 @@ package web
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/macjediwizard/calbridgesync/internal/auth"
+	"github.com/macjediwizard/calbridgesync/internal/caldav"
 	"github.com/macjediwizard/calbridgesync/internal/config"
 	"github.com/macjediwizard/calbridgesync/internal/db"
 	"github.com/macjediwizard/calbridgesync/internal/scheduler"
@@ -289,6 +294,52 @@ func TestCategorizeConnectionError(t *testing.T) {
 				t.Errorf("expected message to contain %q, got %q", tc.contains, result)
 			}
 		})
+	}
+}
+
+// TestCategorizeConnectionError_NoInternalOracle verifies that a
+// dial blocked by the CalDAV SSRF guard and a refused, timed-out or
+// unreachable dial to a non-public address all produce the same
+// user-facing string, so the error text cannot be used to map hosts
+// and ports on the server's network. Dial failures to public
+// addresses keep their specific messages. (#200)
+func TestCategorizeConnectionError_NoInternalOracle(t *testing.T) {
+	wrap := func(inner error) error {
+		return fmt.Errorf("%w: %w", caldav.ErrConnectionFailed,
+			&url.Error{Op: "Propfind", URL: "http://example.test/", Err: inner})
+	}
+	dialErr := func(ip string, err error) error {
+		return wrap(&net.OpError{
+			Op:   "dial",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP(ip), Port: 8443},
+			Err:  os.NewSyscallError("connect", err),
+		})
+	}
+
+	blocked := categorizeConnectionError(wrap(fmt.Errorf(
+		"%w: internal.test resolves to 169.254.169.254 (link-local (includes cloud IMDS))",
+		caldav.ErrBlockedDestination)))
+
+	nonPublic := map[string]error{
+		"blocked loopback":        wrap(fmt.Errorf("%w: localhost resolves to 127.0.0.1 (loopback)", caldav.ErrBlockedDestination)),
+		"refused 10.0.0.5":        dialErr("10.0.0.5", syscall.ECONNREFUSED),
+		"refused 192.168.1.20":    dialErr("192.168.1.20", syscall.ECONNREFUSED),
+		"timeout 172.16.0.9":      dialErr("172.16.0.9", syscall.ETIMEDOUT),
+		"unreachable 100.64.0.1":  dialErr("100.64.0.1", syscall.EHOSTUNREACH),
+		"refused fd00::1":         dialErr("fd00::1", syscall.ECONNREFUSED),
+		"refused 127.0.0.1 (raw)": dialErr("127.0.0.1", syscall.ECONNREFUSED),
+	}
+	for name, err := range nonPublic {
+		t.Run(name, func(t *testing.T) {
+			if got := categorizeConnectionError(err); got != blocked {
+				t.Errorf("got %q, want the same message as a blocked dial (%q)", got, blocked)
+			}
+		})
+	}
+
+	if got := categorizeConnectionError(dialErr("8.8.8.8", syscall.ECONNREFUSED)); got == blocked || !strings.Contains(got, "Connection refused") {
+		t.Errorf("public refused dial should keep its specific message, got %q", got)
 	}
 }
 
