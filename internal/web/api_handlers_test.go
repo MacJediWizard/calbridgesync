@@ -77,10 +77,9 @@ func setupTestHandlers(t *testing.T) *testHandlers {
 // setAuthContext sets the authenticated user context for testing.
 func setAuthContext(c *gin.Context, userID, email string) {
 	session := &auth.SessionData{
-		UserID:    userID,
-		Email:     email,
-		Name:      "Test User",
-		CSRFToken: "test-csrf-token",
+		UserID: userID,
+		Email:  email,
+		Name:   "Test User",
 	}
 	c.Set(auth.ContextKeySession, session)
 }

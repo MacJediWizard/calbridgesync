@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -83,9 +82,6 @@ func TestSessionManager(t *testing.T) {
 		if retrieved.Name != data.Name {
 			t.Errorf("expected Name %q, got %q", data.Name, retrieved.Name)
 		}
-		if retrieved.CSRFToken == "" {
-			t.Error("expected CSRF token to be generated")
-		}
 	})
 
 	t.Run("returns error for missing session", func(t *testing.T) {
@@ -123,23 +119,6 @@ func TestSessionManager(t *testing.T) {
 			if cookie.Name == "calbridgesync_session" && cookie.MaxAge > 0 {
 				t.Error("expected session cookie to be expired")
 			}
-		}
-	})
-
-	t.Run("generates CSRF token when not provided", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-
-		data := &SessionData{
-			UserID: "user-123",
-			Email:  "test@example.com",
-		}
-
-		sm.Set(w, r, data)
-
-		// The data should now have a CSRF token
-		if data.CSRFToken == "" {
-			t.Error("expected CSRF token to be generated")
 		}
 	})
 }
@@ -378,189 +357,52 @@ func TestOptionalAuth(t *testing.T) {
 	})
 }
 
-func TestValidateCSRF(t *testing.T) {
+// TestSetDropsLegacyCSRFToken covers sessions written by builds that still
+// had the HTMX UI: the next Set must not carry their csrf_token forward.
+func TestSetDropsLegacyCSRFToken(t *testing.T) {
 	sm := NewSessionManager("test-secret-key-at-least-32-chars", false, 86400, 300)
 
-	t.Run("skips GET requests", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/api/data", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	legacy, _ := sm.store.New(r, sessionName)
+	legacy.Values["user_id"] = "user-123"
+	legacy.Values["csrf_token"] = "old-token"
+	if err := legacy.Save(r, w); err != nil {
+		t.Fatalf("saving legacy session: %v", err)
+	}
 
-		middleware := ValidateCSRF(sm)
-		middleware(c)
+	r2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	for _, c := range w.Result().Cookies() {
+		r2.AddCookie(c)
+	}
+	w2 := httptest.NewRecorder()
+	if err := sm.Set(w2, r2, &SessionData{UserID: "user-123"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 
-		if c.IsAborted() {
-			t.Error("expected GET request to not be aborted")
-		}
-	})
-
-	t.Run("skips HEAD requests", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodHead, "/api/data", nil)
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if c.IsAborted() {
-			t.Error("expected HEAD request to not be aborted")
-		}
-	})
-
-	t.Run("skips OPTIONS requests", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodOptions, "/api/data", nil)
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if c.IsAborted() {
-			t.Error("expected OPTIONS request to not be aborted")
-		}
-	})
-
-	t.Run("skips HTMX requests", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/data", nil)
-		c.Request.Header.Set("HX-Request", "true")
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if c.IsAborted() {
-			t.Error("expected HTMX request to not be aborted")
-		}
-	})
-
-	t.Run("rejects POST without session", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/data", nil)
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if !c.IsAborted() {
-			t.Error("expected POST without session to be aborted")
-		}
-		if w.Code != http.StatusForbidden {
-			t.Errorf("expected status 403, got %d", w.Code)
-		}
-	})
-
-	t.Run("rejects POST without CSRF token", func(t *testing.T) {
-		// First set up a session
-		w1 := httptest.NewRecorder()
-		r1 := httptest.NewRequest(http.MethodGet, "/", nil)
-		sm.Set(w1, r1, &SessionData{UserID: "user-123", Email: "test@example.com", CSRFToken: "valid-token"})
-
-		// Now test the middleware with the session cookie but no CSRF token
-		w2 := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w2)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/data", nil)
-		for _, cookie := range w1.Result().Cookies() {
-			c.Request.AddCookie(cookie)
-		}
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if !c.IsAborted() {
-			t.Error("expected POST without CSRF token to be aborted")
-		}
-		if w2.Code != http.StatusForbidden {
-			t.Errorf("expected status 403, got %d", w2.Code)
-		}
-	})
-
-	t.Run("rejects POST with invalid CSRF token", func(t *testing.T) {
-		// First set up a session
-		w1 := httptest.NewRecorder()
-		r1 := httptest.NewRequest(http.MethodGet, "/", nil)
-		sm.Set(w1, r1, &SessionData{UserID: "user-123", Email: "test@example.com", CSRFToken: "valid-token"})
-
-		// Now test with wrong CSRF token
-		w2 := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w2)
-		formData := url.Values{}
-		formData.Set("csrf_token", "wrong-token")
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/data", strings.NewReader(formData.Encode()))
-		c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		for _, cookie := range w1.Result().Cookies() {
-			c.Request.AddCookie(cookie)
-		}
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if !c.IsAborted() {
-			t.Error("expected POST with invalid CSRF token to be aborted")
-		}
-	})
-
-	t.Run("allows POST with valid CSRF token in form", func(t *testing.T) {
-		// First set up a session with known CSRF token
-		w1 := httptest.NewRecorder()
-		r1 := httptest.NewRequest(http.MethodGet, "/", nil)
-		sessionData := &SessionData{UserID: "user-123", Email: "test@example.com"}
-		sm.Set(w1, r1, sessionData)
-		csrfToken := sessionData.CSRFToken
-
-		// Now test with valid CSRF token
-		w2 := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w2)
-		formData := url.Values{}
-		formData.Set("csrf_token", csrfToken)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/data", strings.NewReader(formData.Encode()))
-		c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		for _, cookie := range w1.Result().Cookies() {
-			c.Request.AddCookie(cookie)
-		}
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if c.IsAborted() {
-			t.Error("expected POST with valid CSRF token to not be aborted")
-		}
-	})
-
-	t.Run("allows POST with valid CSRF token in header", func(t *testing.T) {
-		// First set up a session with known CSRF token
-		w1 := httptest.NewRecorder()
-		r1 := httptest.NewRequest(http.MethodGet, "/", nil)
-		sessionData := &SessionData{UserID: "user-123", Email: "test@example.com"}
-		sm.Set(w1, r1, sessionData)
-		csrfToken := sessionData.CSRFToken
-
-		// Now test with valid CSRF token in header
-		w2 := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w2)
-		c.Request = httptest.NewRequest(http.MethodPost, "/api/data", nil)
-		c.Request.Header.Set("X-CSRF-Token", csrfToken)
-		for _, cookie := range w1.Result().Cookies() {
-			c.Request.AddCookie(cookie)
-		}
-
-		middleware := ValidateCSRF(sm)
-		middleware(c)
-
-		if c.IsAborted() {
-			t.Error("expected POST with valid CSRF token in header to not be aborted")
-		}
-	})
+	r3 := httptest.NewRequest(http.MethodGet, "/", nil)
+	for _, c := range w2.Result().Cookies() {
+		r3.AddCookie(c)
+	}
+	s, err := sm.store.Get(r3, sessionName)
+	if err != nil {
+		t.Fatalf("reading session: %v", err)
+	}
+	if _, ok := s.Values["csrf_token"]; ok {
+		t.Error("expected csrf_token to be removed from the session")
+	}
+	if s.Values["user_id"] != "user-123" {
+		t.Errorf("expected user_id to survive, got %v", s.Values["user_id"])
+	}
 }
 
 func TestSessionData(t *testing.T) {
 	t.Run("struct has expected fields", func(t *testing.T) {
 		data := SessionData{
-			UserID:    "user-123",
-			Email:     "test@example.com",
-			Name:      "Test User",
-			Picture:   "https://example.com/pic.jpg",
-			CSRFToken: "csrf-token-123",
+			UserID:  "user-123",
+			Email:   "test@example.com",
+			Name:    "Test User",
+			Picture: "https://example.com/pic.jpg",
 		}
 
 		if data.UserID != "user-123" {
@@ -574,9 +416,6 @@ func TestSessionData(t *testing.T) {
 		}
 		if data.Picture != "https://example.com/pic.jpg" {
 			t.Error("Picture not set correctly")
-		}
-		if data.CSRFToken != "csrf-token-123" {
-			t.Error("CSRFToken not set correctly")
 		}
 	})
 }

@@ -437,40 +437,6 @@ func TestResolveAllowedOrigins(t *testing.T) {
 	})
 }
 
-func TestIsHTMX(t *testing.T) {
-	t.Run("returns true for HTMX request", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-		c.Request.Header.Set("HX-Request", "true")
-
-		if !isHTMX(c) {
-			t.Error("expected isHTMX to return true")
-		}
-	})
-
-	t.Run("returns false for non-HTMX request", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-
-		if isHTMX(c) {
-			t.Error("expected isHTMX to return false")
-		}
-	})
-
-	t.Run("returns false for other HX-Request values", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-		c.Request.Header.Set("HX-Request", "false")
-
-		if isHTMX(c) {
-			t.Error("expected isHTMX to return false for 'false' value")
-		}
-	})
-}
-
 // TestClientRateLimiters covers the per-IP bucket isolation from
 // #123: one abusive client must not be able to exhaust another
 // client's bucket. Runs with a deliberately tight rate (1 rps, 1

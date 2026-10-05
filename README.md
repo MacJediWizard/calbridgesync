@@ -9,7 +9,7 @@ A production-ready Go application for bidirectional CalDAV calendar synchronizat
 - **OIDC Authentication**: Secure single sign-on via OpenID Connect
 - **Encrypted Credentials**: AES-256-GCM encryption for stored credentials
 - **Background Scheduling**: Configurable automatic sync intervals
-- **Web Dashboard**: HTMX + Tailwind CSS interface for management
+- **Web Dashboard**: React + Tailwind CSS single-page app for management
 - **Health Monitoring**: Kubernetes-ready health endpoints
 - **Docker Ready**: Multi-stage build with security best practices
 
