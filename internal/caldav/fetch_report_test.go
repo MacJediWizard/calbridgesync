@@ -18,9 +18,11 @@ import (
 const reportCal = "/cal/"
 
 type stubObject struct {
-	status int    // GET status; 0 means 200
-	body   string // GET body (and MULTIGET calendar-data)
-	inMG   bool   // returned by MULTIGET
+	status      int    // GET status; 0 means 200
+	body        string // GET body (and MULTIGET calendar-data)
+	inMG        bool   // returned by MULTIGET
+	errBody     string // GET body on a non-200 status; default "stub failure"
+	contentType string // GET Content-Type on a 200; default text/calendar
 }
 
 // newReportStub serves a minimal CalDAV calendar at /cal/:
@@ -68,12 +70,20 @@ func newReportStub(t *testing.T, objects map[string]stubObject) *Client {
 				return
 			}
 			if o.status != 0 && o.status != http.StatusOK {
+				errBody := o.errBody
+				if errBody == "" {
+					errBody = "stub failure"
+				}
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(o.status)
-				_, _ = io.WriteString(w, "stub failure")
+				_, _ = io.WriteString(w, errBody)
 				return
 			}
-			w.Header().Set("Content-Type", "text/calendar")
+			contentType := o.contentType
+			if contentType == "" {
+				contentType = "text/calendar"
+			}
+			w.Header().Set("Content-Type", contentType)
 			w.Header().Set("ETag", `"get"`)
 			_, _ = io.WriteString(w, o.body)
 		default:
@@ -169,6 +179,76 @@ func TestGetEvent_OnlyA404IsErrNotFound(t *testing.T) {
 	_, err = c.GetEvent(context.Background(), "/cal/missing.ics")
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetEvent on 404: err = %v, want ErrNotFound", err)
+	}
+}
+
+// go-webdav's HTTPError.Error() includes the text/* response body, so
+// a 5xx body can contain "malformed", "missing colon" or "invalid" +
+// "ical". The status must win: anything but a 404 is transient. (#206)
+func TestGetEventsWithReport_5xxBodyWithMalformedWordsIsTransient(t *testing.T) {
+	bodies := []string{
+		"backend unavailable: critical invalid state",
+		"malformed upstream response",
+		"missing colon in proxy config",
+	}
+	objects := map[string]stubObject{
+		"/cal/a.ics": {body: testICS("a", "A", flowStart), inMG: true},
+	}
+	for i, b := range bodies {
+		objects[fmt.Sprintf("/cal/x%d.ics", i)] = stubObject{status: http.StatusServiceUnavailable, errBody: b}
+	}
+	c := newReportStub(t, objects)
+
+	for i := range bodies {
+		path := fmt.Sprintf("/cal/x%d.ics", i)
+		_, err := c.GetEvent(context.Background(), path)
+		if err == nil || errors.Is(err, ErrMalformedContent) || errors.Is(err, ErrNotFound) {
+			t.Errorf("GetEvent(%s) on 503 = %v, want a transient error (not malformed, not not-found)", path, err)
+		}
+	}
+
+	_, report, err := c.GetEventsWithReport(context.Background(), reportCal, NewMalformedEventCollector())
+	if err != nil {
+		t.Fatalf("GetEventsWithReport: %v", err)
+	}
+	if len(report.Unreadable) != len(bodies) {
+		t.Fatalf("report.Unreadable = %+v, want %d entries", report.Unreadable, len(bodies))
+	}
+	for _, u := range report.Unreadable {
+		if u.Kind != UnreadableTransient {
+			t.Errorf("unreadable %s kind = %s, want transient (err %q)", u.Path, u.Kind, u.Err)
+		}
+	}
+}
+
+// A 200 whose body is empty (go-ical returns io.EOF) or whose
+// Content-Type is not text/calendar is a deterministic property of the
+// object, not a transient fault: it must be reported as malformed so
+// it does not block every deletion pass on every cycle. (#206)
+func TestGetEventsWithReport_EmptyOrWrongTypeBodyIsMalformed(t *testing.T) {
+	c := newReportStub(t, map[string]stubObject{
+		"/cal/a.ics":     {body: testICS("a", "A", flowStart), inMG: true},
+		"/cal/empty.ics": {body: ""},
+		"/cal/html.ics":  {body: "<html>oops</html>", contentType: "text/html"},
+	})
+	for _, p := range []string{"/cal/empty.ics", "/cal/html.ics"} {
+		_, err := c.GetEvent(context.Background(), p)
+		if !errors.Is(err, ErrMalformedContent) {
+			t.Errorf("GetEvent(%s) = %v, want ErrMalformedContent", p, err)
+		}
+	}
+
+	_, report, err := c.GetEventsWithReport(context.Background(), reportCal, nil)
+	if err != nil {
+		t.Fatalf("GetEventsWithReport: %v", err)
+	}
+	if len(report.Unreadable) != 2 {
+		t.Fatalf("report.Unreadable = %+v, want empty.ics and html.ics", report.Unreadable)
+	}
+	for _, u := range report.Unreadable {
+		if u.Kind != UnreadableMalformed {
+			t.Errorf("unreadable %s kind = %s, want malformed (err %q)", u.Path, u.Kind, u.Err)
+		}
 	}
 }
 

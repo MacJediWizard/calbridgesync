@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -356,15 +357,54 @@ func extractUIDFromICS(data string) string {
 	return ""
 }
 
-// isHTTPNotFound reports whether err is a 404 from go-webdav, whose
-// HTTPError type is internal and formats as "404 Not Found[: ...]".
-func isHTTPNotFound(err error) bool {
+// httpStatusCode returns the status of a go-webdav HTTPError anywhere
+// in err's chain. That type is internal, so it is matched by its
+// Error() format, "<code> <status text>[: <cause>]". The cause can
+// include up to 1KB of a text/* response body. (#206)
+func httpStatusCode(err error) (int, bool) {
 	for ; err != nil; err = errors.Unwrap(err) {
-		if strings.HasPrefix(err.Error(), "404 ") {
-			return true
+		s := err.Error()
+		if len(s) < 4 || s[3] != ' ' {
+			continue
+		}
+		code, convErr := strconv.Atoi(s[:3])
+		if convErr != nil || code < 100 || code > 599 {
+			continue
+		}
+		prefix := fmt.Sprintf("%d %s", code, http.StatusText(code))
+		if s == prefix || strings.HasPrefix(s, prefix+": ") {
+			return code, true
 		}
 	}
-	return false
+	return 0, false
+}
+
+// isTransportError reports whether err came from the network or the
+// request context rather than from the response content.
+func isTransportError(err error) bool {
+	var urlErr *url.Error
+	var netErr net.Error
+	return errors.As(err, &urlErr) ||
+		errors.As(err, &netErr) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// isMalformedBodyError reports whether a GetCalendarObject error that
+// is neither an HTTP status nor a transport failure describes the body
+// of a 200 response: an empty body (go-ical returns io.EOF), a missing
+// or wrong Content-Type, or an iCalendar parse error.
+func isMalformedBodyError(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	errStr := err.Error()
+	return strings.HasPrefix(errStr, "mime: ") ||
+		strings.Contains(errStr, "expected Content-Type") ||
+		strings.Contains(errStr, "malformed") ||
+		strings.Contains(errStr, "missing colon") ||
+		(strings.Contains(errStr, "invalid") && strings.Contains(errStr, "ical"))
 }
 
 // getEventsViaQuery uses REPORT calendar-query to get events.
@@ -648,7 +688,9 @@ func reportFetchError(report *FetchReport, path string, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return
-	case IsMalformedError(err):
+	case errors.Is(err, ErrMalformedContent):
+		// Sentinel only: IsMalformedError also matches on error text,
+		// which for an HTTP error can be the response body. (#206)
 		report.add(path, UnreadableMalformed, err.Error())
 	default:
 		report.add(path, UnreadableTransient, err.Error())
@@ -664,7 +706,7 @@ func (c *Client) getEventsIndividually(ctx context.Context, paths []string, coll
 	for _, path := range paths {
 		event, err := c.GetEvent(ctx, path)
 		if err != nil {
-			if IsMalformedError(err) {
+			if errors.Is(err, ErrMalformedContent) {
 				if collector != nil {
 					collector.Add(path, err.Error())
 				}
@@ -850,18 +892,24 @@ func IsMalformedError(err error) bool {
 func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error) {
 	obj, err := c.caldavClient.GetCalendarObject(ctx, eventPath)
 	if err != nil {
-		// Check for malformed content errors from the iCal parser
-		errStr := err.Error()
-		if strings.Contains(errStr, "malformed") ||
-			strings.Contains(errStr, "missing colon") ||
-			strings.Contains(errStr, "invalid") && strings.Contains(errStr, "ical") {
-			return nil, fmt.Errorf("%w: %s", ErrMalformedContent, eventPath)
+		// Classify by HTTP status first. Only a 404 means the object
+		// is gone; any other status (5xx, auth failure) says nothing
+		// about the object and is transient. The status check must
+		// come before any string matching, because the error text can
+		// carry the response body. (#206)
+		if code, ok := httpStatusCode(err); ok {
+			if code == http.StatusNotFound {
+				return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+			}
+			return nil, fmt.Errorf("failed to fetch event %s: %w", eventPath, err)
 		}
-		// Only a 404 means the object is gone. A 5xx, timeout or
-		// auth failure says nothing about whether it exists, so it
-		// must not look like ErrNotFound to callers. (#206)
-		if isHTTPNotFound(err) {
-			return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+		if isTransportError(err) {
+			return nil, fmt.Errorf("failed to fetch event %s: %w", eventPath, err)
+		}
+		// A 200 whose body cannot be decoded is a property of the
+		// object, not a passing fault.
+		if isMalformedBodyError(err) {
+			return nil, fmt.Errorf("%w: %s: %v", ErrMalformedContent, eventPath, err)
 		}
 		return nil, fmt.Errorf("failed to fetch event %s: %w", eventPath, err)
 	}
