@@ -3,7 +3,9 @@ package caldav
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
@@ -975,6 +978,28 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	return event, nil
 }
 
+// objectFilenameForUID returns the object filename PutEvent uses when it
+// has to build a destination path from an event UID (the create path).
+//
+// Ordinary UIDs keep uid + ".ics" exactly, so existing destination objects
+// stay addressable. go-webdav already escapes '?', '#', '%' and spaces when
+// it builds the request URL, so those must NOT be pre-escaped here.
+//
+// A UID containing '/', ".." or a control character would produce a path in
+// a sub-collection, a traversal out of the calendar collection, or an
+// invalid request line, and go-webdav cannot send '/' as %2F. Those UIDs get
+// a deterministic hashed filename instead. The UID inside the iCalendar
+// data is unchanged; CalDAV servers key events by that, not by filename.
+func objectFilenameForUID(uid string) string {
+	unsafe := strings.Contains(uid, "/") || strings.Contains(uid, "..") ||
+		strings.ContainsFunc(uid, unicode.IsControl)
+	if !unsafe {
+		return uid + ".ics"
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return hex.EncodeToString(sum[:])[:32] + ".ics"
+}
+
 // PutEvent creates or updates an event on the destination calendar.
 //
 // Return values:
@@ -1018,7 +1043,7 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 			}
 		}
 		if event.UID != "" {
-			path = strings.TrimSuffix(calendarPath, "/") + "/" + event.UID + ".ics"
+			path = strings.TrimSuffix(calendarPath, "/") + "/" + objectFilenameForUID(event.UID)
 		} else {
 			// Skip events without UID — can't construct a valid path. Same
 			// honesty contract as the empty-data case above: return a
