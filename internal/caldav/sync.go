@@ -1776,8 +1776,16 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			// Both sides moved since the last sync and the user chose
 			// dest_wins. Do not PUT the source copy over the
 			// destination edit, and leave currentUIDs alone: the
-			// dest_wins pass below owns this UID and records it after
-			// it pushes the destination copy back to the source.
+			// dest_wins pass below owns this UID. It records the UID
+			// after pushing the destination copy back to the source,
+			// or after a permanent PUT failure (see that pass).
+			//
+			// This relies on isRealConflictSourceWins(prev, destETag)
+			// matching the dest_wins pass's loop guard
+			// shouldUpdateSourceFromDest(destETag, prev): both mean
+			// "prev exists, prev.DestETag is set, and dest changed".
+			// If they ever diverge, a UID could be skipped here and
+			// never picked up there, so keep them in step.
 			result.EventsProcessed++
 			updateProgress()
 		} else if shouldUpdateDestFromSource(sourceEvent.ETag, previouslySyncedMap[sourceEvent.UID]) {
@@ -2003,6 +2011,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 				}
 				destEvent.Path = sourceEvent.Path
 				if err := sourceClient.PutEvent(ctx, calendar.Path, &destEvent); err != nil {
+					permanent := true
 					switch {
 					case errors.Is(err, ErrEventSkipped):
 						result.Skipped++
@@ -2011,7 +2020,27 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 					case isForbiddenError(err):
 						skippedForbidden++
 					default:
+						// Possibly transient: keep the previous row so
+						// the next cycle retries the write-back.
+						permanent = false
 						result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on source: %v", err))
+					}
+					// A permanent failure on a UID the forward loop
+					// deferred to this pass (both sides moved) would
+					// otherwise keep the old row, so the forward guard
+					// would defer it again every cycle and the UID
+					// would stop syncing for good. Record both current
+					// ETags, as the forward unchanged branch does, and
+					// warn: each side keeps its own edit until one of
+					// them changes again.
+					if _, recorded := currentUIDs[destEvent.UID]; permanent && !recorded {
+						result.Warnings = append(result.Warnings, fmt.Sprintf(
+							"dest_wins conflict on %q: could not write the destination copy back to the source (%v); source and destination keep different versions until one changes again",
+							destEvent.Summary, err))
+						currentUIDs[destEvent.UID] = syncETagEntry{
+							sourceETag: sourceEvent.ETag,
+							destETag:   destEvent.ETag,
+						}
 					}
 				} else {
 					result.Updated++

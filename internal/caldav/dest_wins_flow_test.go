@@ -1,6 +1,7 @@
 package caldav
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -104,6 +105,10 @@ func TestSyncFlow_DestWins_ConflictKeepsDestEdit(t *testing.T) {
 // Four cycles under dest_wins: a destination edit, then a source edit,
 // then two idle cycles. PUT traffic must reach zero by the third cycle
 // and stay there (no dest<->source ping-pong, #79 class).
+//
+// This is a settling check, not a check of the PR-11 forward guard: it
+// never edits both sides in one cycle, so it also passes without the
+// guard. TestSyncFlow_DestWins_ConflictKeepsDestEdit covers the guard.
 func TestSyncFlow_DestWins_FourCycleSettles(t *testing.T) {
 	h := destWinsSetup(t)
 
@@ -135,4 +140,86 @@ func TestSyncFlow_DestWins_FourCycleSettles(t *testing.T) {
 		assertPaths(t, step, "dest PUTs", h.dst.putLog())
 		assertPaths(t, step, "source PUTs", h.src.putLog())
 	}
+}
+
+// A both-sides conflict under dest_wins where the source PUT fails for
+// good (read-only source such as an iCloud subscribed calendar, a UID
+// collision, or a refused event). The forward guard must not freeze
+// the UID: the cycle records both current ETags and warns, and a later
+// source edit still reaches the destination.
+func TestSyncFlow_DestWins_ConflictPermanentSourceFailureRecovers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"forbidden", fakeErr("403 Forbidden")},
+		{"already exists", fakeErr("409 Conflict")},
+		{"skipped", fmt.Errorf("%w: refused", ErrEventSkipped)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := destWinsSetup(t)
+			h.src.failOn(srcPath("E"), tc.err)
+
+			h.src.edit(srcPath("E"), "Source edit")
+			h.dst.edit(destPath("E"), "Dest edit")
+			r := h.cycle()
+			assertNoSourceWinnerConflict(t, "cycle3", r)
+			assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog())
+			assertPaths(t, "cycle3", "source PUTs", h.src.putLog())
+			if len(r.Warnings) != 1 || !strings.Contains(r.Warnings[0], "could not write the destination copy back to the source") {
+				t.Errorf("cycle3: warnings = %v, want one dest_wins write-back failure", r.Warnings)
+			}
+			src, _ := h.src.get(srcPath("E"))
+			dst, _ := h.dst.get(destPath("E"))
+			row := h.rows()["E"]
+			if row == nil || row.SourceETag != src.ETag || row.DestETag != dst.ETag {
+				t.Fatalf("cycle3: row E = %+v, want current ETags src=%s dst=%s", row, src.ETag, dst.ETag)
+			}
+
+			// Steady: the failure is not retried every cycle.
+			r = h.cycle()
+			assertNoWarnings(t, "cycle4", r)
+			assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
+			assertPaths(t, "cycle4", "source PUTs", h.src.putLog())
+
+			// A later source edit still propagates.
+			h.src.failOn(srcPath("E"), nil)
+			h.src.edit(srcPath("E"), "Source edit 2")
+			r = h.cycle()
+			assertNoWarnings(t, "cycle5", r)
+			assertPaths(t, "cycle5", "dest PUTs", h.dst.putLog(), destPath("E"))
+			assertPaths(t, "cycle5", "source PUTs", h.src.putLog())
+			assertSummary(t, "cycle5", "dest", h.dst, destPath("E"), "Source edit 2")
+		})
+	}
+}
+
+// A one-off source PUT failure on a dest_wins conflict keeps the
+// previous tracking row, so the next cycle retries and the destination
+// edit still wins.
+func TestSyncFlow_DestWins_ConflictTransientSourceFailureRetries(t *testing.T) {
+	h := destWinsSetup(t)
+	prev := *h.rows()["E"]
+	h.src.failOn(srcPath("E"), fakeErr("500 Internal Server Error"))
+
+	h.src.edit(srcPath("E"), "Source edit")
+	h.dst.edit(destPath("E"), "Dest edit")
+	r := h.cycle()
+	assertNoSourceWinnerConflict(t, "cycle3", r)
+	assertPaths(t, "cycle3", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "cycle3", "source PUTs", h.src.putLog())
+	if len(r.Warnings) != 1 || !strings.Contains(r.Warnings[0], "Failed to update event on source") {
+		t.Errorf("cycle3: warnings = %v, want one source update failure", r.Warnings)
+	}
+	if row := h.rows()["E"]; row == nil || row.SourceETag != prev.SourceETag || row.DestETag != prev.DestETag {
+		t.Fatalf("cycle3: row E = %+v, want previous ETags %+v", row, prev)
+	}
+
+	h.src.failOn(srcPath("E"), nil)
+	r = h.cycle()
+	assertNoSourceWinnerConflict(t, "cycle4", r)
+	assertPaths(t, "cycle4", "dest PUTs", h.dst.putLog())
+	assertPaths(t, "cycle4", "source PUTs", h.src.putLog(), srcPath("E"))
+	assertSummary(t, "cycle4", "dest", h.dst, destPath("E"), "Dest edit")
+	assertSummary(t, "cycle4", "source", h.src, srcPath("E"), "Dest edit")
 }
