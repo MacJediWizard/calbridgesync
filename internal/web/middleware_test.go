@@ -45,6 +45,31 @@ func TestSecurityHeaders(t *testing.T) {
 		}
 	})
 
+	t.Run("CSP allows only self-hosted scripts", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+		SecurityHeaders()(c)
+
+		// The Vite build emits only external module scripts, so script-src
+		// needs no 'unsafe-inline' and no CDN. style-src keeps 'unsafe-inline'
+		// for React style props and the inline <style> in error.html, plus
+		// Google Fonts which web/src/index.css imports.
+		want := "default-src 'self'; " +
+			"script-src 'self'; " +
+			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+			"img-src 'self' data: https://cdn.macjediwizard.com; " +
+			"font-src 'self' https://fonts.gstatic.com; " +
+			"connect-src 'self'; " +
+			"form-action 'self'; " +
+			"frame-ancestors 'none'; " +
+			"base-uri 'self'"
+		if got := w.Header().Get("Content-Security-Policy"); got != want {
+			t.Errorf("Content-Security-Policy mismatch\n got: %s\nwant: %s", got, want)
+		}
+	})
+
 	t.Run("sets HSTS header for HTTPS", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
