@@ -651,9 +651,11 @@ func (db *DB) GetDestinationsBySourceID(sourceID string) ([]*Destination, error)
 	return dests, nil
 }
 
-// DeleteDestination removes a destination by ID. (#154)
-func (db *DB) DeleteDestination(id string) error {
-	result, err := db.conn.Exec(`DELETE FROM destinations WHERE id = ?`, id)
+// DeleteDestination removes a destination by ID, scoped to its owning
+// source so a caller who owns sourceID cannot delete another source's
+// destination. Returns ErrNotFound when no row matched. (#154, #198)
+func (db *DB) DeleteDestination(id, sourceID string) error {
+	result, err := db.conn.Exec(`DELETE FROM destinations WHERE id = ? AND source_id = ?`, id, sourceID)
 	if err != nil {
 		return fmt.Errorf("failed to delete destination: %w", err)
 	}
