@@ -40,9 +40,10 @@ func isForbiddenError(err error) bool {
 
 // isSourceAlreadyExistsError reports whether a PutEvent error against the
 // source CalDAV server indicates that the event already exists there — either
-// in the calendar being synced (412 Precondition Failed on the If-None-Match
-// header) or anywhere else on the same account (409 Conflict on a UID
-// collision). iCloud in particular returns 409 Conflict when you try to PUT
+// in the calendar being synced (a server-side 412 Precondition Failed; the
+// reverse create sends no If-None-Match, so this only comes from servers
+// that refuse a create over an existing UID on their own) or anywhere else
+// on the same account (409 Conflict on a UID collision). iCloud in particular returns 409 Conflict when you try to PUT
 // an event whose UID already exists under a DIFFERENT calendar on the same
 // account — CalDAV UIDs are account-global on iCloud, so an event that lives
 // on iCloud's "Home" calendar can't be created again on iCloud's "Work"
@@ -798,6 +799,7 @@ type calendarClient interface {
 	GetEventsWithReport(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, FetchReport, error)
 	GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	PutEvent(ctx context.Context, calendarPath string, event *Event) error
+	PutEventIfMatch(ctx context.Context, calendarPath string, event *Event, destETag string) error
 	DeleteEvent(ctx context.Context, eventPath string) error
 }
 
@@ -885,10 +887,6 @@ type SyncResult struct {
 	Errors            []string      `json:"errors,omitempty"`   // Critical errors that prevent sync
 	Warnings          []string      `json:"warnings,omitempty"` // Non-critical issues (individual event failures)
 	Duration          time.Duration `json:"duration"`
-	// ContentHash is the SHA-256 hex digest of the ICS feed body.
-	// Populated only for ICS source types. Used by the scheduler's
-	// adaptive polling logic to detect unchanged feeds. (#146)
-	ContentHash string `json:"content_hash,omitempty"`
 }
 
 // sanitizeLogDetails removes potentially sensitive information from sync log details.
@@ -2012,13 +2010,31 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			// from different servers and will never match, which was
 			// the cause of the infinite re-PUT loop fixed in #79.
 			sourceEvent.Path = destEvent.Path
-			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
+			// If-Match on the destination ETag read this cycle, so a
+			// destination edit made since that read is not silently
+			// overwritten. An empty ETag sends no precondition.
+			if err := destClient.PutEventIfMatch(ctx, destCalendarPath, &sourceEvent, destEvent.ETag); err != nil {
 				if errors.Is(err, ErrEventSkipped) {
 					// PutEvent refused. Don't add to currentUIDs —
 					// the destination still has the OLD version of
 					// this event, not an updated one, so we should
 					// not track it as freshly synced.
 					result.Skipped++
+				} else if errors.Is(err, ErrPreconditionFailed) {
+					// 412: the destination changed after we read it.
+					// Nothing was written. Keep the tracking row alive
+					// with its previous ETags so the source change still
+					// looks pending and the next cycle retries against
+					// the fresh destination copy. An untracked UID has
+					// no row to keep; the next cycle retries it anyway.
+					result.Skipped++
+					if prev := previouslySyncedMap[sourceEvent.UID]; prev != nil {
+						currentUIDs[sourceEvent.UID] = syncETagEntry{
+							sourceETag: prev.SourceETag,
+							destETag:   prev.DestETag,
+						}
+					}
+					log.Printf("Update of %s skipped: destination changed since it was read (412); retrying next cycle", sourceEvent.UID)
 				} else {
 					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on dest: %v", err))
 				}
@@ -2569,9 +2585,6 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 		se.finishSync(source.ID, result)
 		return result
 	}
-
-	// Capture content hash for adaptive polling (#146)
-	result.ContentHash = icsClient.LastFetchHash()
 
 	// Filter events by date if configured
 	if source.SyncDaysPast > 0 {

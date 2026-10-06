@@ -254,6 +254,9 @@ func (db *DB) migrate() error {
 		// Migration: ICS adaptive polling (#146). Tracks content
 		// hash to detect unchanged feeds and adaptive interval to
 		// reduce polling frequency when feed hasn't changed.
+		// The feature was removed (it wrote these columns but never
+		// read them back); the columns stay so older binaries and
+		// existing rows keep working. Nothing reads or writes them.
 		`ALTER TABLE sources ADD COLUMN last_content_hash TEXT`,
 		`ALTER TABLE sources ADD COLUMN adaptive_interval INTEGER`,
 
