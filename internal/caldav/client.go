@@ -3,7 +3,9 @@ package caldav
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,10 +14,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	gopath "path"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
@@ -36,6 +40,11 @@ var (
 	// warnings, which is wrong — they are skips, not errors. Use
 	// errors.Is(err, ErrEventSkipped) to distinguish.
 	ErrEventSkipped = errors.New("event skipped")
+	// ErrPreconditionFailed indicates that a PutEventIfMatch update was
+	// refused with 412 because the destination object changed after we
+	// read it. Nothing was written; the next cycle retries against the
+	// fresh destination copy.
+	ErrPreconditionFailed = errors.New("precondition failed")
 )
 
 const (
@@ -975,6 +984,28 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	return event, nil
 }
 
+// objectFilenameForUID returns the object filename PutEvent uses when it
+// has to build a destination path from an event UID (the create path).
+//
+// Ordinary UIDs keep uid + ".ics" exactly, so existing destination objects
+// stay addressable. go-webdav already escapes '?', '#', '%' and spaces when
+// it builds the request URL, so those must NOT be pre-escaped here.
+//
+// A UID containing '/', ".." or a control character would produce a path in
+// a sub-collection, a traversal out of the calendar collection, or an
+// invalid request line, and go-webdav cannot send '/' as %2F. Those UIDs get
+// a deterministic hashed filename instead. The UID inside the iCalendar
+// data is unchanged; CalDAV servers key events by that, not by filename.
+func objectFilenameForUID(uid string) string {
+	unsafe := strings.Contains(uid, "/") || strings.Contains(uid, "..") ||
+		strings.ContainsFunc(uid, unicode.IsControl)
+	if !unsafe {
+		return uid + ".ics"
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return hex.EncodeToString(sum[:])[:32] + ".ics"
+}
+
 // PutEvent creates or updates an event on the destination calendar.
 //
 // Return values:
@@ -986,7 +1017,22 @@ func (c *Client) GetEvent(ctx context.Context, eventPath string) (*Event, error)
 //   - any other non-nil error: a real failure (parse, connection, auth,
 //     write). Callers should surface these in result.Warnings or
 //     result.Errors as appropriate.
+//
+// PutEvent sends no precondition headers. Use PutEventIfMatch to update
+// an object whose destination ETag is known.
 func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event) error {
+	return c.PutEventIfMatch(ctx, calendarPath, event, "")
+}
+
+// PutEventIfMatch is PutEvent with an If-Match precondition on the first
+// PUT when destETag is non-empty, so an update does not silently
+// overwrite a destination edit made after we read the object. A 412
+// returns a wrapped ErrPreconditionFailed.
+//
+// If-None-Match is never sent: the create path must still be able to
+// PUT over an existing object the date filter hid from us, and the #168
+// SEQUENCE retry after a 403 sends no precondition headers at all.
+func (c *Client) PutEventIfMatch(ctx context.Context, calendarPath string, event *Event, destETag string) error {
 	// Skip events with empty data. This is NOT a success — we did not
 	// write anything. Previously this returned nil, which made the
 	// caller's `result.Created++` bookkeeping lie.
@@ -1018,7 +1064,7 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 			}
 		}
 		if event.UID != "" {
-			path = strings.TrimSuffix(calendarPath, "/") + "/" + event.UID + ".ics"
+			path = strings.TrimSuffix(calendarPath, "/") + "/" + objectFilenameForUID(event.UID)
 		} else {
 			// Skip events without UID — can't construct a valid path. Same
 			// honesty contract as the empty-data case above: return a
@@ -1030,7 +1076,7 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 	}
 
 	log.Printf("PutEvent: putting to path %s", path)
-	_, err = c.caldavClient.PutCalendarObject(ctx, path, cal)
+	err = c.putCalendarObject(ctx, path, cal, destETag)
 	if err != nil {
 		// SOGo (and other RFC-5546-strict servers) reject a PUT when the
 		// incoming SEQUENCE is lower than what they already have stored
@@ -1051,10 +1097,95 @@ func (c *Client) PutEvent(ctx context.Context, calendarPath string, event *Event
 				return nil
 			}
 		}
+		var statusErr *putStatusError
+		if destETag != "" && errors.As(err, &statusErr) && statusErr.code == http.StatusPreconditionFailed {
+			return fmt.Errorf("%w: destination changed since it was read (%s): %w", ErrPreconditionFailed, path, err)
+		}
 		return fmt.Errorf("%w: failed to put event: %w", ErrConnectionFailed, err)
 	}
 
 	return nil
+}
+
+// putStatusError is a non-2xx PUT response. Error() keeps go-webdav's
+// "<code> <status text>: <body>" shape, which the 403 SEQUENCE hand-off
+// and the string-based 412/409 classifiers in sync.go match on.
+type putStatusError struct {
+	code   int
+	detail string
+}
+
+func (e *putStatusError) Error() string {
+	s := fmt.Sprintf("%d %s", e.code, http.StatusText(e.code))
+	if e.detail != "" {
+		s += ": " + e.detail
+	}
+	return s
+}
+
+// putCalendarObject PUTs cal to path. go-webdav's PutCalendarObject cannot
+// set request headers and fails a successful PUT whose response carries a
+// weak ETag (it strconv.Unquotes W/"..."), so the request is built here
+// on the same *http.Client, with the same URL resolution, Content-Type
+// and auth go-webdav would use. No caller needs the response ETag, so it
+// is not parsed. ifMatch, when non-empty, is the unquoted destination
+// ETag (go-webdav unquotes getetag values) and is sent quoted.
+func (c *Client) putCalendarObject(ctx context.Context, path string, cal *ical.Calendar, ifMatch string) error {
+	// Buffered, not streamed: some servers require Content-Length
+	// (Radicale #1016), as go-webdav notes.
+	var buf bytes.Buffer
+	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
+		return err
+	}
+	target, err := c.resolveHref(path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", ical.MIMEType)
+	if ifMatch != "" {
+		req.Header.Set("If-Match", strconv.Quote(ifMatch))
+	}
+	// OAuth clients get their bearer token from the transport; basic-auth
+	// clients get credentials here, as webdav.HTTPClientWithBasicAuth does.
+	if c.tokenSource == nil {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxCalDAVResponseSize))
+		return nil
+	}
+	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	return &putStatusError{code: resp.StatusCode, detail: strings.TrimSpace(string(detail))}
+}
+
+// resolveHref turns an object path into a request URL exactly as
+// go-webdav's internal Client.ResolveHref does, so the hand-built PUT
+// hits the same wire path (including its escaping of '?', '#', '%' and
+// spaces) as every other go-webdav request. A relative path is joined
+// to the endpoint path; an absolute path replaces it.
+func (c *Client) resolveHref(p string) (string, error) {
+	endpoint, err := url.Parse(c.baseURL)
+	if err != nil {
+		return "", err
+	}
+	if endpoint.Path == "" {
+		endpoint.Path = "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = gopath.Join(endpoint.Path, p)
+	}
+	u := url.URL{Scheme: endpoint.Scheme, User: endpoint.User, Host: endpoint.Host, Path: p}
+	return u.String(), nil
 }
 
 // retryPutWithBumpedSequence attempts a second PUT after a 403 by reading

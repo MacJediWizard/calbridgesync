@@ -40,9 +40,10 @@ func isForbiddenError(err error) bool {
 
 // isSourceAlreadyExistsError reports whether a PutEvent error against the
 // source CalDAV server indicates that the event already exists there — either
-// in the calendar being synced (412 Precondition Failed on the If-None-Match
-// header) or anywhere else on the same account (409 Conflict on a UID
-// collision). iCloud in particular returns 409 Conflict when you try to PUT
+// in the calendar being synced (a server-side 412 Precondition Failed; the
+// reverse create sends no If-None-Match, so this only comes from servers
+// that refuse a create over an existing UID on their own) or anywhere else
+// on the same account (409 Conflict on a UID collision). iCloud in particular returns 409 Conflict when you try to PUT
 // an event whose UID already exists under a DIFFERENT calendar on the same
 // account — CalDAV UIDs are account-global on iCloud, so an event that lives
 // on iCloud's "Home" calendar can't be created again on iCloud's "Work"
@@ -798,6 +799,7 @@ type calendarClient interface {
 	GetEventsWithReport(ctx context.Context, calendarPath string, collector *MalformedEventCollector) ([]Event, FetchReport, error)
 	GetEvent(ctx context.Context, eventPath string) (*Event, error)
 	PutEvent(ctx context.Context, calendarPath string, event *Event) error
+	PutEventIfMatch(ctx context.Context, calendarPath string, event *Event, destETag string) error
 	DeleteEvent(ctx context.Context, eventPath string) error
 }
 
@@ -885,10 +887,6 @@ type SyncResult struct {
 	Errors            []string      `json:"errors,omitempty"`   // Critical errors that prevent sync
 	Warnings          []string      `json:"warnings,omitempty"` // Non-critical issues (individual event failures)
 	Duration          time.Duration `json:"duration"`
-	// ContentHash is the SHA-256 hex digest of the ICS feed body.
-	// Populated only for ICS source types. Used by the scheduler's
-	// adaptive polling logic to detect unchanged feeds. (#146)
-	ContentHash string `json:"content_hash,omitempty"`
 }
 
 // sanitizeLogDetails removes potentially sensitive information from sync log details.
@@ -996,44 +994,6 @@ func (se *SyncEngine) buildPerSourceGoogleOAuthConfig(source *db.Source, redirec
 // GetActivityTracker returns the activity tracker for external use.
 func (se *SyncEngine) GetActivityTracker() *activity.Tracker {
 	return se.tracker
-}
-
-// multiDestinationPaused gates syncing to additional destinations (#183).
-// synced_events and sync_states have no destination_id, so an extra
-// destination reads and writes the primary destination's tracking rows:
-// its upserts overwrite the primary's dest_etag/dest_path and its orphan
-// deletes act on the primary's rows. Forcing it to one-way is not enough.
-// Stays true until the remove-or-finish decision (audit PR-35) lands.
-const multiDestinationPaused = true
-
-// activeAdditionalDestinations returns the additional destinations that
-// should be synced this cycle. It returns nil while multi-destination is
-// paused (#183), even when destinations are enabled.
-func activeAdditionalDestinations(dests []*db.Destination) []*db.Destination {
-	if multiDestinationPaused {
-		return nil
-	}
-	var active []*db.Destination
-	for _, d := range dests {
-		if d.Enabled {
-			active = append(active, d)
-		}
-	}
-	return active
-}
-
-// logPausedDestinations logs once per sync how many enabled additional
-// destinations were skipped because multi-destination is paused (#183).
-func logPausedDestinations(sourceName string, all, active []*db.Destination) {
-	enabled := 0
-	for _, d := range all {
-		if d.Enabled {
-			enabled++
-		}
-	}
-	if paused := enabled - len(active); paused > 0 {
-		log.Printf("%d additional destination(s) paused for source %s: multi-destination sync is disabled until destinations get their own tracking state (#183)", paused, sourceName)
-	}
 }
 
 // SyncSource performs synchronization for a single source.
@@ -1257,55 +1217,6 @@ func (se *SyncEngine) SyncSource(ctx context.Context, source *db.Source) *SyncRe
 
 	result.CalendarsSynced = len(sourceCalendars)
 
-	// Multi-destination sync (#156): after syncing to the primary
-	// destination, check for additional destinations and sync to
-	// each one. The primary destination (dest_url on the source
-	// row) always syncs first — additional destinations are
-	// additive. A failure on one additional destination doesn't
-	// prevent others from being tried.
-	//
-	// Paused (#183): activeAdditionalDestinations returns nil until
-	// extra destinations get their own tracking rows.
-	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
-	if err != nil {
-		log.Printf("Failed to load additional destinations for source %s: %v", source.Name, err)
-	}
-	activeDests := activeAdditionalDestinations(additionalDests)
-	logPausedDestinations(source.Name, additionalDests, activeDests)
-	for _, dest := range activeDests {
-		log.Printf("Syncing to additional destination: %s (%s)", dest.Name, dest.DestURL)
-		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
-		if decErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to decrypt credentials for additional dest %q: %v", dest.Name, decErr))
-			continue
-		}
-		extraDestClient, connErr := NewClient(dest.DestURL, dest.DestUsername, extraDestPassword)
-		if connErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to connect to additional dest %q: %v", dest.Name, connErr))
-			continue
-		}
-		if testErr := extraDestClient.TestConnection(ctx); testErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Connection test failed for additional dest %q: %v", dest.Name, testErr))
-			continue
-		}
-		for i, cal := range sourceCalendars {
-			calResult := se.syncCalendar(ctx, source, sourceClient, extraDestClient, cal, i+1, sharedDestCalendar)
-			result.Created += calResult.Created
-			result.Updated += calResult.Updated
-			result.Deleted += calResult.Deleted
-			result.Skipped += calResult.Skipped
-			result.EventsProcessed += calResult.EventsProcessed
-			result.Warnings = append(result.Warnings, calResult.Warnings...)
-			// Errors from additional dests are downgraded to warnings
-			// so a failure on one extra dest doesn't mark the whole
-			// sync as failed.
-			for _, e := range calResult.Errors {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("[additional dest %q] %s", dest.Name, e))
-			}
-		}
-		log.Printf("Completed sync to additional destination: %s", dest.Name)
-	}
-
 	// Success if no critical errors (warnings are OK)
 	result.Success = len(result.Errors) == 0
 	if result.Success && len(result.Warnings) == 0 {
@@ -1345,6 +1256,58 @@ func syncFailureMessage(source *db.Source, errs []string) string {
 // was removed (#196).
 func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourceClient, destClient *Client, calendar Calendar, calendarIndex int, sharedDestCalendar bool) *SyncResult {
 	return se.fullSync(ctx, source, sourceClient, destClient, calendar, calendarIndex, sharedDestCalendar)
+}
+
+// filterEventsInWindow is the sync_days_past filter every sync path
+// uses. It applies filterEventsByDate to each event as if the object
+// had no VTIMEZONE blocks and returns the kept events unmodified.
+//
+// DST VTIMEZONEs carry RRULE:FREQ=YEARLY in their STANDARD/DAYLIGHT
+// sub-components, which filterEventsByDate's "RRULE:" short-circuit
+// would read as a recurring event. Since ICS objects carry their
+// VTIMEZONEs (#248), that would keep every old one-off event in a DST
+// zone. Source and destination must use the same check: an event kept
+// on one side and dropped on the other looks new (created) or
+// destination-only (orphan-deleted).
+func filterEventsInWindow(events []Event, cutoffDate time.Time) []Event {
+	var kept []Event
+	for _, e := range events {
+		probe := e
+		probe.Data = stripVTimezones(e.Data)
+		if len(filterEventsByDate([]Event{probe}, cutoffDate)) == 1 {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// stripVTimezones returns data with every BEGIN:VTIMEZONE ...
+// END:VTIMEZONE block removed. It is used only for property checks
+// that must ignore VTIMEZONE sub-component RRULEs; the result is never
+// written anywhere.
+func stripVTimezones(data string) string {
+	if !strings.Contains(data, "BEGIN:VTIMEZONE") {
+		return data
+	}
+	var b strings.Builder
+	b.Grow(len(data))
+	inTZ := false
+	for _, line := range strings.SplitAfter(data, "\n") {
+		switch strings.TrimRight(line, "\r\n") {
+		case "BEGIN:VTIMEZONE":
+			inTZ = true
+			continue
+		case "END:VTIMEZONE":
+			if inTZ {
+				inTZ = false
+				continue
+			}
+		}
+		if !inTZ {
+			b.WriteString(line)
+		}
+	}
+	return b.String()
 }
 
 // filterEventsByDate filters events to only include those with start time after cutoff date.
@@ -1437,7 +1400,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	if source.SyncDaysPast > 0 {
 		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
 		originalCount := len(sourceEvents)
-		sourceEvents = filterEventsByDate(sourceEvents, cutoffDate)
+		sourceEvents = filterEventsInWindow(sourceEvents, cutoffDate)
 		filteredOut := originalCount - len(sourceEvents)
 		if filteredOut > 0 {
 			log.Printf("Filtered out %d events older than %d days (cutoff: %s)", filteredOut, source.SyncDaysPast, cutoffDate.Format("2006-01-02"))
@@ -1602,7 +1565,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	if source.SyncDaysPast > 0 {
 		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
 		originalCount := len(destEvents)
-		destEvents = filterEventsByDate(destEvents, cutoffDate)
+		destEvents = filterEventsInWindow(destEvents, cutoffDate)
 		filteredOut := originalCount - len(destEvents)
 		if filteredOut > 0 {
 			log.Printf("Filtered out %d destination events older than %d days", filteredOut, source.SyncDaysPast)
@@ -1960,13 +1923,31 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 			// from different servers and will never match, which was
 			// the cause of the infinite re-PUT loop fixed in #79.
 			sourceEvent.Path = destEvent.Path
-			if err := destClient.PutEvent(ctx, destCalendarPath, &sourceEvent); err != nil {
+			// If-Match on the destination ETag read this cycle, so a
+			// destination edit made since that read is not silently
+			// overwritten. An empty ETag sends no precondition.
+			if err := destClient.PutEventIfMatch(ctx, destCalendarPath, &sourceEvent, destEvent.ETag); err != nil {
 				if errors.Is(err, ErrEventSkipped) {
 					// PutEvent refused. Don't add to currentUIDs —
 					// the destination still has the OLD version of
 					// this event, not an updated one, so we should
 					// not track it as freshly synced.
 					result.Skipped++
+				} else if errors.Is(err, ErrPreconditionFailed) {
+					// 412: the destination changed after we read it.
+					// Nothing was written. Keep the tracking row alive
+					// with its previous ETags so the source change still
+					// looks pending and the next cycle retries against
+					// the fresh destination copy. An untracked UID has
+					// no row to keep; the next cycle retries it anyway.
+					result.Skipped++
+					if prev := previouslySyncedMap[sourceEvent.UID]; prev != nil {
+						currentUIDs[sourceEvent.UID] = syncETagEntry{
+							sourceETag: prev.SourceETag,
+							destETag:   prev.DestETag,
+						}
+					}
+					log.Printf("Update of %s skipped: destination changed since it was read (412); retrying next cycle", sourceEvent.UID)
 				} else {
 					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to update event on dest: %v", err))
 				}
@@ -2518,13 +2499,10 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 		return result
 	}
 
-	// Capture content hash for adaptive polling (#146)
-	result.ContentHash = icsClient.LastFetchHash()
-
 	// Filter events by date if configured
 	if source.SyncDaysPast > 0 {
 		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
-		sourceEvents = filterEventsByDate(sourceEvents, cutoffDate)
+		sourceEvents = filterEventsInWindow(sourceEvents, cutoffDate)
 	}
 
 	// Store malformed events
@@ -2556,47 +2534,6 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	result.Errors = append(result.Errors, syncResult.Errors...)
 	result.Warnings = append(result.Warnings, syncResult.Warnings...)
 	result.CalendarsSynced = 1
-
-	// Multi-destination sync (#156): after syncing to the primary
-	// destination, replicate the same ICS events to any additional
-	// destinations. Failures on one extra dest don't block others.
-	//
-	// Paused (#183): activeAdditionalDestinations returns nil until
-	// extra destinations get their own tracking rows.
-	additionalDests, err := se.db.GetDestinationsBySourceID(source.ID)
-	if err != nil {
-		log.Printf("Failed to load additional destinations for ICS source %s: %v", source.Name, err)
-	}
-	activeDests := activeAdditionalDestinations(additionalDests)
-	logPausedDestinations(source.Name, additionalDests, activeDests)
-	for _, dest := range activeDests {
-		log.Printf("Syncing ICS feed to additional destination: %s (%s)", dest.Name, dest.DestURL)
-		extraDestPassword, decErr := se.encryptor.Decrypt(dest.DestPassword)
-		if decErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to decrypt credentials for additional dest %q: %v", dest.Name, decErr))
-			continue
-		}
-		extraDestClient, connErr := NewClient(dest.DestURL, dest.DestUsername, extraDestPassword)
-		if connErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to connect to additional dest %q: %v", dest.Name, connErr))
-			continue
-		}
-		if testErr := extraDestClient.TestConnection(ctx); testErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Connection test failed for additional dest %q: %v", dest.Name, testErr))
-			continue
-		}
-		extraResult := se.syncEventsToDestination(ctx, source, nil, extraDestClient, sourceEvents, FetchReport{}, calendar, 1, db.SyncDirectionOneWay, false)
-		result.Created += extraResult.Created
-		result.Updated += extraResult.Updated
-		result.Deleted += extraResult.Deleted
-		result.Skipped += extraResult.Skipped
-		result.EventsProcessed += extraResult.EventsProcessed
-		result.Warnings = append(result.Warnings, extraResult.Warnings...)
-		for _, e := range extraResult.Errors {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("[additional dest %q] %s", dest.Name, e))
-		}
-		log.Printf("Completed ICS sync to additional destination: %s", dest.Name)
-	}
 
 	result.Success = len(result.Errors) == 0
 	if result.Success && len(result.Warnings) == 0 {

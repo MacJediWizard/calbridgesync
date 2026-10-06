@@ -133,18 +133,6 @@ type ICSClient struct {
 	username   string
 	password   string
 	httpClient *http.Client
-	// lastFetchHash is the SHA-256 hex digest of the most recently
-	// fetched feed body. Set by FetchEvents, read by
-	// LastFetchHash(). Used by the scheduler's adaptive polling
-	// to detect unchanged content. (#146)
-	lastFetchHash string
-}
-
-// LastFetchHash returns the SHA-256 hex digest of the feed body
-// from the most recent FetchEvents call. Empty if FetchEvents
-// hasn't been called yet or failed before reading the body.
-func (c *ICSClient) LastFetchHash() string {
-	return c.lastFetchHash
 }
 
 // validateICSFeedURL rejects obviously unsafe ICS feed URLs. The
@@ -316,11 +304,7 @@ func (c *ICSClient) TestConnection(ctx context.Context) error {
 	return nil
 }
 
-// FetchEvents fetches and parses events from the ICS feed.
 // FetchEvents fetches and parses all events from the ICS feed.
-// Returns events + a SHA-256 hex digest of the raw feed body (for
-// adaptive polling content change detection). The hash is computed
-// before parsing so it captures the exact bytes received.
 func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCollector) ([]Event, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.feedURL, nil)
 	if err != nil {
@@ -349,10 +333,6 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 	}
 
 	log.Printf("ICS feed: fetched %d bytes from %s", len(body), c.feedURL)
-
-	// Compute content hash for adaptive polling (#146)
-	hash := sha256.Sum256(body)
-	c.lastFetchHash = fmt.Sprintf("%x", hash)
 
 	// Parse iCalendar data
 	dec := ical.NewDecoder(strings.NewReader(string(body)))
@@ -398,6 +378,29 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		}
 	}
 
+	// Index the feed's VTIMEZONEs in feed order (first encodable
+	// definition of a TZID wins) so each per-UID object can carry the
+	// ones it references. A VTIMEZONE the encoder rejects is skipped:
+	// copying it would fail the whole UID group's encode and drop the
+	// event, which one-way orphan deletion then removes downstream.
+	var feedTimezones []*ical.Component
+	seenTZID := make(map[string]bool)
+	for _, child := range cal.Children {
+		if child.Name != ical.CompTimezone {
+			continue
+		}
+		tzid, _ := child.Props.Text(ical.PropTimezoneID)
+		if tzid == "" || seenTZID[tzid] {
+			continue
+		}
+		if err := checkEncodableTimezone(child); err != nil {
+			log.Printf("ICS feed: skipping invalid VTIMEZONE %q: %v", tzid, err)
+			continue
+		}
+		seenTZID[tzid] = true
+		feedTimezones = append(feedTimezones, child)
+	}
+
 	// Build events from groups
 	var events []Event
 	for _, uid := range groupOrder {
@@ -406,6 +409,22 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 		singleCal := ical.NewCalendar()
 		singleCal.Props.SetText(ical.PropVersion, "2.0")
 		singleCal.Props.SetText(ical.PropProductID, "-//CalBridgeSync//EN")
+
+		// Copy referenced VTIMEZONEs ahead of the VEVENTs; without them
+		// TZID parameters dangle and the event is mis-timed or rejected
+		// by strict servers. (#248)
+		if len(feedTimezones) > 0 {
+			used := make(map[string]bool)
+			for _, vevent := range g.vevents {
+				collectTZIDs(vevent, used)
+			}
+			for _, tz := range feedTimezones {
+				if tzid, _ := tz.Props.Text(ical.PropTimezoneID); used[tzid] {
+					singleCal.Children = append(singleCal.Children, tz)
+				}
+			}
+		}
+
 		for _, vevent := range g.vevents {
 			singleCal.Children = append(singleCal.Children, vevent)
 		}
@@ -430,6 +449,34 @@ func (c *ICSClient) FetchEvents(ctx context.Context, collector *MalformedEventCo
 
 	log.Printf("ICS feed: parsed %d events (%d UIDs grouped from %d VEVENTs)", len(events), len(groups), len(cal.Events()))
 	return events, nil
+}
+
+// checkEncodableTimezone reports whether go-ical can encode tz, by
+// encoding it alone in a throwaway calendar. This applies the encoder's
+// own structural checks (STANDARD/DAYLIGHT children, exactly one TZID,
+// DTSTART/TZOFFSETFROM/TZOFFSETTO once per child) rather than
+// duplicating them.
+func checkEncodableTimezone(tz *ical.Component) error {
+	probe := ical.NewCalendar()
+	probe.Props.SetText(ical.PropVersion, "2.0")
+	probe.Props.SetText(ical.PropProductID, "-//CalBridgeSync//EN")
+	probe.Children = []*ical.Component{tz}
+	return ical.NewEncoder(io.Discard).Encode(probe)
+}
+
+// collectTZIDs records every TZID parameter used by comp's properties
+// and those of its sub-components (e.g. VALARM) into used.
+func collectTZIDs(comp *ical.Component, used map[string]bool) {
+	for _, props := range comp.Props {
+		for _, p := range props {
+			if tzid := p.Params.Get(ical.ParamTimezoneID); tzid != "" {
+				used[tzid] = true
+			}
+		}
+	}
+	for _, child := range comp.Children {
+		collectTZIDs(child, used)
+	}
 }
 
 // icsSyntheticETag derives a stable ETag for one encoded UID group.

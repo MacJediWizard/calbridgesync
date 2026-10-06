@@ -16,6 +16,12 @@ var (
 	ErrNotFound     = errors.New("record not found")
 	ErrDuplicate    = errors.New("duplicate record")
 	ErrDatabaseInit = errors.New("database initialization failed")
+
+	// ErrSubjectMismatch means the email is already bound to a different
+	// OIDC subject, so the login must not be mapped onto that user.
+	ErrSubjectMismatch = errors.New("email is bound to a different OIDC subject")
+	// ErrMissingSubject means the OIDC claims carried no subject.
+	ErrMissingSubject = errors.New("OIDC subject is required")
 )
 
 // DB represents the database connection.
@@ -248,6 +254,9 @@ func (db *DB) migrate() error {
 		// Migration: ICS adaptive polling (#146). Tracks content
 		// hash to detect unchanged feeds and adaptive interval to
 		// reduce polling frequency when feed hasn't changed.
+		// The feature was removed (it wrote these columns but never
+		// read them back); the columns stay so older binaries and
+		// existing rows keep working. Nothing reads or writes them.
 		`ALTER TABLE sources ADD COLUMN last_content_hash TEXT`,
 		`ALTER TABLE sources ADD COLUMN adaptive_interval INTEGER`,
 
@@ -267,11 +276,11 @@ func (db *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,
 
-		// Multi-destination support (#154). Each source can sync
-		// to additional destinations beyond the primary one stored
-		// on the source row. The primary dest_url/dest_username/
-		// dest_password columns on sources are kept for backward
-		// compatibility; this table holds ADDITIONAL destinations.
+		// Multi-destination support (#154) was removed (#262): the
+		// destinations shared the primary destination's synced_events
+		// and sync_states rows. Nothing reads or writes this table any
+		// more. It and any existing rows are kept, with no migration,
+		// so an older binary can still start against this database.
 		`CREATE TABLE IF NOT EXISTS destinations (
 			id TEXT PRIMARY KEY,
 			source_id TEXT NOT NULL,
@@ -295,6 +304,15 @@ func (db *DB) migrate() error {
 		// stripped regardless of this flag — they cause RFC-strict
 		// servers like SOGo to 501 the whole calendar object.
 		`ALTER TABLE sources ADD COLUMN strip_alarms INTEGER NOT NULL DEFAULT 0`,
+
+		// OIDC subject binding. Users were keyed only by email, so any
+		// IdP identity presenting a matching email got the account. The
+		// subject is bound on first login after this migration. Nullable
+		// with no default: existing rows stay NULL until their owner logs
+		// in, and the partial index only constrains bound rows. The old
+		// binary ignores the column, so rolling back needs no DB change.
+		`ALTER TABLE users ADD COLUMN oidc_subject TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_subject ON users(oidc_subject) WHERE oidc_subject IS NOT NULL`,
 	}
 
 	for _, migration := range migrations {

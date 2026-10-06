@@ -148,11 +148,14 @@ var SourcePresets = map[SourceType]SourcePreset{
 
 // User represents a user in the system.
 type User struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	// OIDCSubject is the IdP "sub" this user is bound to. Empty until the
+	// user's first login after the binding migration.
+	OIDCSubject string    `json:"-"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // UserAlertPreferences stores per-user alert notification preferences.
@@ -208,11 +211,6 @@ type Source struct {
 	LastSyncMessage    string           `json:"last_sync_message"`
 	CreatedAt          time.Time        `json:"created_at"`
 	UpdatedAt          time.Time        `json:"updated_at"`
-	// ICS adaptive polling (#146). LastContentHash is SHA-256 of the
-	// last fetched ICS feed body. AdaptiveInterval is the current
-	// polling interval in seconds (0 = use source.SyncInterval default).
-	LastContentHash  string `json:"-"`
-	AdaptiveInterval int    `json:"adaptive_interval,omitempty"`
 	// StripAlarms removes every VALARM block from this source's events
 	// before writing them to the destination. Useful for subscribed
 	// publish feeds where the source-side alarms shouldn't fire on the
@@ -275,22 +273,6 @@ type MalformedEvent struct {
 	EventPath    string    `json:"event_path"`
 	ErrorMessage string    `json:"error_message"`
 	DiscoveredAt time.Time `json:"discovered_at"`
-}
-
-// Destination is an additional sync destination for a source.
-// The primary destination lives on the Source row (dest_url etc.);
-// entries in this table are ADDITIONAL destinations that the sync
-// engine can push to. (#154)
-type Destination struct {
-	ID           string    `json:"id"`
-	SourceID     string    `json:"source_id"`
-	Name         string    `json:"name"`
-	DestURL      string    `json:"dest_url"`
-	DestUsername string    `json:"dest_username"`
-	DestPassword string    `json:"-"`
-	Enabled      bool      `json:"enabled"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // AuditLog records a user action for accountability. (#152)

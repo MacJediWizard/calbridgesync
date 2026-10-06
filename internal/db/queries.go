@@ -11,6 +11,9 @@ import (
 )
 
 // GetOrCreateUser returns an existing user by email or creates a new one.
+// It never binds an OIDC subject, so it must not be used to resolve a login:
+// the OIDC callback uses GetOrBindUserBySubject. It remains for unverified
+// logins (via GetOrBindUserBySubject) and for tests that need a user row.
 func (db *DB) GetOrCreateUser(email, name string) (*User, error) {
 	user, err := db.GetUserByEmail(email)
 	if err == nil {
@@ -38,38 +41,164 @@ func (db *DB) GetOrCreateUser(email, name string) (*User, error) {
 	return user, nil
 }
 
-// GetUserByEmail returns a user by their email address.
-func (db *DB) GetUserByEmail(email string) (*User, error) {
-	query := `SELECT id, email, name, created_at, updated_at FROM users WHERE email = ?`
-	row := db.conn.QueryRow(query, email)
+// GetOrBindUserBySubject returns the user bound to the OIDC subject. When no
+// user is bound to it yet, it binds the subject to the existing user with
+// this email (the first login after the binding migration), or creates a new
+// bound user. An email already bound to a different subject is rejected with
+// ErrSubjectMismatch, so a second IdP identity presenting the same email
+// cannot take over the account.
+//
+// A subject is bound to an email only when emailVerified is true. An
+// unverified login on an unbound or unknown email gets the pre-binding
+// behaviour (the user is found or created by email and left unbound), so an
+// identity with an unverified address cannot permanently claim the account
+// and lock its real owner out.
+//
+// For a user already bound to the subject, the stored name is refreshed from
+// the claims, and so is the email when it is verified and no other user holds
+// it. Alerts and the session then follow the IdP's current address.
+func (db *DB) GetOrBindUserBySubject(subject, email, name string, emailVerified bool) (*User, error) {
+	if subject == "" {
+		return nil, ErrMissingSubject
+	}
 
+	user, err := db.getUserBySubject(subject)
+	if err == nil {
+		if err := db.refreshBoundProfile(user, email, name, emailVerified); err != nil {
+			return nil, err
+		}
+		return user, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	user, err = db.GetUserByEmail(email)
+	switch {
+	case err == nil:
+		if user.OIDCSubject != "" {
+			return nil, ErrSubjectMismatch
+		}
+		if !emailVerified {
+			return user, nil
+		}
+		res, err := db.conn.Exec(
+			`UPDATE users SET oidc_subject = ?, updated_at = ? WHERE id = ? AND oidc_subject IS NULL`,
+			subject, now, user.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to bind OIDC subject: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("failed to bind OIDC subject: %w", err)
+		} else if n == 0 {
+			// A concurrent login bound this row first. Accept it only if
+			// it bound the same subject.
+			if bound, err := db.getUserBySubject(subject); err == nil && bound.ID == user.ID {
+				return bound, nil
+			}
+			return nil, ErrSubjectMismatch
+		}
+		user.OIDCSubject = subject
+		user.UpdatedAt = now
+		return user, nil
+
+	case errors.Is(err, ErrNotFound):
+		if !emailVerified {
+			return db.GetOrCreateUser(email, name)
+		}
+		user = &User{
+			ID:          uuid.New().String(),
+			Email:       email,
+			Name:        name,
+			OIDCSubject: subject,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		_, err = db.conn.Exec(
+			`INSERT INTO users (id, email, name, oidc_subject, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			user.ID, user.Email, user.Name, user.OIDCSubject, user.CreatedAt, user.UpdatedAt)
+		if err != nil {
+			// A concurrent first login with the same subject may have won.
+			if bound, lookupErr := db.getUserBySubject(subject); lookupErr == nil {
+				return bound, nil
+			}
+			return nil, fmt.Errorf("failed to create user: %w", err)
+		}
+		return user, nil
+
+	default:
+		return nil, err
+	}
+}
+
+// refreshBoundProfile updates a bound user's stored name and email from the
+// login claims and mirrors the change onto user. The email moves only when it
+// is verified, and the conditional UPDATE leaves it alone if another user
+// already holds the address (email is UNIQUE).
+func (db *DB) refreshBoundProfile(user *User, email, name string, emailVerified bool) error {
+	now := time.Now().UTC()
+
+	if name != "" && name != user.Name {
+		if _, err := db.conn.Exec(
+			`UPDATE users SET name = ?, updated_at = ? WHERE id = ?`,
+			name, now, user.ID); err != nil {
+			return fmt.Errorf("failed to refresh user name: %w", err)
+		}
+		user.Name = name
+		user.UpdatedAt = now
+	}
+
+	if emailVerified && email != "" && email != user.Email {
+		res, err := db.conn.Exec(
+			`UPDATE users SET email = ?, updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE email = ?)`,
+			email, now, user.ID, email)
+		if err != nil {
+			return fmt.Errorf("failed to refresh user email: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to refresh user email: %w", err)
+		}
+		if n > 0 {
+			user.Email = email
+			user.UpdatedAt = now
+		}
+	}
+
+	return nil
+}
+
+const userColumns = `id, email, name, oidc_subject, created_at, updated_at`
+
+// scanUser reads one user row selected with userColumns.
+func scanUser(row *sql.Row, by string) (*User, error) {
 	user := &User{}
-	err := row.Scan(&user.ID, &user.Email, &user.Name, &user.CreatedAt, &user.UpdatedAt)
+	var subject sql.NullString
+	err := row.Scan(&user.ID, &user.Email, &user.Name, &subject, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user by email: %w", err)
+		return nil, fmt.Errorf("failed to get user by %s: %w", by, err)
 	}
-
+	user.OIDCSubject = subject.String
 	return user, nil
+}
+
+// getUserBySubject returns the user bound to an OIDC subject.
+func (db *DB) getUserBySubject(subject string) (*User, error) {
+	return scanUser(db.conn.QueryRow(`SELECT `+userColumns+` FROM users WHERE oidc_subject = ?`, subject), "OIDC subject")
+}
+
+// GetUserByEmail returns a user by their email address.
+func (db *DB) GetUserByEmail(email string) (*User, error) {
+	return scanUser(db.conn.QueryRow(`SELECT `+userColumns+` FROM users WHERE email = ?`, email), "email")
 }
 
 // GetUserByID returns a user by their ID.
 func (db *DB) GetUserByID(id string) (*User, error) {
-	query := `SELECT id, email, name, created_at, updated_at FROM users WHERE id = ?`
-	row := db.conn.QueryRow(query, id)
-
-	user := &User{}
-	err := row.Scan(&user.ID, &user.Email, &user.Name, &user.CreatedAt, &user.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user by ID: %w", err)
-	}
-
-	return user, nil
+	return scanUser(db.conn.QueryRow(`SELECT `+userColumns+` FROM users WHERE id = ?`, id), "ID")
 }
 
 // CreateSource creates a new source.
@@ -539,74 +668,6 @@ func (db *DB) GetSourceStats(sourceID string) (*SourceStats, error) {
 	}
 
 	return stats, nil
-}
-
-// UpdateSourceAdaptiveState updates the ICS content hash and adaptive
-// interval for a source. Used by the scheduler after each ICS fetch
-// to track whether the feed content changed. (#146)
-func (db *DB) UpdateSourceAdaptiveState(sourceID, contentHash string, adaptiveInterval int) error {
-	query := `UPDATE sources SET last_content_hash = ?, adaptive_interval = ?, updated_at = ? WHERE id = ?`
-	_, err := db.conn.Exec(query, contentHash, adaptiveInterval, time.Now().UTC(), sourceID)
-	if err != nil {
-		return fmt.Errorf("failed to update source adaptive state: %w", err)
-	}
-	return nil
-}
-
-// CreateDestination adds an additional destination for a source. (#154)
-func (db *DB) CreateDestination(dest *Destination) error {
-	dest.ID = uuid.New().String()
-	now := time.Now().UTC()
-	dest.CreatedAt = now
-	dest.UpdatedAt = now
-	query := `INSERT INTO destinations (id, source_id, name, dest_url, dest_username, dest_password, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := db.conn.Exec(query, dest.ID, dest.SourceID, dest.Name, dest.DestURL, dest.DestUsername, dest.DestPassword, dest.Enabled, dest.CreatedAt, dest.UpdatedAt)
-	if err != nil {
-		return fmt.Errorf("failed to create destination: %w", err)
-	}
-	return nil
-}
-
-// GetDestinationsBySourceID returns all destinations for a source. (#154)
-func (db *DB) GetDestinationsBySourceID(sourceID string) ([]*Destination, error) {
-	rows, err := db.conn.Query(
-		`SELECT id, source_id, name, dest_url, dest_username, dest_password, enabled, created_at, updated_at
-		 FROM destinations WHERE source_id = ? ORDER BY created_at`,
-		sourceID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query destinations: %w", err)
-	}
-	defer rows.Close()
-
-	var dests []*Destination
-	for rows.Next() {
-		var d Destination
-		if err := rows.Scan(&d.ID, &d.SourceID, &d.Name, &d.DestURL, &d.DestUsername, &d.DestPassword, &d.Enabled, &d.CreatedAt, &d.UpdatedAt); err != nil {
-			continue
-		}
-		dests = append(dests, &d)
-	}
-	return dests, nil
-}
-
-// DeleteDestination removes a destination by ID, scoped to its owning
-// source so a caller who owns sourceID cannot delete another source's
-// destination. Returns ErrNotFound when no row matched. (#154, #198)
-func (db *DB) DeleteDestination(id, sourceID string) error {
-	result, err := db.conn.Exec(`DELETE FROM destinations WHERE id = ? AND source_id = ?`, id, sourceID)
-	if err != nil {
-		return fmt.Errorf("failed to delete destination: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if affected == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 // CreateAuditLog inserts an audit log entry. (#152)
