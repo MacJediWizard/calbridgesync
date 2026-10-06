@@ -1,5 +1,5 @@
 # Frontend build stage
-FROM node:20-alpine AS frontend-builder
+FROM node:24-alpine AS frontend-builder
 
 WORKDIR /app/web
 
@@ -12,7 +12,7 @@ COPY web/ ./
 RUN npm run build
 
 # Go build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 # VERSION is passed via --build-arg from Komodo's build system.
 # Must be declared here so the RUN command can reference it.
@@ -37,7 +37,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     ./cmd/calbridgesync
 
 # Final stage
-FROM alpine:3.19
+FROM alpine:3.24
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates tzdata
