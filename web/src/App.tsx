@@ -29,8 +29,7 @@ function App() {
         setUser(status.user);
       }
     } catch {
-      // Not authenticated
-      console.log('Not authenticated');
+      // Not authenticated: leave user unset so the login view renders.
     } finally {
       setLoading(false);
     }

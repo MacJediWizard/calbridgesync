@@ -143,3 +143,33 @@ func TestSafeDialContext_BlocksLiteralIMDS(t *testing.T) {
 		t.Errorf("error should classify the block as link-local (IMDS), got: %v", err)
 	}
 }
+
+// TestValidateWebhookURL_MatchesIsBlockedIP pins the save-time literal
+// IP check in validateWebhookURL to the dial-time policy in
+// isBlockedIP, so the two cannot drift apart. (#264)
+func TestValidateWebhookURL_MatchesIsBlockedIP(t *testing.T) {
+	ips := []string{
+		"8.8.8.8", "172.32.0.1", "2606:4700::1111",
+		"127.0.0.1", "127.1.2.3", "::1",
+		"10.0.0.1", "172.16.0.1", "192.168.1.1", "fc00::1", "fd00::1",
+		"169.254.169.254", "fe80::1",
+		"0.0.0.0", "::",
+		"100.64.0.1", "100.127.255.254", "100.63.0.1", "100.128.0.1",
+		"::ffff:127.0.0.1", "::ffff:10.0.0.1",
+	}
+	for _, s := range ips {
+		ip := net.ParseIP(s)
+		host := s
+		if strings.Contains(s, ":") {
+			host = "[" + s + "]"
+		}
+		blocked, reason := isBlockedIP(ip)
+		err := validateWebhookURL("https://" + host + "/hook")
+		if blocked != (err != nil) {
+			t.Errorf("%s: isBlockedIP=%v (%s) but validateWebhookURL err=%v", s, blocked, reason, err)
+		}
+		if blocked && err != nil && !strings.Contains(err.Error(), reason) {
+			t.Errorf("%s: validateWebhookURL error %q should name the rule %q", s, err, reason)
+		}
+	}
+}

@@ -6,14 +6,16 @@ package web
 //  1. User picks "Google" in the add-source form (React SPA).
 //  2. React POSTs the form (sans source credentials) to
 //     POST /api/sources/google/prepare, which validates the form,
-//     encrypts the dest password, stashes it in a short-lived
-//     session cookie, and returns {redirect_url}.
-//  3. React does window.location.href = redirect_url, landing on
-//     GET /auth/oauth/google/start.
-//  4. /start generates an OAuth state, stores it in the OAuth state
-//     cookie, and redirects to Google's consent screen with the
-//     calendar + userinfo.email scopes and access_type=offline so
-//     Google returns a refresh_token.
+//     generates an OAuth state, stores it in the OAuth state cookie,
+//     stashes the form (secrets encrypted) plus the state in a
+//     short-lived pending-source cookie, and returns {redirect_url}:
+//     Google's consent URL with the calendar + userinfo.email scopes
+//     and access_type=offline so Google returns a refresh_token.
+//  3. React does window.location.href = redirect_url, landing
+//     directly on Google's consent screen. (GET /auth/oauth/google/start
+//     is a legacy shim and is not part of this flow; see
+//     GoogleOAuthStart.)
+//  4. The user approves on Google.
 //  5. Google redirects back to GET /auth/oauth/google/callback with
 //     code + state.
 //  6. /callback validates the state, exchanges the code for a token,
@@ -353,27 +355,22 @@ func (h *Handlers) APIReconnectGoogleSource(c *gin.Context) {
 	c.JSON(http.StatusOK, APIPrepareGoogleSourceResponse{RedirectURL: googleAuthCodeURL(cfg, state)})
 }
 
-// GoogleOAuthStart is a convenience redirect that exists so operators
-// can kick off the flow from the URL bar for debugging. In the
-// normal flow, the SPA navigates directly to Google using the URL
-// returned by APIPrepareGoogleSource, but this handler exists as a
-// second entry point for the consent screen.
+// GoogleOAuthStart is a legacy shim for GET /auth/oauth/google/start.
+// It does not start the OAuth flow and never reaches Google: the flow
+// begins at APIPrepareGoogleSource (or APIReconnectGoogleSource),
+// which returns Google's consent URL for the SPA to navigate to.
 //
-// It REQUIRES that a pending source already exist in the session —
-// if the user navigates here directly without going through the
-// prepare endpoint first, they'll be bounced back to /sources/add
-// with an error.
+// The route is kept so an old bookmark or link lands on a useful
+// error instead of a 404. It always redirects to /sources/add, with
+// error=google_not_configured when Google OAuth is not configured and
+// error=start_via_prepare otherwise. The SPA maps both codes to
+// messages (web/src/services/googleOAuthErrors.ts).
 func (h *Handlers) GoogleOAuthStart(c *gin.Context) {
 	if !h.cfg.GoogleOAuth.Enabled() {
 		c.Redirect(http.StatusFound, "/sources/add?error=google_not_configured")
 		return
 	}
 
-	// We can't easily peek at the pending cookie without clearing
-	// it, so the start endpoint just redirects to /sources/add with
-	// an error if there's no valid prior prepare call. The normal
-	// path is the SPA calling the AuthCodeURL returned by prepare,
-	// which skips this handler entirely.
 	c.Redirect(http.StatusFound, "/sources/add?error=start_via_prepare")
 }
 

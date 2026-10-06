@@ -85,31 +85,6 @@ func shouldSkipTwoWayDeletion(direction db.SyncDirection, destEventCount, previo
 		previouslySyncedCount > 0
 }
 
-// shouldSkipTwoWayCreate returns true if the two-way reverse CREATE
-// pass (dest → source upload) should be skipped entirely for this
-// sync cycle. Mirror of shouldSkipTwoWayDeletion, guarding against
-// mass upload to the source when the source query returned empty.
-//
-// Rationale: if we previously synced N events and the SOURCE query
-// now returns zero events, that's almost certainly a source query
-// failure (network hiccup, bad auth, server bug on iCloud's end),
-// NOT a user who just deleted everything from their iCloud calendar.
-// Without this guard, the reverse create pass would see every
-// destination event as "not on source, upload it" and would mass-
-// upload the entire destination calendar back to the source, causing
-// iCloud to get every SOGo event as if it were new.
-//
-// This is the symmetric twin of shouldSkipTwoWayDeletion. The two
-// guards together enforce: "if either side returns empty while we
-// have prior sync records, treat it as a query failure and don't
-// propagate anything across that empty boundary." Introduced in
-// Issue #72.
-func shouldSkipTwoWayCreate(direction db.SyncDirection, sourceEventCount, previouslySyncedCount int) bool {
-	return direction == db.SyncDirectionTwoWay &&
-		sourceEventCount == 0 &&
-		previouslySyncedCount > 0
-}
-
 // syncETagEntry tracks the last-observed source and destination ETags
 // for a single event UID during a sync pass. Collected as the sync
 // iterates through events, then written to the synced_events table in
@@ -889,18 +864,14 @@ type SyncResult struct {
 	Duration          time.Duration `json:"duration"`
 }
 
-// sanitizeLogDetails removes potentially sensitive information from sync log details.
-// This prevents leaking server internal paths, stack traces, or network info.
-func sanitizeLogDetails(details string) string {
+// truncateLogDetails caps sync log details at 2000 bytes so a runaway
+// error (a stack trace or a large server response) cannot bloat the
+// sync_logs row. It only truncates; it does not redact anything.
+func truncateLogDetails(details string) string {
 	if details == "" {
 		return ""
 	}
 
-	// Remove potential IP addresses
-	// Remove potential file paths that might reveal server structure
-	// Keep the message useful but remove internal details
-
-	// Truncate very long details (could contain memory dumps or stack traces)
 	const maxLength = 2000
 	if len(details) > maxLength {
 		details = details[:maxLength] + "... (truncated)"
@@ -2624,7 +2595,7 @@ func (se *SyncEngine) finishSync(sourceID string, result *SyncResult) {
 		details = append(details, fmt.Sprintf("Warnings: %v", result.Warnings))
 	}
 	if len(details) > 0 {
-		syncLog.Details = sanitizeLogDetails(strings.Join(details, "\n"))
+		syncLog.Details = truncateLogDetails(strings.Join(details, "\n"))
 	}
 
 	// Create sync log with retry for concurrent access. A failure here

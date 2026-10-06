@@ -35,11 +35,12 @@ func SetupRoutes(r *gin.Engine, h *Handlers, sm *auth.SessionManager) {
 		authGroup.GET("/callback", h.Callback)
 		authGroup.POST("/logout", h.Logout)
 
-		// Google Calendar OAuth2 source flow (#70). /start is a
-		// debugging entry point; the real path is the SPA calling
-		// POST /api/sources/google/prepare and then navigating
-		// directly to the returned URL. /callback is the redirect
-		// URI registered in Google Cloud Console.
+		// Google Calendar OAuth2 source flow (#70). The real path is
+		// the SPA calling POST /api/sources/google/prepare and then
+		// navigating directly to the returned Google URL. /start is a
+		// legacy shim that only redirects back to /sources/add with an
+		// error code. /callback is the redirect URI registered in
+		// Google Cloud Console.
 		authGroup.GET("/oauth/google/start", h.GoogleOAuthStart)
 		authGroup.GET("/oauth/google/callback", h.GoogleOAuthCallback)
 	}

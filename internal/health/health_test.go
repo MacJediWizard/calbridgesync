@@ -181,17 +181,6 @@ func TestCheckMarshalJSON(t *testing.T) {
 	})
 }
 
-func TestLastReport(t *testing.T) {
-	t.Run("returns nil when no check performed", func(t *testing.T) {
-		checker := &Checker{}
-
-		report := checker.LastReport()
-		if report != nil {
-			t.Error("expected nil report when no check performed")
-		}
-	})
-}
-
 func TestNewChecker(t *testing.T) {
 	t.Run("creates checker with provided values", func(t *testing.T) {
 		// Note: We can't easily test with a real DB here, so we just verify creation
@@ -657,37 +646,6 @@ func TestDetermineOverallStatusEdgeCases(t *testing.T) {
 		result := checker.determineOverallStatus(checks)
 		if result != StatusUnhealthy {
 			t.Errorf("expected %q, got %q", StatusUnhealthy, result)
-		}
-	})
-}
-
-func TestLastReportCaching(t *testing.T) {
-	t.Run("lastReport is nil by default", func(t *testing.T) {
-		checker := &Checker{}
-		report := checker.LastReport()
-		if report != nil {
-			t.Error("expected nil report initially")
-		}
-	})
-
-	t.Run("lastReport can be set and retrieved", func(t *testing.T) {
-		checker := &Checker{}
-
-		// Manually set lastReport
-		checker.mu.Lock()
-		checker.lastReport = &Report{
-			Status:    StatusHealthy,
-			Timestamp: time.Now().UTC(),
-			Checks:    map[string]Check{},
-		}
-		checker.mu.Unlock()
-
-		report := checker.LastReport()
-		if report == nil {
-			t.Fatal("expected non-nil report")
-		}
-		if report.Status != StatusHealthy {
-			t.Errorf("expected %q, got %q", StatusHealthy, report.Status)
 		}
 	})
 }

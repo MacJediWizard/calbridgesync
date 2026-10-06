@@ -86,11 +86,6 @@ export interface SourceFormData {
   google_client_secret?: string;
 }
 
-export interface ApiResponse<T> {
-  data?: T;
-  error?: string;
-}
-
 export interface AuthStatus {
   authenticated: boolean;
   user?: User;

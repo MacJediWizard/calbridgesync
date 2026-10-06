@@ -56,9 +56,6 @@ type Checker struct {
 	oidcIssuer string
 	caldavURL  string
 	httpClient *http.Client
-
-	mu         sync.RWMutex
-	lastReport *Report
 }
 
 // NewChecker creates a new health checker.
@@ -134,11 +131,6 @@ func (c *Checker) Check(ctx context.Context) *Report {
 	// Determine overall status
 	report.Status = c.determineOverallStatus(report.Checks)
 
-	// Cache the report
-	c.mu.Lock()
-	c.lastReport = report
-	c.mu.Unlock()
-
 	return report
 }
 
@@ -155,13 +147,6 @@ func (c *Checker) Liveness() *Report {
 			},
 		},
 	}
-}
-
-// LastReport returns the most recent cached health report.
-func (c *Checker) LastReport() *Report {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.lastReport
 }
 
 func (c *Checker) checkDatabase(ctx context.Context) Check {

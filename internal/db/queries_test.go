@@ -1042,7 +1042,7 @@ func TestMalformedEvent(t *testing.T) {
 			t.Fatalf("failed to delete: %v", err)
 		}
 
-		_, err = db.GetMalformedEventByID(eventID)
+		_, err = db.GetMalformedEventByIDForUser(eventID, userID)
 		if !errors.Is(err, ErrNotFound) {
 			t.Error("event should be deleted")
 		}
