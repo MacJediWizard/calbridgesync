@@ -199,3 +199,197 @@ func TestNewICSClient_AcceptsLegitimateURLs(t *testing.T) {
 		})
 	}
 }
+
+// icsVTimezoneFeed has one event in Europe/Berlin (with a VALARM whose
+// X- property references Europe/London, and a RECURRENCE-ID exception
+// whose DTSTART is in America/New_York), one UTC-only event, and an
+// unreferenced Asia/Tokyo VTIMEZONE. (#248)
+const icsVTimezoneFeed = "BEGIN:VCALENDAR\r\n" +
+	"VERSION:2.0\r\n" +
+	"PRODID:-//Test//EN\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:Europe/Berlin\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"DTSTART:19701025T030000\r\n" +
+	"TZOFFSETFROM:+0200\r\n" +
+	"TZOFFSETTO:+0100\r\n" +
+	"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\n" +
+	"END:STANDARD\r\n" +
+	"BEGIN:DAYLIGHT\r\n" +
+	"DTSTART:19700329T020000\r\n" +
+	"TZOFFSETFROM:+0100\r\n" +
+	"TZOFFSETTO:+0200\r\n" +
+	"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\n" +
+	"END:DAYLIGHT\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:Asia/Tokyo\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"DTSTART:19700101T000000\r\n" +
+	"TZOFFSETFROM:+0900\r\n" +
+	"TZOFFSETTO:+0900\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:America/New_York\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"DTSTART:19701101T020000\r\n" +
+	"TZOFFSETFROM:-0400\r\n" +
+	"TZOFFSETTO:-0500\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:Europe/London\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"DTSTART:19701025T020000\r\n" +
+	"TZOFFSETFROM:+0100\r\n" +
+	"TZOFFSETTO:+0000\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"UID:berlin@example.com\r\n" +
+	"DTSTAMP:20261001T000000Z\r\n" +
+	"DTSTART;TZID=Europe/Berlin:20261012T090000\r\n" +
+	"DTEND;TZID=Europe/Berlin:20261012T100000\r\n" +
+	"RRULE:FREQ=WEEKLY\r\n" +
+	"SUMMARY:Berlin standup\r\n" +
+	"BEGIN:VALARM\r\n" +
+	"ACTION:DISPLAY\r\n" +
+	"DESCRIPTION:Reminder\r\n" +
+	"TRIGGER:-PT15M\r\n" +
+	"X-TEST-ACK;TZID=Europe/London:20261012T074500\r\n" +
+	"END:VALARM\r\n" +
+	"END:VEVENT\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"UID:utc@example.com\r\n" +
+	"DTSTAMP:20261001T000000Z\r\n" +
+	"DTSTART:20261013T090000Z\r\n" +
+	"DTEND:20261013T100000Z\r\n" +
+	"SUMMARY:UTC only\r\n" +
+	"END:VEVENT\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"UID:berlin@example.com\r\n" +
+	"DTSTAMP:20261001T000000Z\r\n" +
+	"RECURRENCE-ID;TZID=Europe/Berlin:20261019T090000\r\n" +
+	"DTSTART;TZID=America/New_York:20261019T090000\r\n" +
+	"DTEND;TZID=America/New_York:20261019T100000\r\n" +
+	"SUMMARY:Berlin standup (from NY)\r\n" +
+	"END:VEVENT\r\n" +
+	"END:VCALENDAR\r\n"
+
+// TestICSFetchEvents_CopiesReferencedVTimezones checks that splitting a
+// feed per UID keeps the VTIMEZONE definitions each object references,
+// places them before the VEVENTs, and does not copy unreferenced ones.
+// Before #248 every object held only VEVENTs, so TZID references
+// dangled and strict servers mis-timed or rejected the event.
+func TestICSFetchEvents_CopiesReferencedVTimezones(t *testing.T) {
+	events := fetchICSForTest(t, icsVTimezoneFeed)
+	byUID := make(map[string]Event, len(events))
+	for _, e := range events {
+		byUID[e.UID] = e
+	}
+
+	berlin, ok := byUID["berlin@example.com"]
+	if !ok {
+		t.Fatalf("berlin@example.com missing from %d events", len(events))
+	}
+	for _, want := range []string{"TZID:Europe/Berlin", "TZID:America/New_York", "TZID:Europe/London", "BEGIN:DAYLIGHT", "BEGIN:VALARM"} {
+		if !strings.Contains(berlin.Data, want) {
+			t.Errorf("berlin object missing %q:\n%s", want, berlin.Data)
+		}
+	}
+	if strings.Contains(berlin.Data, "Asia/Tokyo") {
+		t.Errorf("berlin object contains unreferenced Asia/Tokyo VTIMEZONE:\n%s", berlin.Data)
+	}
+	if got := strings.Count(berlin.Data, "BEGIN:VTIMEZONE"); got != 3 {
+		t.Errorf("berlin object has %d VTIMEZONEs, want 3", got)
+	}
+	if tz, ev := strings.Index(berlin.Data, "BEGIN:VTIMEZONE"), strings.Index(berlin.Data, "BEGIN:VEVENT"); tz < 0 || tz > ev {
+		t.Errorf("VTIMEZONE must precede VEVENT (tz=%d, vevent=%d)", tz, ev)
+	}
+	if got := strings.Count(berlin.Data, "BEGIN:VEVENT"); got != 2 {
+		t.Errorf("berlin object has %d VEVENTs, want 2 (master + exception)", got)
+	}
+
+	utc, ok := byUID["utc@example.com"]
+	if !ok {
+		t.Fatalf("utc@example.com missing from %d events", len(events))
+	}
+	if strings.Contains(utc.Data, "BEGIN:VTIMEZONE") {
+		t.Errorf("UTC-only object should carry no VTIMEZONE:\n%s", utc.Data)
+	}
+}
+
+// icsInvalidVTimezoneFeed references two VTIMEZONEs that go-ical's
+// encoder rejects: "Custom" has no STANDARD/DAYLIGHT child, and the
+// first "Europe/Paris" has a STANDARD without TZOFFSETTO. A valid
+// second "Europe/Paris" follows the broken one.
+const icsInvalidVTimezoneFeed = "BEGIN:VCALENDAR\r\n" +
+	"VERSION:2.0\r\n" +
+	"PRODID:-//Test//EN\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:Custom\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:Europe/Paris\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"DTSTART:19701025T030000\r\n" +
+	"TZOFFSETFROM:+0200\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VTIMEZONE\r\n" +
+	"TZID:Europe/Paris\r\n" +
+	"BEGIN:STANDARD\r\n" +
+	"DTSTART:19701025T030000\r\n" +
+	"TZOFFSETFROM:+0200\r\n" +
+	"TZOFFSETTO:+0100\r\n" +
+	"END:STANDARD\r\n" +
+	"END:VTIMEZONE\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"UID:custom@example.com\r\n" +
+	"DTSTAMP:20261001T000000Z\r\n" +
+	"DTSTART;TZID=Custom:20261012T090000\r\n" +
+	"DTEND;TZID=Custom:20261012T100000\r\n" +
+	"SUMMARY:Custom zone\r\n" +
+	"END:VEVENT\r\n" +
+	"BEGIN:VEVENT\r\n" +
+	"UID:paris@example.com\r\n" +
+	"DTSTAMP:20261001T000000Z\r\n" +
+	"DTSTART;TZID=Europe/Paris:20261012T090000\r\n" +
+	"DTEND;TZID=Europe/Paris:20261012T100000\r\n" +
+	"SUMMARY:Paris\r\n" +
+	"END:VEVENT\r\n" +
+	"END:VCALENDAR\r\n"
+
+// TestICSFetchEvents_SkipsUnencodableVTimezones guards against a
+// data-loss path: copying a VTIMEZONE the encoder rejects would fail
+// the whole UID group's encode and drop the event from the source set,
+// which one-way orphan deletion then removes from the destination.
+// Invalid VTIMEZONEs must be skipped, and a later valid definition of
+// the same TZID used instead.
+func TestICSFetchEvents_SkipsUnencodableVTimezones(t *testing.T) {
+	events := fetchICSForTest(t, icsInvalidVTimezoneFeed)
+	byUID := make(map[string]Event, len(events))
+	for _, e := range events {
+		byUID[e.UID] = e
+	}
+
+	custom, ok := byUID["custom@example.com"]
+	if !ok {
+		t.Fatalf("custom@example.com dropped; got %d events", len(events))
+	}
+	if strings.Contains(custom.Data, "BEGIN:VTIMEZONE") {
+		t.Errorf("custom object should not carry the invalid VTIMEZONE:\n%s", custom.Data)
+	}
+
+	paris, ok := byUID["paris@example.com"]
+	if !ok {
+		t.Fatalf("paris@example.com dropped; got %d events", len(events))
+	}
+	if got := strings.Count(paris.Data, "BEGIN:VTIMEZONE"); got != 1 {
+		t.Errorf("paris object has %d VTIMEZONEs, want 1:\n%s", got, paris.Data)
+	}
+	if !strings.Contains(paris.Data, "TZOFFSETTO:+0100") {
+		t.Errorf("paris object should carry the valid Europe/Paris definition:\n%s", paris.Data)
+	}
+}
