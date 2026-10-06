@@ -12,7 +12,7 @@ type SyncActivity struct {
 	Status          string     `json:"status"` // "running", "completed", "error"
 	CurrentCalendar string     `json:"current_calendar,omitempty"`
 	TotalCalendars  int        `json:"total_calendars"`
-	Calendarssynced int        `json:"calendars_synced"`
+	CalendarsSynced int        `json:"calendars_synced"`
 	EventsProcessed int        `json:"events_processed"`
 	EventsCreated   int        `json:"events_created"`
 	EventsUpdated   int        `json:"events_updated"`
@@ -63,7 +63,7 @@ func (t *Tracker) UpdateCalendar(sourceID, calendarName string, calendarIndex in
 
 	if activity, exists := t.active[sourceID]; exists {
 		activity.CurrentCalendar = calendarName
-		activity.Calendarssynced = calendarIndex
+		activity.CalendarsSynced = calendarIndex
 	}
 }
 
@@ -78,20 +78,6 @@ func (t *Tracker) UpdateProgress(sourceID string, created, updated, deleted, ski
 		activity.EventsDeleted = deleted
 		activity.EventsSkipped = skipped
 		activity.EventsProcessed = processed
-	}
-}
-
-// IncrementProgress increments progress counters by the given amounts.
-func (t *Tracker) IncrementProgress(sourceID string, created, updated, deleted, skipped, processed int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if activity, exists := t.active[sourceID]; exists {
-		activity.EventsCreated += created
-		activity.EventsUpdated += updated
-		activity.EventsDeleted += deleted
-		activity.EventsSkipped += skipped
-		activity.EventsProcessed += processed
 	}
 }
 
@@ -158,20 +144,4 @@ func (t *Tracker) GetRecent() []*SyncActivity {
 		result[i] = &copy
 	}
 	return result
-}
-
-// GetAll returns both active and recent syncs.
-func (t *Tracker) GetAll() map[string]interface{} {
-	return map[string]interface{}{
-		"active": t.GetActive(),
-		"recent": t.GetRecent(),
-	}
-}
-
-// IsSourceSyncing returns true if the given source is currently syncing.
-func (t *Tracker) IsSourceSyncing(sourceID string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	_, exists := t.active[sourceID]
-	return exists
 }

@@ -5,7 +5,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -98,13 +97,4 @@ func GenerateKey() ([]byte, error) {
 		return nil, fmt.Errorf("failed to generate key: %w", err)
 	}
 	return key, nil
-}
-
-// GenerateKeyHex generates a cryptographically secure random key and returns it as a hex string.
-func GenerateKeyHex() (string, error) {
-	key, err := GenerateKey()
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(key), nil
 }

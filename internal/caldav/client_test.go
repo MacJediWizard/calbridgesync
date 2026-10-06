@@ -764,9 +764,9 @@ func TestSyncResult(t *testing.T) {
 	})
 }
 
-func TestSanitizeLogDetails(t *testing.T) {
+func TestTruncateLogDetails(t *testing.T) {
 	t.Run("returns empty string for empty input", func(t *testing.T) {
-		result := sanitizeLogDetails("")
+		result := truncateLogDetails("")
 		if result != "" {
 			t.Errorf("expected empty string, got %q", result)
 		}
@@ -774,7 +774,7 @@ func TestSanitizeLogDetails(t *testing.T) {
 
 	t.Run("returns short strings unchanged", func(t *testing.T) {
 		input := "Synced 10 events successfully"
-		result := sanitizeLogDetails(input)
+		result := truncateLogDetails(input)
 		if result != input {
 			t.Errorf("expected %q, got %q", input, result)
 		}
@@ -782,7 +782,7 @@ func TestSanitizeLogDetails(t *testing.T) {
 
 	t.Run("truncates very long strings", func(t *testing.T) {
 		input := strings.Repeat("a", 3000)
-		result := sanitizeLogDetails(input)
+		result := truncateLogDetails(input)
 
 		if len(result) > 2100 { // 2000 + some buffer for "... (truncated)"
 			t.Errorf("expected truncated result, got length %d", len(result))
@@ -1113,10 +1113,10 @@ func TestParseEventPathsEdgeCases(t *testing.T) {
 	})
 }
 
-func TestSanitizeLogDetailsEdgeCases(t *testing.T) {
+func TestTruncateLogDetailsEdgeCases(t *testing.T) {
 	t.Run("handles string at max length", func(t *testing.T) {
 		input := strings.Repeat("a", 2000)
-		result := sanitizeLogDetails(input)
+		result := truncateLogDetails(input)
 		if result != input {
 			t.Error("expected string at max length to be unchanged")
 		}
@@ -1124,7 +1124,7 @@ func TestSanitizeLogDetailsEdgeCases(t *testing.T) {
 
 	t.Run("handles string just over max length", func(t *testing.T) {
 		input := strings.Repeat("a", 2001)
-		result := sanitizeLogDetails(input)
+		result := truncateLogDetails(input)
 
 		if len(result) > 2020 {
 			t.Errorf("expected result to be truncated, got length %d", len(result))

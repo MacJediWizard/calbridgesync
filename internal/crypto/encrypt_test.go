@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -205,30 +204,6 @@ func TestGenerateKey(t *testing.T) {
 
 		if string(key1) == string(key2) {
 			t.Fatal("generated keys should be unique")
-		}
-	})
-}
-
-func TestGenerateKeyHex(t *testing.T) {
-	t.Run("correct length", func(t *testing.T) {
-		keyHex, err := GenerateKeyHex()
-		if err != nil {
-			t.Fatalf("failed to generate key hex: %v", err)
-		}
-		// Hex encoding doubles the length
-		if len(keyHex) != KeySize*2 {
-			t.Fatalf("expected hex length %d, got %d", KeySize*2, len(keyHex))
-		}
-	})
-
-	t.Run("valid hex", func(t *testing.T) {
-		keyHex, _ := GenerateKeyHex()
-		decoded, err := hex.DecodeString(keyHex)
-		if err != nil {
-			t.Fatalf("generated hex should be valid: %v", err)
-		}
-		if len(decoded) != KeySize {
-			t.Fatalf("decoded key should be %d bytes", KeySize)
 		}
 	})
 }

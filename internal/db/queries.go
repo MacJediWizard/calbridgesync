@@ -1027,26 +1027,6 @@ func (db *DB) GetMalformedEvents(userID string) ([]*MalformedEvent, error) {
 	return events, nil
 }
 
-// GetMalformedEventByID returns a single malformed event by ID.
-func (db *DB) GetMalformedEventByID(id string) (*MalformedEvent, error) {
-	query := `SELECT m.id, m.source_id, s.name, m.event_path, m.error_message, m.discovered_at
-		FROM malformed_events m
-		JOIN sources s ON m.source_id = s.id
-		WHERE m.id = ?`
-
-	event := &MalformedEvent{}
-	err := db.conn.QueryRow(query, id).Scan(&event.ID, &event.SourceID, &event.SourceName,
-		&event.EventPath, &event.ErrorMessage, &event.DiscoveredAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get malformed event: %w", err)
-	}
-
-	return event, nil
-}
-
 // GetMalformedEventByIDForUser returns a malformed event by ID only if it belongs to the user.
 // This prevents timing attacks by combining auth check with the query.
 func (db *DB) GetMalformedEventByIDForUser(id, userID string) (*MalformedEvent, error) {

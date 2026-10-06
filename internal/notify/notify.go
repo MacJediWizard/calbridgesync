@@ -159,9 +159,9 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 // rule fired. (#117)
 //
 // Kept as a package-private helper so both the validation-time
-// (validateWebhookURL, indirectly via net.ParseIP check) and
-// dial-time (safeDialContext) paths enforce exactly the same
-// policy. Adding a new block rule here covers both call sites.
+// (validateWebhookURL, for IP-literal hosts) and dial-time
+// (safeDialContext) paths enforce exactly the same policy. Adding a
+// new block rule here covers both call sites.
 func isBlockedIP(ip net.IP) (bool, string) {
 	if ip == nil {
 		return true, "unparseable IP"
@@ -279,16 +279,13 @@ func ValidateConfig(cfg *Config) error {
 //     mappings): the old check only caught the exact string "::1".
 //   - Hostnames that resolve to private IPs: a malicious DNS
 //     entry like `my.attacker.com → A 127.0.0.1` would have
-//     passed the old string-based check. Proper validation
-//     needs to parse the hostname as IP OR resolve it and check
-//     each answer. This function handles the direct-IP case
-//     correctly; the resolve-and-check case is noted as a
-//     follow-up because it would need a separate DNS lookup
-//     path that doesn't exist today.
+//     passed the old string-based check. This function handles
+//     the direct-IP case; resolved hostnames are checked at send
+//     time by safeDialContext (#117).
 //
 // The new check uses net.ParseIP against the URL hostname so any
-// valid IP literal gets structural validation instead of string
-// prefix matching.
+// valid IP literal gets structural validation via isBlockedIP
+// instead of string prefix matching.
 func validateWebhookURL(webhookURL string) error {
 	parsed, err := url.Parse(webhookURL)
 	if err != nil {
@@ -319,38 +316,17 @@ func validateWebhookURL(webhookURL string) error {
 	// rather than string prefixes. This catches 127.x.x.x,
 	// 169.254.x.x, ::1, ::ffff:* IPv4 mappings, fc00::/7 etc.
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() {
-			return fmt.Errorf("webhook URL cannot point to loopback (%s)", host)
-		}
-		if ip.IsPrivate() {
-			return fmt.Errorf("webhook URL cannot point to private IP addresses (%s)", host)
-		}
-		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			// 169.254.0.0/16 and fe80::/10 — includes cloud
-			// metadata endpoints (AWS/GCP/Azure IMDS).
-			return fmt.Errorf("webhook URL cannot point to link-local addresses (%s)", host)
-		}
-		if ip.IsUnspecified() {
-			// 0.0.0.0 / :: — "this network," routes to loopback
-			// on many systems.
-			return fmt.Errorf("webhook URL cannot point to unspecified address (%s)", host)
-		}
-		// 100.64.0.0/10 (carrier NAT / Tailscale) is not caught by
-		// IsPrivate() in the stdlib. Check explicitly.
-		if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-			return fmt.Errorf("webhook URL cannot point to carrier-grade NAT range (%s)", host)
+		if blocked, reason := isBlockedIP(ip); blocked {
+			return fmt.Errorf("webhook URL cannot point to %s IP address (%s)", reason, host)
 		}
 		return nil
 	}
 
-	// Hostname is not an IP literal. We could resolve it here and
-	// check each answer IP, but doing DNS in a validation function
-	// introduces a second network round-trip per source edit and
-	// creates a TOCTOU between validation time and actual send.
-	// A proper fix is to do the private-IP check inside the HTTP
-	// transport via a custom DialContext that rejects private
-	// destinations post-resolution. That's a bigger change noted
-	// as a follow-up in the PR description.
+	// Hostname is not an IP literal. It is not resolved here: a
+	// save-time lookup would add a network round-trip per source edit
+	// and still leave a TOCTOU window before the send. Resolved IPs
+	// are checked at send time instead, by safeDialContext on the
+	// webhook transport, which also defeats DNS rebinding. (#117)
 	return nil
 }
 
@@ -804,20 +780,6 @@ func (n *Notifier) ClearStaleState(sourceID string) {
 	delete(n.staleState, sourceID)
 	delete(n.lastAlertTimes, sourceID)
 	delete(n.inFlightAlerts, "stale:"+sourceID)
-}
-
-// GetStaleSourceIDs returns a list of currently stale source IDs.
-func (n *Notifier) GetStaleSourceIDs() []string {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-
-	ids := make([]string, 0, len(n.staleState))
-	for id, isStale := range n.staleState {
-		if isStale {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }
 
 // SendStaleAlertWithPrefs sends an alert for a stale source using per-user preferences.
