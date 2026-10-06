@@ -33,14 +33,15 @@ func SecurityHeaders() gin.HandlerFunc {
 		c.Header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
 
 		// CSP - Content Security Policy
-		// Note on 'unsafe-inline':
-		// - style-src: Required for Tailwind CSS which uses inline styles
-		// - script-src: Required for React/Vite which injects inline scripts for HMR in dev
-		//   and may use inline event handlers. Removing this would require nonce-based CSP
-		//   which adds complexity. The XSS risk is mitigated by React's automatic escaping.
+		// - script-src: the production Vite build (web/dist/index.html) loads only
+		//   external module scripts from /assets, so no inline scripts or CDNs are
+		//   allowed. The Vite dev server serves its own pages and is not affected.
+		// - style-src: 'unsafe-inline' stays for React style props and the inline
+		//   <style> in templates/error.html; Google Fonts is imported by
+		//   web/src/index.css.
 		c.Header("Content-Security-Policy", "default-src 'self'; "+
-			"script-src 'self' 'unsafe-inline' https://unpkg.com; "+
-			"style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com; "+
+			"script-src 'self'; "+
+			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
 			"img-src 'self' data: https://cdn.macjediwizard.com; "+
 			"font-src 'self' https://fonts.gstatic.com; "+
 			"connect-src 'self'; "+
