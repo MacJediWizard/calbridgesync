@@ -153,12 +153,11 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 	return dialer.DialContext(ctx, network, dialAddr)
 }
 
-// isBlockedIP classifies an IP as safe or blocked using the same
-// rules as validateWebhookURL's literal-IP check. Returns a
+// isBlockedIP classifies an IP as safe or blocked. Returns a
 // human-readable reason for the block so errors pinpoint which
 // rule fired. (#117)
 //
-// Kept as a package-private helper so both the validation-time
+// It is the single IP policy: both the validation-time
 // (validateWebhookURL, for IP-literal hosts) and dial-time
 // (safeDialContext) paths enforce exactly the same policy. Adding a
 // new block rule here covers both call sites.
@@ -317,7 +316,7 @@ func validateWebhookURL(webhookURL string) error {
 	// 169.254.x.x, ::1, ::ffff:* IPv4 mappings, fc00::/7 etc.
 	if ip := net.ParseIP(host); ip != nil {
 		if blocked, reason := isBlockedIP(ip); blocked {
-			return fmt.Errorf("webhook URL cannot point to %s IP address (%s)", reason, host)
+			return fmt.Errorf("webhook URL host %s is a blocked %s IP address", host, reason)
 		}
 		return nil
 	}
