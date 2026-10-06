@@ -1,6 +1,8 @@
 package web
 
 import (
+	"errors"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -110,6 +112,31 @@ func (h *Handlers) Login(c *gin.Context) {
 	c.Redirect(http.StatusFound, authURL)
 }
 
+// resolveLoginUser maps verified OIDC claims to a local user, binding the
+// subject to the account with this email on first verified login. On failure
+// it returns a nil user with the status and message to show; it logs the
+// cause by user ID, never by email.
+func (h *Handlers) resolveLoginUser(claims *auth.OIDCClaims) (*db.User, int, string) {
+	user, err := h.db.GetOrBindUserBySubject(claims.Subject, claims.Email, claims.Name, claims.EmailVerified)
+	switch {
+	case err == nil:
+		return user, 0, ""
+	case errors.Is(err, db.ErrSubjectMismatch):
+		userID := "unknown"
+		if existing, lookupErr := h.db.GetUserByEmail(claims.Email); lookupErr == nil {
+			userID = existing.ID
+		}
+		log.Printf("OIDC login rejected: user %s is bound to a different subject", userID)
+		return nil, http.StatusForbidden, "This email is linked to a different sign-in identity. Contact the administrator."
+	case errors.Is(err, db.ErrMissingSubject):
+		log.Printf("OIDC login rejected: ID token has no subject claim")
+		return nil, http.StatusBadRequest, "Sign-in response did not identify the user"
+	default:
+		log.Printf("OIDC login failed: user lookup: %v", err)
+		return nil, http.StatusInternalServerError, "Failed to create user"
+	}
+}
+
 // Callback handles the OIDC callback.
 func (h *Handlers) Callback(c *gin.Context) {
 	// Verify state
@@ -149,12 +176,9 @@ func (h *Handlers) Callback(c *gin.Context) {
 		return
 	}
 
-	// Get or create user
-	user, err := h.db.GetOrCreateUser(claims.Email, claims.Name)
-	if err != nil {
-		c.HTML(http.StatusInternalServerError, "error.html", gin.H{
-			"error": "Failed to create user",
-		})
+	user, status, msg := h.resolveLoginUser(claims)
+	if user == nil {
+		c.HTML(status, "error.html", gin.H{"error": msg})
 		return
 	}
 
