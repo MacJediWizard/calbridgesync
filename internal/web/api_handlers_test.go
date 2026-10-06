@@ -2092,37 +2092,22 @@ func TestAPIUpdateAlertPreferences_EmailEnableRejectedWhenNoSMTP(t *testing.T) {
 	})
 }
 
-// TestAPIDeleteDestinationCrossUser verifies a user cannot delete another
-// user's destination by pairing it with their own source ID (#198).
-func TestAPIDeleteDestinationCrossUser(t *testing.T) {
+// TestRoutesHaveNoDestinationEndpoints pins the PR-35 removal of
+// multi-destination: the /sources/:id/destinations API must not be
+// mounted. Additional destinations shared the primary destination's
+// tracking rows and were paused in #183; the feature was then removed.
+func TestRoutesHaveNoDestinationEndpoints(t *testing.T) {
 	th := setupTestHandlers(t)
 	defer th.cleanup()
+	th.handlers.cfg = &config.Config{}
 
-	_, src1 := createTestUserAndSource(t, th.db, "owner@example.com", "Owner Source")
-	user2ID, src2 := createTestUserAndSource(t, th.db, "attacker@example.com", "Attacker Source")
+	r := gin.New()
+	SetupRoutes(r, th.handlers, auth.NewSessionManager(strings.Repeat("s", 32), false, 3600, 300))
 
-	dest := &db.Destination{SourceID: src1.ID, Name: "Extra", DestURL: "https://d.example.com", DestUsername: "u", DestPassword: "p", Enabled: true}
-	if err := th.db.CreateDestination(dest); err != nil {
-		t.Fatalf("CreateDestination: %v", err)
-	}
-
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodDelete, "/api/sources/"+src2.ID+"/destinations/"+dest.ID, nil)
-	c.Params = gin.Params{{Key: "id", Value: src2.ID}, {Key: "destId", Value: dest.ID}}
-	setAuthContext(c, user2ID, "attacker@example.com")
-
-	th.handlers.APIDeleteDestination(c)
-
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
-	}
-	dests, err := th.db.GetDestinationsBySourceID(src1.ID)
-	if err != nil {
-		t.Fatalf("GetDestinationsBySourceID: %v", err)
-	}
-	if len(dests) != 1 || dests[0].ID != dest.ID {
-		t.Fatalf("owner's destination must survive cross-user delete, got %+v", dests)
+	for _, route := range r.Routes() {
+		if strings.Contains(route.Path, "/destinations") {
+			t.Errorf("route %s %s is still mounted; multi-destination was removed", route.Method, route.Path)
+		}
 	}
 }
 
