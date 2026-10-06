@@ -276,11 +276,11 @@ func (db *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)`,
 
-		// Multi-destination support (#154). Each source can sync
-		// to additional destinations beyond the primary one stored
-		// on the source row. The primary dest_url/dest_username/
-		// dest_password columns on sources are kept for backward
-		// compatibility; this table holds ADDITIONAL destinations.
+		// Multi-destination support (#154) was removed (#262): the
+		// destinations shared the primary destination's synced_events
+		// and sync_states rows. Nothing reads or writes this table any
+		// more. It and any existing rows are kept, with no migration,
+		// so an older binary can still start against this database.
 		`CREATE TABLE IF NOT EXISTS destinations (
 			id TEXT PRIMARY KEY,
 			source_id TEXT NOT NULL,

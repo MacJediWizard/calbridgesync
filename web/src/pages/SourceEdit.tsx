@@ -3,7 +3,6 @@ import { useNavigate, useParams, Link, useSearchParams } from 'react-router-dom'
 import { getSource, updateSource, deleteSource, discoverCalendars, reconnectGoogleSource } from '../services/api';
 import { GOOGLE_OAUTH_ERRORS } from '../services/googleOAuthErrors';
 import { stripAlarmsScope } from '../services/stripAlarms';
-import DestinationManager from '../components/DestinationManager';
 import SyncIntervalSelect from '../components/SyncIntervalSelect';
 import type { Source, Calendar, CalendarConfig } from '../types';
 
@@ -528,13 +527,6 @@ export default function SourceEdit() {
               </div>
             </div>
           </div>
-
-          {/* Additional Destinations (#156) */}
-          {id && (
-            <div className="border-t border-zinc-800 pt-6">
-              <DestinationManager sourceId={id} />
-            </div>
-          )}
 
           {/* Status Info */}
           {source && (
