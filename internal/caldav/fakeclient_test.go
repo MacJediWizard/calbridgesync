@@ -29,6 +29,9 @@ type fakeCalendarClient struct {
 	deletes []string         // paths of successful DELETEs, in order
 	errOn   map[string]error // path (event or calendar) -> injected error
 
+	ifMatches []string          // If-Match value of every PUT attempt, in order ("" = none)
+	editOnPut map[string]string // path -> summary applied (once) just before a PUT to it
+
 	// Read-side failures reported by GetEventsWithReport (#206).
 	readErrOn map[string]error  // stored event path -> fetch error (object is listed but unreadable)
 	malformed map[string]string // listed path -> raw UID ("" if none) of a malformed object
@@ -40,6 +43,7 @@ func newFakeCalendarClient(calendarPath string) *fakeCalendarClient {
 		calendarPath: calendarPath,
 		events:       make(map[string]Event),
 		errOn:        make(map[string]error),
+		editOnPut:    make(map[string]string),
 		readErrOn:    make(map[string]error),
 		malformed:    make(map[string]string),
 	}
@@ -136,6 +140,23 @@ func (f *fakeCalendarClient) resetLog() {
 	defer f.mu.Unlock()
 	f.puts = nil
 	f.deletes = nil
+	f.ifMatches = nil
+}
+
+// ifMatchLog returns the If-Match value of every PUT attempt since the
+// last resetLog, in call order.
+func (f *fakeCalendarClient) ifMatchLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ifMatches...)
+}
+
+// editBeforePut makes the next PUT to path first apply an out-of-band
+// edit, as if a user changed the object after the sync read it.
+func (f *fakeCalendarClient) editBeforePut(path, newSummary string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.editOnPut[path] = newSummary
 }
 
 func (f *fakeCalendarClient) putLog() []string {
@@ -248,9 +269,19 @@ func (f *fakeCalendarClient) GetEvent(_ context.Context, eventPath string) (*Eve
 	return &e, nil
 }
 
-func (f *fakeCalendarClient) PutEvent(_ context.Context, calendarPath string, event *Event) error {
+func (f *fakeCalendarClient) PutEvent(ctx context.Context, calendarPath string, event *Event) error {
+	return f.PutEventIfMatch(ctx, calendarPath, event, "")
+}
+
+// PutEventIfMatch enforces If-Match like a CalDAV server: when ifMatch
+// is set and differs from the stored object's ETag, nothing is written
+// and a 412 wrapped in ErrPreconditionFailed is returned. editOnPut
+// lets a test simulate a concurrent edit landing between the sync's
+// read and its PUT.
+func (f *fakeCalendarClient) PutEventIfMatch(_ context.Context, calendarPath string, event *Event, ifMatch string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ifMatches = append(f.ifMatches, ifMatch)
 	if event.Data == "" {
 		return fmt.Errorf("%w: empty iCalendar data (UID: %s)", ErrEventSkipped, event.UID)
 	}
@@ -263,6 +294,20 @@ func (f *fakeCalendarClient) PutEvent(_ context.Context, calendarPath string, ev
 	}
 	if err := f.errOn[path]; err != nil {
 		return err
+	}
+	if summary, ok := f.editOnPut[path]; ok {
+		delete(f.editOnPut, path)
+		if e, exists := f.events[path]; exists {
+			e.Summary = summary
+			e.Data = testICS(e.UID, summary, e.StartTime)
+			e.ETag = f.nextETag()
+			f.events[path] = e
+		}
+	}
+	if ifMatch != "" {
+		if e, exists := f.events[path]; !exists || e.ETag != ifMatch {
+			return fmt.Errorf("%w: failed to put event: 412 Precondition Failed", ErrPreconditionFailed)
+		}
 	}
 	stored := *event
 	stored.Path = path
