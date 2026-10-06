@@ -65,11 +65,17 @@ jobs:
       # Blocking: any vulnerability reachable from our code fails the build.
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
-  # Advisory until PR-39 (after the PR-37 dead-code sweep) makes it blocking.
+  # Blocking on new findings only. only-new-issues lints the PR diff (or the
+  # push diff on main) via --new-from-patch, so any finding on a changed line
+  # fails CI while the pre-existing baseline (#269) does not.
   golangci-lint:
-    name: golangci-lint (advisory)
+    name: golangci-lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      # only-new-issues reads the PR diff through the GitHub API.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -79,6 +85,6 @@ jobs:
           go-version: '1.27.x'
           check-latest: true
       - uses: golangci/golangci-lint-action@v9
-        continue-on-error: true
         with:
           version: v2.14.0
+          only-new-issues: true
