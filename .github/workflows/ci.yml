@@ -25,9 +25,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          # Latest 1.24.x patch, matching the golang:1.24-alpine Docker build.
-          # go.mod pins only `go 1.24.0`, which would install the unpatched 1.24.0.
-          go-version: '1.24.x'
+          # Latest 1.27.x patch, matching the golang:1.27-alpine Docker build.
+          # go.mod declares only the minimum (`go 1.26.0`), not the toolchain we ship.
+          go-version: '1.27.x'
           check-latest: true
       - run: go build ./...
       - run: go vet ./...
@@ -44,30 +44,26 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run build
 
-  # Advisory until PR-38 (toolchain/dependency upgrades) makes it blocking.
   govulncheck:
-    name: govulncheck (advisory)
+    name: govulncheck
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          # Latest 1.24.x patch, matching the golang:1.24-alpine Docker build.
-          # go.mod pins only `go 1.24.0`, which would install the unpatched 1.24.0.
-          go-version: '1.24.x'
+          # Latest 1.27.x patch, matching the golang:1.27-alpine Docker build.
+          # go.mod declares only the minimum (`go 1.26.0`), not the toolchain we ship.
+          go-version: '1.27.x'
           check-latest: true
-      # v1.1.4 is the newest release that builds on Go 1.24.x.
-      # Step-level continue-on-error: the step shows as failed but the job
-      # (and the PR check) concludes success, so `gh pr checks` stays green.
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
-        continue-on-error: true
+      # Blocking: any vulnerability reachable from our code fails the build.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   # Advisory until PR-39 (after the PR-37 dead-code sweep) makes it blocking.
   golangci-lint:
@@ -78,11 +74,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          # Latest 1.24.x patch, matching the golang:1.24-alpine Docker build.
-          # go.mod pins only `go 1.24.0`, which would install the unpatched 1.24.0.
-          go-version: '1.24.x'
+          # Latest 1.27.x patch, matching the golang:1.27-alpine Docker build.
+          # go.mod declares only the minimum (`go 1.26.0`), not the toolchain we ship.
+          go-version: '1.27.x'
           check-latest: true
       - uses: golangci/golangci-lint-action@v9
         continue-on-error: true
         with:
-          version: v2.6.2
+          version: v2.14.0
