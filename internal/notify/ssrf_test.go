@@ -173,3 +173,19 @@ func TestValidateWebhookURL_MatchesIsBlockedIP(t *testing.T) {
 		}
 	}
 }
+
+// The block error is returned to users in the settings API's 400 body,
+// so it must read cleanly for reasons that carry their own parentheses.
+func TestValidateWebhookURL_BlockErrorText(t *testing.T) {
+	cases := map[string]string{
+		"https://169.254.169.254/hook": "webhook URL host 169.254.169.254 is a blocked link-local (includes cloud IMDS) IP address",
+		"https://100.64.0.1/hook":      "webhook URL host 100.64.0.1 is a blocked carrier-grade NAT (100.64.0.0/10) IP address",
+		"https://10.0.0.1/hook":        "webhook URL host 10.0.0.1 is a blocked private IP address",
+	}
+	for u, want := range cases {
+		err := validateWebhookURL(u)
+		if err == nil || err.Error() != want {
+			t.Errorf("validateWebhookURL(%q) = %v, want %q", u, err, want)
+		}
+	}
+}
