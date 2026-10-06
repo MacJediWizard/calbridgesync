@@ -15,7 +15,7 @@ A production-ready Go application for bidirectional CalDAV calendar synchronizat
 
 ## Requirements
 
-- Go 1.22 or later
+- Go 1.26 or later
 - SQLite (pure Go implementation, no CGO required)
 - OIDC provider (Keycloak, Auth0, Okta, etc.)
 
@@ -148,36 +148,74 @@ point the existing source at another calendar.
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /auth/login` | Login page |
-| `POST /auth/login` | Initiate OIDC flow |
+| `GET /auth/login`, `POST /auth/login` | Start the OIDC flow (redirects to the provider) |
 | `GET /auth/callback` | OIDC callback |
 | `POST /auth/logout` | Logout |
+| `GET /auth/oauth/google/callback` | Google OAuth redirect URI for Google sources |
 
-### Dashboard (Protected)
+### JSON API and web UI
+
+The web UI is a React single-page app. `internal/web/routes.go` serves it
+for every path that isn't under `/api`, `/auth` or a health endpoint. The
+UI talks to a JSON API under `/api`. Apart from `GET /api/auth/status`,
+`GET /api/version` and `POST /api/auth/logout`, every API route requires a
+session, and requests that change state must pass the Origin check
+described below.
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /` | Dashboard |
-| `GET /sources` | List sources |
-| `GET /sources/add` | Add source form |
-| `POST /sources/add` | Create source |
-| `GET /sources/:id/edit` | Edit source form |
-| `POST /sources/:id` | Update source |
-| `DELETE /sources/:id` | Delete source |
-| `POST /sources/:id/sync` | Trigger sync |
-| `POST /sources/:id/toggle` | Enable/disable |
-| `GET /sources/:id/logs` | View sync logs |
+| `GET /api/sources`, `POST /api/sources` | List or create sources |
+| `GET/PUT/DELETE /api/sources/:id` | Read, update or delete a source |
+| `POST /api/sources/:id/sync` | Trigger a sync |
+| `POST /api/sources/:id/toggle` | Enable or disable a source |
+| `GET /api/sources/:id/logs`, `GET /api/sources/:id/stats` | Sync logs and stats |
+| `POST /api/sources/google/prepare`, `POST /api/sources/:id/google/reconnect` | Start or redo Google authorization |
+| `POST /api/calendars/discover` | Discover calendars on a CalDAV server |
+| `GET /api/dashboard/stats`, `GET /api/dashboard/sync-history` | Dashboard data |
+| `GET/PUT /api/settings/alerts`, `POST /api/settings/alerts/test-webhook` | Alert preferences |
+| `GET /api/export/calendars` | Export the user's calendars as ICS |
+
+See `internal/web/routes.go` for the full list.
 
 ## Security Features
 
-- **HTTPS Required**: Production mode enforces HTTPS for all URLs
-- **Private IP Blocking**: Prevents SSRF attacks
-- **TLS 1.2 Minimum**: Modern TLS requirements
-- **Security Headers**: CSP, X-Frame-Options, X-XSS-Protection
-- **Rate Limiting**: Configurable request rate limiting
-- **CSRF Protection**: Token-based CSRF protection
-- **Session Security**: HttpOnly, Secure, SameSite cookies
-- **Credential Encryption**: AES-256-GCM for stored passwords
+- **HTTPS for configured URLs**: Startup validation requires `https://` for
+  `OIDC_ISSUER` always, and for `BASE_URL` and `OIDC_REDIRECT_URL` in
+  production. In production, `DEFAULT_DEST_URL` may use `http://` only for
+  private or loopback hosts. Webhook URLs must be `https://`. ICS feed URLs
+  may be `http://` unless `STRICT_ICS_HTTPS=true` is set. CalDAV source and
+  destination URLs entered in the UI are not restricted to HTTPS. The server
+  listens on plain HTTP, so put a TLS-terminating reverse proxy in front of
+  it.
+- **SSRF protection**: Webhook URLs are rejected if they point to loopback,
+  private, link-local, unspecified or CGNAT addresses. They are checked when
+  saved and again when the connection is made. CalDAV and ICS connections
+  refuse loopback, unspecified and link-local addresses (link-local covers
+  cloud metadata endpoints) when the connection is made. Private LAN ranges
+  are allowed for them so that LAN servers such as SOGo, Nextcloud and
+  Radicale work.
+- **TLS 1.2 minimum** on outbound CalDAV, ICS, webhook and SMTP connections.
+- **Security headers**: Every response gets:
+  - a Content-Security-Policy that allows no inline scripts and no script CDNs
+  - `X-Frame-Options: DENY`
+  - `X-Content-Type-Options: nosniff`
+  - `Referrer-Policy`
+  - `Permissions-Policy`
+  - `X-XSS-Protection`
+
+  HSTS is added when the request arrived over HTTPS.
+- **Rate limiting**: The limits are fixed in code and applied per client IP:
+  5 req/s (burst 10) on `/auth`, 30 req/s (burst 60) on the API, and 2 req/s
+  (burst 5) on endpoints that make outbound network calls. Set
+  `TRUSTED_PROXIES` so that client IPs are read correctly behind a proxy.
+- **CSRF protection**: There are no CSRF tokens. The Origin header (or the
+  Referer when Origin is missing) of state-changing `/api` requests is
+  checked against `ALLOWED_ORIGINS`. Session cookies are `SameSite=Lax`, and
+  the OIDC and Google OAuth flows check a `state` parameter.
+- **Session cookies**: `HttpOnly` and `SameSite=Lax`, plus `Secure` in
+  production.
+- **Credential encryption**: Stored source and destination passwords, Google
+  OAuth client secrets and refresh tokens are encrypted with AES-256-GCM.
 
 ## Development
 
@@ -185,7 +223,7 @@ point the existing source at another calendar.
 
 ```bash
 # Install golangci-lint
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 ```
 
 ### Commands
@@ -194,8 +232,8 @@ go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 # Build
 go build ./...
 
-# Test
-go test -v ./...
+# Test (CI also runs with -race)
+go test -race ./...
 
 # Lint
 golangci-lint run ./...
@@ -216,16 +254,21 @@ openssl rand -hex 32
 calbridgesync/
 ├── cmd/calbridgesync/         # Main entry point
 ├── internal/
+│   ├── activity/          # In-memory sync activity tracking
 │   ├── auth/              # OIDC + session management
-│   ├── caldav/            # CalDAV client + sync engine
-│   ├── config/            # Configuration loading
+│   ├── backup/            # Database backups
+│   ├── caldav/            # CalDAV/ICS clients + sync engine
+│   ├── config/            # Configuration loading and validation
 │   ├── crypto/            # AES-256-GCM encryption
 │   ├── db/                # SQLite database layer
 │   ├── health/            # Health check endpoints
+│   ├── notify/            # Email and webhook alerts
 │   ├── scheduler/         # Background job scheduler
-│   ├── validator/         # URL + OIDC validation
-│   └── web/               # HTTP handlers + templates
-├── scripts/               # Docker entrypoint
+│   ├── validator/         # URL validation
+│   ├── version/           # Build version
+│   └── web/               # HTTP handlers, JSON API, error template
+├── web/                   # React + Vite single-page app
+├── scripts/               # Docker entrypoint, backup script
 ├── Dockerfile             # Multi-stage Docker build
 ├── docker-compose.yml     # Docker Compose config
 └── .golangci.yml          # Linter configuration
