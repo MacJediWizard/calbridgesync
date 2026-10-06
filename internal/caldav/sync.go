@@ -1347,6 +1347,58 @@ func (se *SyncEngine) syncCalendar(ctx context.Context, source *db.Source, sourc
 	return se.fullSync(ctx, source, sourceClient, destClient, calendar, calendarIndex, sharedDestCalendar)
 }
 
+// filterEventsInWindow is the sync_days_past filter every sync path
+// uses. It applies filterEventsByDate to each event as if the object
+// had no VTIMEZONE blocks and returns the kept events unmodified.
+//
+// DST VTIMEZONEs carry RRULE:FREQ=YEARLY in their STANDARD/DAYLIGHT
+// sub-components, which filterEventsByDate's "RRULE:" short-circuit
+// would read as a recurring event. Since ICS objects carry their
+// VTIMEZONEs (#248), that would keep every old one-off event in a DST
+// zone. Source and destination must use the same check: an event kept
+// on one side and dropped on the other looks new (created) or
+// destination-only (orphan-deleted).
+func filterEventsInWindow(events []Event, cutoffDate time.Time) []Event {
+	var kept []Event
+	for _, e := range events {
+		probe := e
+		probe.Data = stripVTimezones(e.Data)
+		if len(filterEventsByDate([]Event{probe}, cutoffDate)) == 1 {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// stripVTimezones returns data with every BEGIN:VTIMEZONE ...
+// END:VTIMEZONE block removed. It is used only for property checks
+// that must ignore VTIMEZONE sub-component RRULEs; the result is never
+// written anywhere.
+func stripVTimezones(data string) string {
+	if !strings.Contains(data, "BEGIN:VTIMEZONE") {
+		return data
+	}
+	var b strings.Builder
+	b.Grow(len(data))
+	inTZ := false
+	for _, line := range strings.SplitAfter(data, "\n") {
+		switch strings.TrimRight(line, "\r\n") {
+		case "BEGIN:VTIMEZONE":
+			inTZ = true
+			continue
+		case "END:VTIMEZONE":
+			if inTZ {
+				inTZ = false
+				continue
+			}
+		}
+		if !inTZ {
+			b.WriteString(line)
+		}
+	}
+	return b.String()
+}
+
 // filterEventsByDate filters events to only include those with start time after cutoff date.
 // Events without a parseable start time are included (to be safe).
 // Recurring events (containing RRULE) are always included since their DTSTART
@@ -1437,7 +1489,7 @@ func (se *SyncEngine) fullSync(ctx context.Context, source *db.Source, sourceCli
 	if source.SyncDaysPast > 0 {
 		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
 		originalCount := len(sourceEvents)
-		sourceEvents = filterEventsByDate(sourceEvents, cutoffDate)
+		sourceEvents = filterEventsInWindow(sourceEvents, cutoffDate)
 		filteredOut := originalCount - len(sourceEvents)
 		if filteredOut > 0 {
 			log.Printf("Filtered out %d events older than %d days (cutoff: %s)", filteredOut, source.SyncDaysPast, cutoffDate.Format("2006-01-02"))
@@ -1602,7 +1654,7 @@ func (se *SyncEngine) syncEventsToDestination(ctx context.Context, source *db.So
 	if source.SyncDaysPast > 0 {
 		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
 		originalCount := len(destEvents)
-		destEvents = filterEventsByDate(destEvents, cutoffDate)
+		destEvents = filterEventsInWindow(destEvents, cutoffDate)
 		filteredOut := originalCount - len(destEvents)
 		if filteredOut > 0 {
 			log.Printf("Filtered out %d destination events older than %d days", filteredOut, source.SyncDaysPast)
@@ -2524,7 +2576,7 @@ func (se *SyncEngine) syncICSSource(ctx context.Context, source *db.Source) *Syn
 	// Filter events by date if configured
 	if source.SyncDaysPast > 0 {
 		cutoffDate := time.Now().AddDate(0, 0, -source.SyncDaysPast)
-		sourceEvents = filterEventsByDate(sourceEvents, cutoffDate)
+		sourceEvents = filterEventsInWindow(sourceEvents, cutoffDate)
 	}
 
 	// Store malformed events
