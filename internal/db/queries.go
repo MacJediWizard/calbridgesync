@@ -670,18 +670,6 @@ func (db *DB) GetSourceStats(sourceID string) (*SourceStats, error) {
 	return stats, nil
 }
 
-// UpdateSourceAdaptiveState updates the ICS content hash and adaptive
-// interval for a source. Used by the scheduler after each ICS fetch
-// to track whether the feed content changed. (#146)
-func (db *DB) UpdateSourceAdaptiveState(sourceID, contentHash string, adaptiveInterval int) error {
-	query := `UPDATE sources SET last_content_hash = ?, adaptive_interval = ?, updated_at = ? WHERE id = ?`
-	_, err := db.conn.Exec(query, contentHash, adaptiveInterval, time.Now().UTC(), sourceID)
-	if err != nil {
-		return fmt.Errorf("failed to update source adaptive state: %w", err)
-	}
-	return nil
-}
-
 // CreateDestination adds an additional destination for a source. (#154)
 func (db *DB) CreateDestination(dest *Destination) error {
 	dest.ID = uuid.New().String()
