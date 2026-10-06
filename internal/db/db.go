@@ -16,6 +16,12 @@ var (
 	ErrNotFound     = errors.New("record not found")
 	ErrDuplicate    = errors.New("duplicate record")
 	ErrDatabaseInit = errors.New("database initialization failed")
+
+	// ErrSubjectMismatch means the email is already bound to a different
+	// OIDC subject, so the login must not be mapped onto that user.
+	ErrSubjectMismatch = errors.New("email is bound to a different OIDC subject")
+	// ErrMissingSubject means the OIDC claims carried no subject.
+	ErrMissingSubject = errors.New("OIDC subject is required")
 )
 
 // DB represents the database connection.
@@ -295,6 +301,15 @@ func (db *DB) migrate() error {
 		// stripped regardless of this flag — they cause RFC-strict
 		// servers like SOGo to 501 the whole calendar object.
 		`ALTER TABLE sources ADD COLUMN strip_alarms INTEGER NOT NULL DEFAULT 0`,
+
+		// OIDC subject binding. Users were keyed only by email, so any
+		// IdP identity presenting a matching email got the account. The
+		// subject is bound on first login after this migration. Nullable
+		// with no default: existing rows stay NULL until their owner logs
+		// in, and the partial index only constrains bound rows. The old
+		// binary ignores the column, so rolling back needs no DB change.
+		`ALTER TABLE users ADD COLUMN oidc_subject TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_subject ON users(oidc_subject) WHERE oidc_subject IS NOT NULL`,
 	}
 
 	for _, migration := range migrations {
